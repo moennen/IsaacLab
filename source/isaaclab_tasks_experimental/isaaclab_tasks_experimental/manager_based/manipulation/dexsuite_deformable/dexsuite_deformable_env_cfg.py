@@ -268,15 +268,12 @@ class CommandsCfg:
 
 @configclass
 class ActionsCfg:
-    """Relative joint position control with conservative soft-contact steps."""
+    """Relative joint position control matching the rigid Kuka/Allegro task."""
 
     action = mdp.RelativeJointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
-        scale={
-            "iiwa7_joint_.*": 0.035,
-            "(index|middle|ring|thumb)_joint_.*": 0.050,
-        },
+        scale=0.1,
     )
 
 
@@ -348,7 +345,40 @@ class ObservationsCfg:
 
 @configclass
 class EventCfg:
-    """Reset events with small perturbations around a stable pre-grasp setup."""
+    """Robot reset/randomization events matched to rigid Dexsuite Kuka/Allegro."""
+
+    robot_physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": [0.5, 1.0],
+            "dynamic_friction_range": [0.5, 1.0],
+            "restitution_range": [0.0, 0.0],
+            "num_buckets": 250,
+        },
+    )
+
+    joint_stiffness_and_damping = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "stiffness_distribution_params": [0.5, 2.0],
+            "damping_distribution_params": [0.5, 2.0],
+            "operation": "scale",
+        },
+    )
+
+    joint_friction = EventTerm(
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "friction_distribution_params": [0.0, 5.0],
+            "operation": "scale",
+        },
+    )
 
     reset_robot_root = EventTerm(
         func=mdp.reset_root_state_uniform,
@@ -360,23 +390,22 @@ class EventCfg:
         },
     )
 
-    reset_robot_arm_joints = EventTerm(
+    reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
-            "position_range": (-0.05, 0.05),
+            "position_range": (-0.50, 0.50),
             "velocity_range": (0.0, 0.0),
-            "asset_cfg": SceneEntityCfg("robot", joint_names="iiwa7_joint_.*"),
         },
     )
 
-    reset_robot_hand_joints = EventTerm(
+    reset_robot_wrist_joint = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
-            "position_range": (-0.10, 0.10),
+            "asset_cfg": SceneEntityCfg("robot", joint_names="iiwa7_joint_7"),
+            "position_range": (-3.0, 3.0),
             "velocity_range": (0.0, 0.0),
-            "asset_cfg": SceneEntityCfg("robot", joint_names="(index|middle|ring|thumb)_joint_.*"),
         },
     )
 
