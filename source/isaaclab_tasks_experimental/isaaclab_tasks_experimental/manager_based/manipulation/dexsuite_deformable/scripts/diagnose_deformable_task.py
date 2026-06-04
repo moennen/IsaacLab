@@ -20,13 +20,14 @@ import isaaclab_tasks  # noqa: F401
 with contextlib.suppress(ImportError):
     import isaaclab_tasks_experimental  # noqa: F401
 
-from isaaclab.app import add_launcher_args, launch_simulation
-from isaaclab_tasks.utils.hydra import resolve_presets
-from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
-
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.dexsuite_deformable_env_cfg import (
     PhysicsCfg,
 )
+
+from isaaclab.app import add_launcher_args, launch_simulation
+
+from isaaclab_tasks.utils.hydra import resolve_presets
+from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 
 
 def _parse_env_counts(value: str) -> list[int]:

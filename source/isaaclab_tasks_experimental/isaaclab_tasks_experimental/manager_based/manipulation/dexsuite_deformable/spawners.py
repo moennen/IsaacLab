@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import MISSING
 
 import numpy as np
+
 from pxr import Usd, UsdGeom, UsdShade
 
 from isaaclab.sim.spawners.materials.physics_materials_cfg import DeformableBodyMaterialBaseCfg

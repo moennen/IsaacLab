@@ -13,7 +13,6 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 
 from isaaclab_tasks.utils import PresetCfg
 
-
 POLICY_CFG = RslRlMLPModelCfg(
     distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.8),
     obs_normalization=True,
