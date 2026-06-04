@@ -49,6 +49,7 @@ FINGERTIP_LIST = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"
 DEFORMABLE_SIZE = (0.09, 0.08, 0.07)
 DEFORMABLE_INIT_POS = (-0.55, 0.10, 0.34)
 TABLE_POS = (-0.55, 0.0, 0.235)
+TABLE_TOP_Z = TABLE_POS[2] + 0.02
 YOUNGS_MODULUS = 6.0e4
 POISSONS_RATIO = 0.25
 SOFT_CONTACT_MAX = 1_048_576
@@ -380,7 +381,16 @@ class RewardsCfg:
     fingertip_proximity = RewTerm(
         func=mdp.fingertip_deformable_proximity,
         params={"std": 0.08, "fingertip_cfg": SceneEntityCfg("robot", body_names=FINGERTIP_LIST)},
-        weight=2.0,
+        weight=0.75,
+    )
+    height_progress = RewTerm(
+        func=mdp.deformable_height_progress,
+        params={
+            "baseline_height": DEFORMABLE_INIT_POS[2],
+            "target_height": 0.42,
+            "asset_cfg": SceneEntityCfg("deformable"),
+        },
+        weight=4.0,
     )
     lifting = RewTerm(
         func=mdp.deformable_lifted,
@@ -412,6 +422,14 @@ class RewardsCfg:
         func=mdp.deformable_spread_l2,
         params={"nominal_extent": DEFORMABLE_SIZE, "margin": 0.06},
         weight=-1.0,
+    )
+    fingertip_table_scrape = RewTerm(
+        func=mdp.fingertip_below_height,
+        params={
+            "minimum_height": TABLE_TOP_Z + 0.045,
+            "fingertip_cfg": SceneEntityCfg("robot", body_names=FINGERTIP_LIST),
+        },
+        weight=-8.0,
     )
     action_l2 = RewTerm(func=mdp.action_l2_clamped, weight=-0.003)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2_clamped, weight=-0.008)

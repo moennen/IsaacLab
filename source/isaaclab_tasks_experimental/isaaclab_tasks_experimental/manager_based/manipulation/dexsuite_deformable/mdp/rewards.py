@@ -56,6 +56,19 @@ def deformable_lifted(
     return (com_z > minimal_height).float()
 
 
+def deformable_height_progress(
+    env: ManagerBasedRLEnv,
+    baseline_height: float,
+    target_height: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("deformable"),
+) -> torch.Tensor:
+    """Dense COM-height progress from the reset height to the lift threshold."""
+    asset: DeformableObject = env.scene[asset_cfg.name]
+    com_z = asset.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
+    height_span = max(target_height - baseline_height, 1.0e-6)
+    return ((com_z - baseline_height) / height_span).clamp(0.0, 1.0)
+
+
 def deformable_com_goal_distance(
     env: ManagerBasedRLEnv,
     std: float,
@@ -74,6 +87,17 @@ def deformable_com_goal_distance(
     com_z = com_w[:, 2] - env.scene.env_origins[:, 2]
     distance = torch.linalg.norm(command_w - com_w, dim=1)
     return (com_z > minimal_height).float() * (1.0 - torch.tanh(distance / std))
+
+
+def fingertip_below_height(
+    env: ManagerBasedRLEnv,
+    minimum_height: float,
+    fingertip_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize fingertips scraping below a table/object clearance height."""
+    robot: Articulation = env.scene[fingertip_cfg.name]
+    fingertip_z = robot.data.body_pos_w.torch[:, fingertip_cfg.body_ids, 2] - env.scene.env_origins[:, 2].unsqueeze(1)
+    return torch.relu(minimum_height - fingertip_z).mean(dim=1)
 
 
 def deformable_velocity_l2(

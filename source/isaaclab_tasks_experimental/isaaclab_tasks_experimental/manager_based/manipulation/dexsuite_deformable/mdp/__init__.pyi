@@ -16,15 +16,19 @@ __all__ = [
     "action_l2_clamped",
     "action_rate_l2_clamped",
     "deformable_com_goal_distance",
+    "deformable_height_progress",
     "deformable_lifted",
     "deformable_spread_l2",
     "deformable_velocity_l2",
+    "fingertip_below_height",
     "fingertip_deformable_proximity",
     "abnormal_robot_state",
     "deformable_com_below_minimum",
     "deformable_nodal_out_of_bounds",
     "deformable_state_invalid",
 ]
+
+from isaaclab.envs.mdp import *  # noqa: F403
 
 from .commands import DeformableUniformPositionCommand, DeformableUniformPositionCommandCfg
 from .observations import (
@@ -40,9 +44,11 @@ from .rewards import (
     action_l2_clamped,
     action_rate_l2_clamped,
     deformable_com_goal_distance,
+    deformable_height_progress,
     deformable_lifted,
     deformable_spread_l2,
     deformable_velocity_l2,
+    fingertip_below_height,
     fingertip_deformable_proximity,
 )
 from .terminations import (
@@ -51,4 +57,3 @@ from .terminations import (
     deformable_nodal_out_of_bounds,
     deformable_state_invalid,
 )
-from isaaclab.envs.mdp import *
