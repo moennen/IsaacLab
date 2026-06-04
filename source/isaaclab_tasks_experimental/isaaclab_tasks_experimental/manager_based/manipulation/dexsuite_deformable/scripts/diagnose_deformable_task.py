@@ -162,9 +162,7 @@ def _physics_health(env) -> dict[str, float]:
     joint_vel = robot.data.joint_vel.torch
     joint_vel_limits = robot.data.joint_vel_limits.torch
     finite_state = (
-        torch.isfinite(nodal_pos).all()
-        and torch.isfinite(nodal_vel).all()
-        and torch.isfinite(joint_vel).all()
+        torch.isfinite(nodal_pos).all() and torch.isfinite(nodal_vel).all() and torch.isfinite(joint_vel).all()
     )
     joint_vel_ratio = joint_vel.abs() / joint_vel_limits.clamp_min(1.0e-6)
 

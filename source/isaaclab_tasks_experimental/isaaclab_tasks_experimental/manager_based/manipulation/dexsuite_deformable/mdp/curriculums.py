@@ -82,9 +82,7 @@ class DeformableCommandDifficultyScheduler(ManagerTermBase):
         command = env.command_manager.get_term(command_name)
         succeeded = command.metrics["success_rate"][env_ids] > 0.5
         demoted = (
-            self.current_adr_difficulties[env_ids]
-            if promotion_only
-            else self.current_adr_difficulties[env_ids] - 1
+            self.current_adr_difficulties[env_ids] if promotion_only else self.current_adr_difficulties[env_ids] - 1
         )
         self.current_adr_difficulties[env_ids] = torch.where(
             succeeded,

@@ -207,9 +207,7 @@ DEFORMABLE_OBJECT_CFG = DeformableObjectCfg(
         physics_material=NewtonDeformableBodyMaterialCfg(
             density=300.0,
             k_mu=YOUNGS_MODULUS / (2.0 * (1.0 + POISSONS_RATIO)),
-            k_lambda=YOUNGS_MODULUS
-            * POISSONS_RATIO
-            / ((1.0 + POISSONS_RATIO) * (1.0 - 2.0 * POISSONS_RATIO)),
+            k_lambda=YOUNGS_MODULUS * POISSONS_RATIO / ((1.0 + POISSONS_RATIO) * (1.0 - 2.0 * POISSONS_RATIO)),
             particle_radius=0.012,
         ),
     ),
