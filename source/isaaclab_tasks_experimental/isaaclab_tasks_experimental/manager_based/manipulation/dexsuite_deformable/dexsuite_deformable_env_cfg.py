@@ -66,7 +66,8 @@ TABLE_TOP_Z = TABLE_POS[2] + 0.02
 DEFORMABLE_DENSITY = 300.0
 DEFORMABLE_K_MU = 1.0e5
 DEFORMABLE_K_LAMBDA = 1.0e5
-SOFT_CONTACT_MAX = 1_048_576
+# Covers the 1024-env ragdoll candidate space while preserving deterministic CUDA graph replay.
+SOFT_CONTACT_MAX = 8_388_608
 
 
 TABLE_SPAWN_CFG = sim_utils.CuboidCfg(
