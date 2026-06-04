@@ -12,6 +12,8 @@ and position control; no synthetic deformable orientation is exposed.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from isaaclab_newton.physics import FeatherstoneSolverCfg, MJWarpSolverCfg, NewtonCfg
 from isaaclab_newton.physics.newton_collision_cfg import NewtonCollisionPipelineCfg
 from isaaclab_newton.sim.spawners.materials import NewtonDeformableBodyMaterialCfg
@@ -45,7 +47,7 @@ from isaaclab_tasks.utils import PresetCfg
 from isaaclab_assets.robots import KUKA_ALLEGRO_CFG
 
 from . import mdp
-from .spawners import NewtonTetCuboidCfg
+from .spawners import NewtonVbdTetAssetCfg
 
 FINGERTIP_LIST = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]
 REACH_BODY_LIST = ["palm_link", ".*_tip"]
@@ -55,12 +57,15 @@ CONTACT_BODY_GROUPS = (
     ("ring_link_3", "ring_biotac_tip"),
     ("thumb_link_3", "thumb_biotac_tip"),
 )
-DEFORMABLE_SIZE = (0.09, 0.08, 0.07)
-DEFORMABLE_INIT_POS = (-0.55, 0.10, 0.34)
+DEFORMABLE_SIZE = (0.085, 0.335, 0.149)
+DEFORMABLE_INIT_POS = (-0.55, 0.10, 0.38)
+DEFORMABLE_LIFT_HEIGHT = 0.50
+DEFORMABLE_ASSET_PATH = str(Path(__file__).resolve().parent / "assets" / "blueHairRagdoll100k_tet.usda")
 TABLE_POS = (-0.55, 0.0, 0.235)
 TABLE_TOP_Z = TABLE_POS[2] + 0.02
-YOUNGS_MODULUS = 6.0e4
-POISSONS_RATIO = 0.25
+DEFORMABLE_DENSITY = 300.0
+DEFORMABLE_K_MU = 1.0e5
+DEFORMABLE_K_LAMBDA = 1.0e5
 SOFT_CONTACT_MAX = 1_048_576
 
 
@@ -202,13 +207,14 @@ class PhysicsCfg(PresetCfg):
 DEFORMABLE_OBJECT_CFG = DeformableObjectCfg(
     prim_path="/World/envs/env_.*/Deformable",
     init_state=DeformableObjectCfg.InitialStateCfg(pos=DEFORMABLE_INIT_POS),
-    spawn=NewtonTetCuboidCfg(
-        size=DEFORMABLE_SIZE,
+    spawn=NewtonVbdTetAssetCfg(
+        usd_path=DEFORMABLE_ASSET_PATH,
         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.16, 0.22)),
         physics_material=NewtonDeformableBodyMaterialCfg(
-            density=300.0,
-            k_mu=YOUNGS_MODULUS / (2.0 * (1.0 + POISSONS_RATIO)),
-            k_lambda=YOUNGS_MODULUS * POISSONS_RATIO / ((1.0 + POISSONS_RATIO) * (1.0 - 2.0 * POISSONS_RATIO)),
+            density=DEFORMABLE_DENSITY,
+            k_mu=DEFORMABLE_K_MU,
+            k_lambda=DEFORMABLE_K_LAMBDA,
+            k_damp=1.0e-5,
             particle_radius=0.012,
         ),
     ),
@@ -261,8 +267,8 @@ class CommandsCfg:
         success_threshold=0.07,
         ranges=mdp.DeformableUniformPositionCommandCfg.Ranges(
             pos_x=(-0.70, -0.35),
-            pos_y=(-0.22, 0.30),
-            pos_z=(0.50, 0.75),
+            pos_y=(-0.30, 0.35),
+            pos_z=(0.58, 0.82),
         ),
     )
 
@@ -488,7 +494,7 @@ class RewardsCfg:
         func=mdp.deformable_height_progress,
         params={
             "baseline_height": DEFORMABLE_INIT_POS[2],
-            "target_height": 0.42,
+            "target_height": DEFORMABLE_LIFT_HEIGHT,
             "asset_cfg": SceneEntityCfg("deformable"),
             "contact_body_name_groups": CONTACT_BODY_GROUPS,
         },
@@ -497,7 +503,7 @@ class RewardsCfg:
     lifting = RewTerm(
         func=mdp.deformable_lifted,
         params={
-            "minimal_height": 0.42,
+            "minimal_height": DEFORMABLE_LIFT_HEIGHT,
             "asset_cfg": SceneEntityCfg("deformable"),
             "contact_body_name_groups": CONTACT_BODY_GROUPS,
         },
@@ -507,7 +513,7 @@ class RewardsCfg:
         func=mdp.deformable_com_goal_distance,
         params={
             "std": 0.25,
-            "minimal_height": 0.40,
+            "minimal_height": DEFORMABLE_LIFT_HEIGHT,
             "command_name": "deformable_position",
             "asset_cfg": SceneEntityCfg("deformable"),
             "contact_body_name_groups": CONTACT_BODY_GROUPS,
@@ -518,7 +524,7 @@ class RewardsCfg:
         func=mdp.deformable_com_goal_distance,
         params={
             "std": 0.06,
-            "minimal_height": 0.40,
+            "minimal_height": DEFORMABLE_LIFT_HEIGHT,
             "command_name": "deformable_position",
             "asset_cfg": SceneEntityCfg("deformable"),
             "contact_body_name_groups": CONTACT_BODY_GROUPS,
@@ -528,7 +534,7 @@ class RewardsCfg:
     deformable_velocity = RewTerm(func=mdp.deformable_velocity_l2, weight=-0.01)
     deformable_spread = RewTerm(
         func=mdp.deformable_spread_l2,
-        params={"nominal_extent": DEFORMABLE_SIZE, "margin": 0.06},
+        params={"nominal_extent": DEFORMABLE_SIZE, "margin": 0.08},
         weight=-1.0,
     )
     fingertip_table_scrape = RewTerm(
@@ -570,7 +576,7 @@ class TerminationsCfg:
 
     deformable_state_invalid = DoneTerm(
         func=mdp.deformable_state_invalid,
-        params={"max_velocity": 25.0, "max_extent": 0.55, "asset_cfg": SceneEntityCfg("deformable")},
+        params={"max_velocity": 25.0, "max_extent": 0.70, "asset_cfg": SceneEntityCfg("deformable")},
     )
 
     abnormal_robot = DoneTerm(func=mdp.abnormal_robot_state, params={"velocity_limit_scale": 2.5})

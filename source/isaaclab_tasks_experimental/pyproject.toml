@@ -38,4 +38,4 @@ where = ["."]
 include = ["isaaclab_tasks_experimental", "isaaclab_tasks_experimental.*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.pyi"]
+"*" = ["*.pyi", "*.usd", "*.usda", "assets/*.usd", "assets/*.usda"]
