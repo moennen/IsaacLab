@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,9 +15,24 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import combine_frame_transforms
 
+from .soft_contacts import soft_good_contact_mask
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, DeformableObject
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def _soft_contact_gate(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,
+    contact_body_name_groups: Sequence[str | Sequence[str]] | None,
+    thumb_slot: int,
+    contact_threshold: float,
+) -> torch.Tensor | None:
+    """Return a thumb-plus-finger soft-contact gate when configured."""
+    if contact_body_name_groups is None:
+        return None
+    return soft_good_contact_mask(env, robot_cfg, contact_body_name_groups, thumb_slot, contact_threshold).float()
 
 
 def action_rate_l2_clamped(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -45,15 +61,56 @@ def fingertip_deformable_proximity(
     return proximity.mean(dim=-1)
 
 
+def fingertip_deformable_reach(
+    env: ManagerBasedRLEnv,
+    std: float,
+    fingertip_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("deformable"),
+    contact_body_name_groups: Sequence[str | Sequence[str]] | None = None,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    thumb_slot: int = 3,
+    contact_threshold: float = 1.0,
+    no_contact_scale: float = 1.0,
+) -> torch.Tensor:
+    """Reward all selected hand bodies reaching the deformable node cloud.
+
+    Unlike the earlier proximity reward, this uses the maximum selected-body
+    distance so one close finger cannot hide another finger staying far away.
+    When contact groups are supplied, the term can be down-scaled until a true
+    thumb-plus-finger deformable contact is present, matching the rigid
+    Dexsuite reach/contact progression.
+    """
+    robot: Articulation = env.scene[fingertip_cfg.name]
+    asset: DeformableObject = env.scene[asset_cfg.name]
+    fingertip_pos_w = robot.data.body_pos_w.torch[:, fingertip_cfg.body_ids]
+    nodal_pos_w = asset.data.nodal_pos_w.torch
+    distances = torch.linalg.norm(fingertip_pos_w.unsqueeze(2) - nodal_pos_w.unsqueeze(1), dim=-1)
+    max_distance = distances.min(dim=-1).values.max(dim=-1).values
+    reward = 1.0 - torch.tanh(max_distance / std)
+
+    gate = _soft_contact_gate(env, robot_cfg, contact_body_name_groups, thumb_slot, contact_threshold)
+    if gate is not None:
+        reward = reward * gate.clamp(no_contact_scale, 1.0)
+    return reward
+
+
 def deformable_lifted(
     env: ManagerBasedRLEnv,
     minimal_height: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("deformable"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    contact_body_name_groups: Sequence[str | Sequence[str]] | None = None,
+    thumb_slot: int = 3,
+    contact_threshold: float = 1.0,
 ) -> torch.Tensor:
     """Reward if the deformable COM is above a minimum env-frame height."""
     asset: DeformableObject = env.scene[asset_cfg.name]
     com_z = asset.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
-    return (com_z > minimal_height).float()
+    reward = (com_z > minimal_height).float()
+    gate = _soft_contact_gate(env, robot_cfg, contact_body_name_groups, thumb_slot, contact_threshold)
+    if gate is not None:
+        reward = reward * gate
+    return reward
 
 
 def deformable_height_progress(
@@ -61,12 +118,20 @@ def deformable_height_progress(
     baseline_height: float,
     target_height: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("deformable"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    contact_body_name_groups: Sequence[str | Sequence[str]] | None = None,
+    thumb_slot: int = 3,
+    contact_threshold: float = 1.0,
 ) -> torch.Tensor:
     """Dense COM-height progress from the reset height to the lift threshold."""
     asset: DeformableObject = env.scene[asset_cfg.name]
     com_z = asset.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
     height_span = max(target_height - baseline_height, 1.0e-6)
-    return ((com_z - baseline_height) / height_span).clamp(0.0, 1.0)
+    reward = ((com_z - baseline_height) / height_span).clamp(0.0, 1.0)
+    gate = _soft_contact_gate(env, robot_cfg, contact_body_name_groups, thumb_slot, contact_threshold)
+    if gate is not None:
+        reward = reward * gate
+    return reward
 
 
 def deformable_com_goal_distance(
@@ -76,6 +141,9 @@ def deformable_com_goal_distance(
     command_name: str,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("deformable"),
+    contact_body_name_groups: Sequence[str | Sequence[str]] | None = None,
+    thumb_slot: int = 3,
+    contact_threshold: float = 1.0,
 ) -> torch.Tensor:
     """Tanh reward for deformable COM tracking the commanded position."""
     robot: Articulation = env.scene[robot_cfg.name]
@@ -86,7 +154,11 @@ def deformable_com_goal_distance(
     com_w = asset.data.root_pos_w.torch
     com_z = com_w[:, 2] - env.scene.env_origins[:, 2]
     distance = torch.linalg.norm(command_w - com_w, dim=1)
-    return (com_z > minimal_height).float() * (1.0 - torch.tanh(distance / std))
+    reward = (com_z > minimal_height).float() * (1.0 - torch.tanh(distance / std))
+    gate = _soft_contact_gate(env, robot_cfg, contact_body_name_groups, thumb_slot, contact_threshold)
+    if gate is not None:
+        reward = reward * gate
+    return reward
 
 
 def fingertip_below_height(

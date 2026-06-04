@@ -46,6 +46,13 @@ from . import mdp
 from .spawners import NewtonTetCuboidCfg
 
 FINGERTIP_LIST = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]
+REACH_BODY_LIST = ["palm_link", ".*_tip"]
+CONTACT_BODY_GROUPS = (
+    ("index_link_3", "index_biotac_tip"),
+    ("middle_link_3", "middle_biotac_tip"),
+    ("ring_link_3", "ring_biotac_tip"),
+    ("thumb_link_3", "thumb_biotac_tip"),
+)
 DEFORMABLE_SIZE = (0.09, 0.08, 0.07)
 DEFORMABLE_INIT_POS = (-0.55, 0.10, 0.34)
 TABLE_POS = (-0.55, 0.0, 0.235)
@@ -306,6 +313,16 @@ class ObservationsCfg:
                 "base_asset_cfg": SceneEntityCfg("robot"),
             },
         )
+        soft_contact_flags = ObsTerm(
+            func=mdp.fingertip_soft_contact_flags,
+            clip=(0.0, 1.0),
+            params={"body_name_groups": CONTACT_BODY_GROUPS, "contact_threshold": 1.0},
+        )
+        soft_contact_counts = ObsTerm(
+            func=mdp.fingertip_soft_contact_counts,
+            clip=(0.0, 1.0),
+            params={"body_name_groups": CONTACT_BODY_GROUPS, "count_normalizer": 8.0},
+        )
 
         def __post_init__(self) -> None:
             self.enable_corruption = True
@@ -378,10 +395,25 @@ class EventCfg:
 class RewardsCfg:
     """Dense shaping for grasping, lifting, and goal tracking."""
 
-    fingertip_proximity = RewTerm(
-        func=mdp.fingertip_deformable_proximity,
-        params={"std": 0.08, "fingertip_cfg": SceneEntityCfg("robot", body_names=FINGERTIP_LIST)},
-        weight=0.75,
+    fingers_to_deformable = RewTerm(
+        func=mdp.fingertip_deformable_reach,
+        params={
+            "std": 0.25,
+            "fingertip_cfg": SceneEntityCfg("robot", body_names=REACH_BODY_LIST),
+            "contact_body_name_groups": CONTACT_BODY_GROUPS,
+            "no_contact_scale": 0.1,
+        },
+        weight=1.0,
+    )
+    good_finger_contact = RewTerm(
+        func=mdp.soft_good_contact,
+        params={"body_name_groups": CONTACT_BODY_GROUPS, "thumb_slot": 3, "contact_threshold": 1.0},
+        weight=0.5,
+    )
+    contact_count = RewTerm(
+        func=mdp.soft_contact_count,
+        params={"body_name_groups": CONTACT_BODY_GROUPS, "contact_threshold": 1.0},
+        weight=1.0,
     )
     height_progress = RewTerm(
         func=mdp.deformable_height_progress,
@@ -389,12 +421,17 @@ class RewardsCfg:
             "baseline_height": DEFORMABLE_INIT_POS[2],
             "target_height": 0.42,
             "asset_cfg": SceneEntityCfg("deformable"),
+            "contact_body_name_groups": CONTACT_BODY_GROUPS,
         },
-        weight=4.0,
+        weight=2.0,
     )
     lifting = RewTerm(
         func=mdp.deformable_lifted,
-        params={"minimal_height": 0.42, "asset_cfg": SceneEntityCfg("deformable")},
+        params={
+            "minimal_height": 0.42,
+            "asset_cfg": SceneEntityCfg("deformable"),
+            "contact_body_name_groups": CONTACT_BODY_GROUPS,
+        },
         weight=5.0,
     )
     goal_tracking = RewTerm(
@@ -404,6 +441,7 @@ class RewardsCfg:
             "minimal_height": 0.40,
             "command_name": "deformable_position",
             "asset_cfg": SceneEntityCfg("deformable"),
+            "contact_body_name_groups": CONTACT_BODY_GROUPS,
         },
         weight=12.0,
     )
@@ -414,6 +452,7 @@ class RewardsCfg:
             "minimal_height": 0.40,
             "command_name": "deformable_position",
             "asset_cfg": SceneEntityCfg("deformable"),
+            "contact_body_name_groups": CONTACT_BODY_GROUPS,
         },
         weight=4.0,
     )

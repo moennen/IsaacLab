@@ -12,6 +12,8 @@ __all__ = [
     "deformable_extent_b",
     "deformable_root_vel_b",
     "fingertip_deformable_distances",
+    "fingertip_soft_contact_counts",
+    "fingertip_soft_contact_flags",
     "time_left",
     "action_l2_clamped",
     "action_rate_l2_clamped",
@@ -22,6 +24,11 @@ __all__ = [
     "deformable_velocity_l2",
     "fingertip_below_height",
     "fingertip_deformable_proximity",
+    "fingertip_deformable_reach",
+    "raw_fingertip_soft_contact_counts",
+    "soft_contact_count",
+    "soft_good_contact",
+    "soft_good_contact_mask",
     "abnormal_robot_state",
     "deformable_com_below_minimum",
     "deformable_nodal_out_of_bounds",
@@ -50,6 +57,15 @@ from .rewards import (
     deformable_velocity_l2,
     fingertip_below_height,
     fingertip_deformable_proximity,
+    fingertip_deformable_reach,
+)
+from .soft_contacts import (
+    fingertip_soft_contact_counts,
+    fingertip_soft_contact_flags,
+    raw_fingertip_soft_contact_counts,
+    soft_contact_count,
+    soft_good_contact,
+    soft_good_contact_mask,
 )
 from .terminations import (
     abnormal_robot_state,

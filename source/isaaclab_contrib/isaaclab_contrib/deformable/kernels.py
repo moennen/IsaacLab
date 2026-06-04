@@ -278,3 +278,40 @@ def enforce_kinematic_targets(
     else:
         particle_inv_mass[flat_idx] = default_inv_mass[flat_idx]
         particle_flags[flat_idx] = default_flags[flat_idx]
+def aggregate_soft_contact_counts(
+    contact_count: wp.array(dtype=wp.int32),
+    contact_shape: wp.array(dtype=wp.int32),
+    shape_body: wp.array(dtype=wp.int32),
+    body_world: wp.array(dtype=wp.int32),
+    body_to_slot: wp.array(dtype=wp.int32),
+    num_envs: int,
+    counts: wp.array2d(dtype=wp.float32),
+):
+    """Aggregate active Newton body-particle contacts by rigid body slot.
+
+    ``contacts.soft_contact_shape`` stores the rigid shape touched by each
+    deformable particle.  The slot mapping is body-indexed, so this kernel
+    resolves ``shape -> body -> world`` and atomically increments the selected
+    per-environment fingertip bin.
+    """
+    tid = wp.tid()
+    if tid >= contact_count[0]:
+        return
+
+    shape_idx = contact_shape[tid]
+    if shape_idx < 0:
+        return
+
+    body_idx = shape_body[shape_idx]
+    if body_idx < 0:
+        return
+
+    slot = body_to_slot[body_idx]
+    if slot < 0:
+        return
+
+    world = body_world[body_idx]
+    if world < 0 or world >= num_envs:
+        return
+
+    wp.atomic_add(counts, world, slot, 1.0)

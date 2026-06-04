@@ -22,7 +22,12 @@ with contextlib.suppress(ImportError):
     import isaaclab_tasks_experimental  # noqa: F401
 
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.dexsuite_deformable_env_cfg import (
+    CONTACT_BODY_GROUPS,
     PhysicsCfg,
+)
+from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.mdp.soft_contacts import (
+    raw_fingertip_soft_contact_counts,
+    soft_good_contact_mask,
 )
 
 from isaaclab.app import add_launcher_args, launch_simulation
@@ -80,6 +85,19 @@ parser.add_argument("--disable-cuda-graph", action="store_true", default=False, 
 parser.add_argument("--verify-cuda", action="store_true", default=False, help="Synchronize after Warp CUDA work.")
 parser.add_argument("--print-warp-launches", action="store_true", default=False, help="Print each Warp kernel launch.")
 parser.add_argument("--verbose-steps", action="store_true", default=False, help="Print a marker before each step.")
+parser.add_argument(
+    "--contact-overlap-probe",
+    action="store_true",
+    default=False,
+    help="Temporarily move the deformable onto one fingertip and print native soft-contact counts.",
+)
+parser.add_argument(
+    "--contact-overlap-body",
+    type=str,
+    default="index_biotac_tip",
+    help="Robot body used by the probe.",
+)
+parser.add_argument("--contact-overlap-steps", type=int, default=3, help="Zero-action steps after probe placement.")
 add_launcher_args(parser)
 parser.set_defaults(headless=True)
 args_cli = parser.parse_args()
@@ -155,6 +173,18 @@ def _physics_health(env) -> dict[str, float]:
         command_error_mean = float("nan")
         command_error_max = float("nan")
 
+    try:
+        soft_counts = raw_fingertip_soft_contact_counts(env, body_name_groups=CONTACT_BODY_GROUPS)
+        soft_flags = (soft_counts >= 1.0).float()
+        soft_good_contact = soft_good_contact_mask(env, body_name_groups=CONTACT_BODY_GROUPS)
+        soft_contact_slots_mean = float(soft_flags.sum(dim=1).mean().item())
+        soft_good_contact_frac = float(soft_good_contact.float().mean().item())
+        soft_contact_count_max = float(soft_counts.max().item())
+    except Exception:
+        soft_contact_slots_mean = float("nan")
+        soft_good_contact_frac = float("nan")
+        soft_contact_count_max = float("nan")
+
     return {
         "finite_state": float(bool(finite_state)),
         "com_z_min": float(com_env[:, 2].min().item()),
@@ -164,6 +194,9 @@ def _physics_health(env) -> dict[str, float]:
         "joint_vel_ratio_max": float(joint_vel_ratio.max().item()),
         "command_error_mean": command_error_mean,
         "command_error_max": command_error_max,
+        "soft_contact_slots_mean": soft_contact_slots_mean,
+        "soft_good_contact_frac": soft_good_contact_frac,
+        "soft_contact_count_max": soft_contact_count_max,
     }
 
 
@@ -180,11 +213,54 @@ def _make_actions(env) -> torch.Tensor:
     return (2.0 * torch.rand(shape, device=env.unwrapped.device) - 1.0) * args_cli.random_scale
 
 
+def _run_contact_overlap_probe(env) -> None:
+    """Force a temporary fingertip/deformable overlap to validate soft-contact reporting."""
+    if not args_cli.contact_overlap_probe:
+        return
+
+    uenv = env.unwrapped
+    robot = uenv.scene["robot"]
+    deformable = uenv.scene["deformable"]
+    body_names = list(robot.body_names)
+    body_name = args_cli.contact_overlap_body
+    if body_name not in body_names:
+        body_name = "index_link_3"
+    body_id = body_names.index(body_name)
+
+    tip_pos = robot.data.body_pos_w.torch[:, body_id : body_id + 1, :]
+    nodal_pos = deformable.data.nodal_pos_w.torch
+    offsets = nodal_pos - deformable.data.root_pos_w.torch[:, None, :]
+    deformable.write_nodal_pos_to_sim_index(tip_pos + 0.2 * offsets)
+    deformable.write_nodal_velocity_to_sim_index(torch.zeros_like(nodal_pos))
+
+    zero_actions = torch.zeros(
+        (uenv.num_envs, uenv.single_action_space.shape[0]),
+        device=uenv.device,
+    )
+    for _ in range(max(args_cli.contact_overlap_steps, 1)):
+        env.step(zero_actions)
+
+    counts = raw_fingertip_soft_contact_counts(uenv, body_name_groups=CONTACT_BODY_GROUPS)
+    good_contact = soft_good_contact_mask(uenv, body_name_groups=CONTACT_BODY_GROUPS)
+    print(
+        "contact_probe "
+        f"envs={uenv.num_envs} "
+        f"body={body_name} "
+        f"first_counts={counts[0].detach().cpu().tolist()} "
+        f"max_count={float(counts.max().item()):.0f} "
+        f"good_contact_frac={float(good_contact.float().mean().item()):.3f}",
+        flush=True,
+    )
+
+    env.reset()
+
+
 def _run_one(num_envs: int) -> dict[str, float]:
     env_cfg = _make_env_cfg(num_envs)
     env = gym.make(args_cli.task, cfg=env_cfg)
     obs_reset = env.reset()
     obs = obs_reset[0] if isinstance(obs_reset, tuple) else obs_reset
+    _run_contact_overlap_probe(env)
 
     device = env.unwrapped.device
     resets = 0
@@ -246,7 +322,8 @@ def main() -> None:
     first_cfg = _make_env_cfg(args_cli.num_envs[0])
     with launch_simulation(first_cfg, args_cli):
         print(
-            "envs physics action resets obs_bad max|obs| finite max_v max_extent cmd_err step_ms env_steps/s",
+            "envs physics action resets obs_bad max|obs| finite max_v max_extent cmd_err "
+            "c_slots good_c c_max step_ms env_steps/s",
             flush=True,
         )
         for num_envs in args_cli.num_envs:
@@ -262,6 +339,9 @@ def main() -> None:
                 f"{result['max_node_vel']:>6.3f} "
                 f"{result['max_extent']:>10.3f} "
                 f"{result['command_error_mean']:>7.3f} "
+                f"{result['soft_contact_slots_mean']:>7.3f} "
+                f"{result['soft_good_contact_frac']:>6.3f} "
+                f"{result['soft_contact_count_max']:>5.0f} "
                 f"{result['mean_step_ms']:>7.2f} "
                 f"{result['env_steps_per_s']:>11.0f}",
                 flush=True,
