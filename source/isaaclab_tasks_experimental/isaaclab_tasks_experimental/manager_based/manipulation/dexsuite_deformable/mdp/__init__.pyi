@@ -6,6 +6,7 @@
 __all__ = [
     "DeformableUniformPositionCommandCfg",
     "DeformableUniformPositionCommand",
+    "DeformableCommandDifficultyScheduler",
     "DeformableSampledNodesInRobotRootFrame",
     "body_state_b",
     "deformable_com_b",
@@ -29,6 +30,7 @@ __all__ = [
     "soft_contact_count",
     "soft_good_contact",
     "soft_good_contact_mask",
+    "initial_final_interpolate_fn",
     "abnormal_robot_state",
     "deformable_com_below_minimum",
     "deformable_nodal_out_of_bounds",
@@ -38,6 +40,7 @@ __all__ = [
 from isaaclab.envs.mdp import *  # noqa: F403
 
 from .commands import DeformableUniformPositionCommand, DeformableUniformPositionCommandCfg
+from .curriculums import DeformableCommandDifficultyScheduler, initial_final_interpolate_fn
 from .observations import (
     DeformableSampledNodesInRobotRootFrame,
     body_state_b,

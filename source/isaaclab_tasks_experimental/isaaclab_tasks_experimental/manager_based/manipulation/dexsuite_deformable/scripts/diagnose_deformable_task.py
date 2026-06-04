@@ -23,6 +23,8 @@ with contextlib.suppress(ImportError):
 
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.dexsuite_deformable_env_cfg import (
     CONTACT_BODY_GROUPS,
+    FINGERTIP_LIST,
+    TABLE_TOP_Z,
     PhysicsCfg,
 )
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.mdp.soft_contacts import (
@@ -85,6 +87,7 @@ parser.add_argument("--disable-cuda-graph", action="store_true", default=False, 
 parser.add_argument("--verify-cuda", action="store_true", default=False, help="Synchronize after Warp CUDA work.")
 parser.add_argument("--print-warp-launches", action="store_true", default=False, help="Print each Warp kernel launch.")
 parser.add_argument("--verbose-steps", action="store_true", default=False, help="Print a marker before each step.")
+parser.add_argument("--print-robot-state", action="store_true", default=False, help="Print robot clearance details.")
 parser.add_argument(
     "--contact-overlap-probe",
     action="store_true",
@@ -185,6 +188,40 @@ def _physics_health(env) -> dict[str, float]:
         soft_good_contact_frac = float("nan")
         soft_contact_count_max = float("nan")
 
+    body_ids_by_name = {name: body_id for body_id, name in enumerate(robot.body_names)}
+    tracked_body_names = ["palm_link", *FINGERTIP_LIST]
+    tracked_body_ids = [body_ids_by_name[name] for name in tracked_body_names if name in body_ids_by_name]
+    fingertip_body_ids = [body_ids_by_name[name] for name in FINGERTIP_LIST if name in body_ids_by_name]
+    body_pos_env = robot.data.body_pos_w.torch - env.scene.env_origins[:, None, :]
+    tracked_z = body_pos_env[:, tracked_body_ids, 2] if tracked_body_ids else torch.empty(0, device=env.device)
+    fingertip_z = body_pos_env[:, fingertip_body_ids, 2] if fingertip_body_ids else torch.empty(0, device=env.device)
+    palm_z = body_pos_env[:, body_ids_by_name["palm_link"], 2] if "palm_link" in body_ids_by_name else None
+
+    joint_ids_by_name = {name: joint_id for joint_id, name in enumerate(robot.joint_names)}
+    wrist_joint_pos = (
+        robot.data.joint_pos.torch[:, joint_ids_by_name["iiwa7_joint_7"]]
+        if "iiwa7_joint_7" in joint_ids_by_name
+        else None
+    )
+
+    if args_cli.print_robot_state and env.num_envs > 0:
+        first_body_z = {
+            name: float(body_pos_env[0, body_id, 2].item())
+            for name, body_id in zip(tracked_body_names, tracked_body_ids, strict=False)
+        }
+        first_joint_pos = {
+            name: float(robot.data.joint_pos.torch[0, joint_id].item())
+            for name, joint_id in joint_ids_by_name.items()
+            if name.startswith("iiwa7_joint")
+        }
+        print(
+            "robot_state "
+            f"table_top_z={TABLE_TOP_Z:.3f} "
+            f"first_body_z={first_body_z} "
+            f"first_iiwa_joint_pos={first_joint_pos}",
+            flush=True,
+        )
+
     return {
         "finite_state": float(bool(finite_state)),
         "com_z_min": float(com_env[:, 2].min().item()),
@@ -192,6 +229,12 @@ def _physics_health(env) -> dict[str, float]:
         "max_node_vel": float(torch.linalg.norm(nodal_vel, dim=-1).max().item()),
         "max_extent": float(extent.max(dim=1).values.max().item()),
         "joint_vel_ratio_max": float(joint_vel_ratio.max().item()),
+        "tracked_min_clearance": float(tracked_z.min().item() - TABLE_TOP_Z) if tracked_z.numel() else float("nan"),
+        "fingertip_min_clearance": (
+            float(fingertip_z.min().item() - TABLE_TOP_Z) if fingertip_z.numel() else float("nan")
+        ),
+        "palm_clearance_mean": float(palm_z.mean().item() - TABLE_TOP_Z) if palm_z is not None else float("nan"),
+        "wrist_joint_pos_mean": float(wrist_joint_pos.mean().item()) if wrist_joint_pos is not None else float("nan"),
         "command_error_mean": command_error_mean,
         "command_error_max": command_error_max,
         "soft_contact_slots_mean": soft_contact_slots_mean,
@@ -322,8 +365,8 @@ def main() -> None:
     first_cfg = _make_env_cfg(args_cli.num_envs[0])
     with launch_simulation(first_cfg, args_cli):
         print(
-            "envs physics action resets obs_bad max|obs| finite max_v max_extent cmd_err "
-            "c_slots good_c c_max step_ms env_steps/s",
+            "envs physics action resets obs_bad max|obs| finite max_v max_extent robot_min_z tip_min_z "
+            "palm_z wrist7 cmd_err c_slots good_c c_max step_ms env_steps/s",
             flush=True,
         )
         for num_envs in args_cli.num_envs:
@@ -338,6 +381,10 @@ def main() -> None:
                 f"{result['finite_state']:>6.0f} "
                 f"{result['max_node_vel']:>6.3f} "
                 f"{result['max_extent']:>10.3f} "
+                f"{result['tracked_min_clearance']:>11.3f} "
+                f"{result['fingertip_min_clearance']:>9.3f} "
+                f"{result['palm_clearance_mean']:>6.3f} "
+                f"{result['wrist_joint_pos_mean']:>6.3f} "
                 f"{result['command_error_mean']:>7.3f} "
                 f"{result['soft_contact_slots_mean']:>7.3f} "
                 f"{result['soft_good_contact_frac']:>6.3f} "

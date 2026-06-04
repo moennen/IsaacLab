@@ -20,6 +20,8 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.assets.deformable_object import DeformableObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
+from isaaclab.envs import mdp as base_mdp
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -344,8 +346,36 @@ class ObservationsCfg:
 
 
 @configclass
+class CurriculumCfg:
+    """Curriculum terms aligned with rigid Dexsuite object lifting."""
+
+    adr = CurrTerm(
+        func=mdp.DeformableCommandDifficultyScheduler,
+        params={
+            "command_name": "deformable_position",
+            "init_difficulty": 0,
+            "min_difficulty": 0,
+            "max_difficulty": 10,
+        },
+    )
+
+    gravity_adr = CurrTerm(
+        func=base_mdp.modify_term_cfg,
+        params={
+            "address": "events.variable_gravity.params.gravity_distribution_params",
+            "modify_fn": mdp.initial_final_interpolate_fn,
+            "modify_params": {
+                "initial_value": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+                "final_value": ((0.0, 0.0, -9.81), (0.0, 0.0, -9.81)),
+                "difficulty_term_str": "adr",
+            },
+        },
+    )
+
+
+@configclass
 class EventCfg:
-    """Robot reset/randomization events matched to rigid Dexsuite Kuka/Allegro."""
+    """Reset/randomization events matched to rigid Dexsuite Kuka/Allegro."""
 
     robot_physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
@@ -377,6 +407,17 @@ class EventCfg:
             "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
             "friction_distribution_params": [0.0, 5.0],
             "operation": "scale",
+        },
+    )
+
+    # Match rigid Dexsuite's early-learning setup: start without gravity and let ADR
+    # introduce full gravity as the policy becomes competent.
+    variable_gravity = EventTerm(
+        func=mdp.randomize_physics_scene_gravity,
+        mode="reset",
+        params={
+            "gravity_distribution_params": ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+            "operation": "abs",
         },
     )
 
@@ -413,7 +454,7 @@ class EventCfg:
         func=mdp.reset_nodal_state_uniform,
         mode="reset",
         params={
-            "position_range": {"x": (-0.025, 0.025), "y": (-0.025, 0.025), "z": (0.0, 0.0)},
+            "position_range": {"x": (-0.2, 0.2), "y": (-0.2, 0.2), "z": (0.0, 0.4)},
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("deformable"),
         },
@@ -552,6 +593,7 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg(ManagerBasedRLEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self) -> None:
         self.decimation = 2
