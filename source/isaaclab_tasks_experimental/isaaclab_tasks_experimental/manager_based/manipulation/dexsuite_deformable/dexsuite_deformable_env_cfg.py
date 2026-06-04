@@ -12,7 +12,8 @@ and position control; no synthetic deformable orientation is exposed.
 
 from __future__ import annotations
 
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+from isaaclab_newton.physics import FeatherstoneSolverCfg, MJWarpSolverCfg, NewtonCfg
+from isaaclab_newton.physics.newton_collision_cfg import NewtonCollisionPipelineCfg
 from isaaclab_newton.sim.spawners.materials import NewtonDeformableBodyMaterialCfg
 
 import isaaclab.sim as sim_utils
@@ -30,7 +31,12 @@ from isaaclab.sim import GroundPlaneCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_contrib.deformable.newton_manager_cfg import CoupledMJWarpVBDSolverCfg, NewtonModelCfg, VBDSolverCfg
+from isaaclab_contrib.deformable.newton_manager_cfg import (
+    CoupledFeatherstoneVBDSolverCfg,
+    CoupledMJWarpVBDSolverCfg,
+    NewtonModelCfg,
+    VBDSolverCfg,
+)
 
 from isaaclab_tasks.utils import PresetCfg
 
@@ -45,6 +51,7 @@ DEFORMABLE_INIT_POS = (-0.55, 0.10, 0.34)
 TABLE_POS = (-0.55, 0.0, 0.235)
 YOUNGS_MODULUS = 6.0e4
 POISSONS_RATIO = 0.25
+SOFT_CONTACT_MAX = 1_048_576
 
 
 TABLE_SPAWN_CFG = sim_utils.CuboidCfg(
@@ -94,10 +101,34 @@ def _coupled_newton_cfg(
             soft_solver_cfg=soft_solver_cfg,
             coupling_mode=coupling_mode,
         ),
+        collision_cfg=NewtonCollisionPipelineCfg(soft_contact_max=SOFT_CONTACT_MAX),
         num_substeps=num_substeps,
         use_cuda_graph=True,
     )
     # The coupled manager checks this optional attribute after finalizing the model.
+    cfg.model_cfg = model_cfg
+    return cfg
+
+
+def _kinematic_newton_cfg(
+    *,
+    num_substeps: int,
+    soft_solver_cfg: VBDSolverCfg,
+    model_cfg: NewtonModelCfg,
+    velocity_limit_scale: float,
+) -> NewtonCfg:
+    """Create the Newton example-style Featherstone kinematic + VBD config."""
+    cfg = NewtonCfg(
+        solver_cfg=CoupledFeatherstoneVBDSolverCfg(
+            rigid_solver_cfg=FeatherstoneSolverCfg(update_mass_matrix_interval=num_substeps),
+            soft_solver_cfg=soft_solver_cfg,
+            coupling_mode="kinematic",
+            kinematic_velocity_limit_scale=velocity_limit_scale,
+        ),
+        collision_cfg=NewtonCollisionPipelineCfg(soft_contact_max=SOFT_CONTACT_MAX),
+        num_substeps=num_substeps,
+        use_cuda_graph=True,
+    )
     cfg.model_cfg = model_cfg
     return cfg
 
@@ -115,6 +146,20 @@ DEFORMABLE_MODEL_CFG = NewtonModelCfg(
 @configclass
 class PhysicsCfg(PresetCfg):
     """Physics presets for stability/performance sweeps."""
+
+    stable_kinematic: NewtonCfg = _kinematic_newton_cfg(
+        num_substeps=8,
+        soft_solver_cfg=_soft_solver(iterations=12),
+        model_cfg=DEFORMABLE_MODEL_CFG,
+        velocity_limit_scale=0.75,
+    )
+
+    fast_kinematic: NewtonCfg = _kinematic_newton_cfg(
+        num_substeps=4,
+        soft_solver_cfg=_soft_solver(iterations=7),
+        model_cfg=DEFORMABLE_MODEL_CFG,
+        velocity_limit_scale=1.0,
+    )
 
     stable_two_way: NewtonCfg = _coupled_newton_cfg(
         coupling_mode="two_way",
@@ -140,7 +185,7 @@ class PhysicsCfg(PresetCfg):
         model_cfg=DEFORMABLE_MODEL_CFG,
     )
 
-    default = stable_two_way
+    default = stable_kinematic
 
 
 DEFORMABLE_OBJECT_CFG = DeformableObjectCfg(

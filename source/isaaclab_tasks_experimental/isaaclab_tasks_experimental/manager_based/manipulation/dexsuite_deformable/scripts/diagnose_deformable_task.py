@@ -14,6 +14,7 @@ from collections.abc import Iterable
 
 import gymnasium as gym
 import torch
+import warp as wp
 
 import isaaclab_tasks  # noqa: F401
 
@@ -69,15 +70,24 @@ parser.add_argument(
 parser.add_argument("--random-scale", type=float, default=0.35, help="Uniform random action scale.")
 parser.add_argument(
     "--physics-preset",
-    choices=("stable_two_way", "fast_two_way", "one_way_debug"),
-    default="stable_two_way",
+    choices=("stable_kinematic", "fast_kinematic", "stable_two_way", "fast_two_way", "one_way_debug"),
+    default="stable_kinematic",
     help="Physics preset to install on the environment config.",
 )
 parser.add_argument("--check-interval", type=int, default=5, help="Observation health check interval in steps.")
 parser.add_argument("--disable-fabric", action="store_true", default=False, help="Disable fabric scene reads/writes.")
+parser.add_argument("--disable-cuda-graph", action="store_true", default=False, help="Run Newton physics eagerly.")
+parser.add_argument("--verify-cuda", action="store_true", default=False, help="Synchronize after Warp CUDA work.")
+parser.add_argument("--print-warp-launches", action="store_true", default=False, help="Print each Warp kernel launch.")
+parser.add_argument("--verbose-steps", action="store_true", default=False, help="Print a marker before each step.")
 add_launcher_args(parser)
 parser.set_defaults(headless=True)
 args_cli = parser.parse_args()
+
+if args_cli.verify_cuda:
+    wp.config.verify_cuda = True
+if args_cli.print_warp_launches:
+    wp.config.print_launches = True
 
 
 def _make_env_cfg(num_envs: int):
@@ -86,6 +96,8 @@ def _make_env_cfg(num_envs: int):
     env_cfg.scene.num_envs = num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.physics = getattr(PhysicsCfg(), args_cli.physics_preset)
+    if args_cli.disable_cuda_graph:
+        env_cfg.sim.physics.use_cuda_graph = False
     if args_cli.disable_fabric:
         env_cfg.sim.use_fabric = False
     return env_cfg
@@ -189,6 +201,8 @@ def _run_one(num_envs: int) -> dict[str, float]:
         for step_id in range(args_cli.steps):
             actions = _make_actions(env)
             _sync_if_needed(device)
+            if args_cli.verbose_steps:
+                print(f"step {step_id}", flush=True)
             start = time.perf_counter()
             step_out = env.step(actions)
             _sync_if_needed(device)

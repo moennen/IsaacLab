@@ -14,7 +14,7 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 from isaaclab_tasks.utils import PresetCfg
 
 POLICY_CFG = RslRlMLPModelCfg(
-    distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.8),
+    distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.25),
     obs_normalization=True,
     hidden_dims=[512, 256, 128],
     activation="elu",
@@ -49,6 +49,7 @@ class DexsuiteDeformableKukaAllegroPPOBaseRunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 32
     max_iterations = 15000
     save_interval = 250
+    clip_actions = 0.25
     experiment_name = MISSING
     obs_groups = MISSING
     actor = MISSING
