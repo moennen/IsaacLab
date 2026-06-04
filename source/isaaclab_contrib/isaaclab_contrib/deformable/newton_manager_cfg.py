@@ -3,14 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Configuration classes for VBD and global Newton model parameters."""
+"""Configuration classes for VBD, coupled solver, and global Newton model parameters."""
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING, Literal
 
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonSolverCfg
+from isaaclab_newton.physics import FeatherstoneSolverCfg, MJWarpSolverCfg, NewtonSolverCfg
 
 from isaaclab.utils.configclass import configclass
 
@@ -121,30 +120,62 @@ class VBDSolverCfg(NewtonModelSolverCfg):
 
 @configclass
 class CoupledMJWarpVBDSolverCfg(NewtonModelSolverCfg):
-    """Deprecated configuration for the coupled MJWarp and VBD solver.
+    """Configuration for the coupled MJWarp + VBD solver.
 
-    .. deprecated:: 0.5.0
-        Use :class:`isaaclab_contrib.custom_coupling.CoupledMJWarpVBDSolverCfg`.
+    Alternates a rigid-body solver (:class:`MJWarpSolverCfg`) and VBD per substep.
+    The coupling direction is controlled by :attr:`coupling_mode`.
     """
 
-    class_type: type[NewtonManager] | str = (
-        "isaaclab_contrib.custom_coupling.coupled_mjwarp_vbd_manager:NewtonCoupledMJWarpVBDManager"
-    )
-    """Manager class for the coupled MJWarp and VBD solver."""
+    class_type: type[NewtonManager] | str = "{DIR}.coupled_mjwarp_vbd_manager:NewtonCoupledMJWarpVBDManager"
+    """Manager class for the coupled MJWarp + VBD solver."""
 
     rigid_solver_cfg: MJWarpSolverCfg = MJWarpSolverCfg()
     """Rigid-body sub-solver configuration."""
 
     soft_solver_cfg: VBDSolverCfg = VBDSolverCfg(integrate_with_external_rigid_solver=True)
-    """VBD sub-solver configuration."""
+    """VBD sub-solver configuration for cloth/particle dynamics."""
 
     coupling_mode: Literal["one_way", "two_way"] = "two_way"
-    """Coupling direction between the rigid and VBD solvers."""
+    """Coupling direction between the rigid and VBD solvers.
 
-    def __post_init__(self) -> None:
-        warnings.warn(
-            "isaaclab_contrib.deformable.CoupledMJWarpVBDSolverCfg is deprecated. "
-            "Use isaaclab_contrib.custom_coupling.CoupledMJWarpVBDSolverCfg.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    - ``"one_way"``: Rigid -> soft only.
+    - ``"two_way"``: Same-substep two-way coupling with normal + Coulomb friction.
+    """
+
+
+@configclass
+class CoupledFeatherstoneVBDSolverCfg(NewtonModelSolverCfg):
+    """Configuration for the coupled Featherstone + VBD solver.
+
+    Alternates a rigid-body solver (:class:`FeatherstoneSolverCfg`) and VBD per
+    substep. The coupling direction is controlled by :attr:`coupling_mode`.
+    """
+
+    class_type: type[NewtonManager] | str = "{DIR}.coupled_featherstone_vbd_manager:NewtonCoupledFeatherstoneVBDManager"
+    """Manager class for the coupled Featherstone + VBD solver."""
+
+    rigid_solver_cfg: FeatherstoneSolverCfg = FeatherstoneSolverCfg()
+    """Rigid-body sub-solver configuration."""
+
+    soft_solver_cfg: VBDSolverCfg = VBDSolverCfg(integrate_with_external_rigid_solver=True)
+    """VBD sub-solver configuration for cloth/particle dynamics."""
+
+    coupling_mode: Literal["one_way", "two_way", "kinematic"] = "kinematic"
+    """Coupling direction between the rigid and VBD solvers.
+
+    - ``"kinematic"``: Rigid -> soft only (default)
+    - ``"one_way"``: Rigid -> soft only (existing behavior).
+    - ``"two_way"``: Same-substep two-way coupling with normal + Coulomb friction.
+    """
+
+    kinematic_velocity_limit_scale: float = 1.0
+    """Velocity-limit multiplier used when converting position targets to kinematic joint velocities."""
+
+    kinematic_joint_drive_mode: Literal["velocity", "position"] = "velocity"
+    """Joint target source used by kinematic coupling.
+
+    - ``"velocity"``: use ``control.joint_target_vel`` directly. This preserves
+      the original kinematic-mode behavior.
+    - ``"position"``: convert ``control.joint_target_pos`` to bounded joint
+      velocities. This is useful for IsaacLab relative joint-position actions.
+    """

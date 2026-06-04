@@ -133,6 +133,7 @@ def _kinematic_newton_cfg(
             rigid_solver_cfg=FeatherstoneSolverCfg(update_mass_matrix_interval=num_substeps),
             soft_solver_cfg=soft_solver_cfg,
             coupling_mode="kinematic",
+            kinematic_joint_drive_mode="position",
             kinematic_velocity_limit_scale=velocity_limit_scale,
         ),
         collision_cfg=NewtonCollisionPipelineCfg(soft_contact_max=SOFT_CONTACT_MAX),

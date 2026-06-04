@@ -46,7 +46,7 @@ def deformable_root_vel_b(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("deformable"),
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Mean deformable nodal velocity in the robot root frame."""
+    """Deformable root velocity in the robot root frame."""
     asset: DeformableObject = env.scene[asset_cfg.name]
     robot: Articulation = env.scene[robot_cfg.name]
     vel_b = quat_apply_inverse(robot.data.root_quat_w.torch, asset.data.root_vel_w.torch)

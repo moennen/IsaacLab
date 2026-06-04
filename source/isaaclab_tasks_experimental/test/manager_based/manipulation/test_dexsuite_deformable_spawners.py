@@ -21,9 +21,7 @@ def test_cuboid_tet_grid_has_positive_volume_and_closed_surface():
     volumes = []
     for tet in tets:
         points = vertices[tet]
-        volume = np.linalg.det(
-            np.stack((points[1] - points[0], points[2] - points[0], points[3] - points[0]))
-        ) / 6.0
+        volume = np.linalg.det(np.stack((points[1] - points[0], points[2] - points[0], points[3] - points[0]))) / 6.0
         volumes.append(volume)
 
     assert min(volumes) > 0.0

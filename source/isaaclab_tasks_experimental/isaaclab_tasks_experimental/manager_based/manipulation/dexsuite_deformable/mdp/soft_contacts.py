@@ -142,7 +142,10 @@ class _SoftContactAggregator:
         body_to_slot = np.full(body_count, -1, dtype=np.int32)
         matched = [0 for _ in range(self._num_slots)]
         for body_idx, label in enumerate(labels):
-            body_name = str(label).rsplit("/", 1)[-1]
+            label = str(label)
+            if not self._label_matches_robot_asset(label):
+                continue
+            body_name = label.rsplit("/", 1)[-1]
             for slot, patterns in enumerate(self._body_name_groups):
                 if any(_pattern_matches(pattern, body_name) for pattern in patterns):
                     body_to_slot[body_idx] = slot
@@ -162,6 +165,21 @@ class _SoftContactAggregator:
         self._model_id = model_id
         self._body_count = body_count
         self._last_step = -1
+
+    def _label_matches_robot_asset(self, label: str) -> bool:
+        """Restrict full USD-path body labels to the selected robot asset."""
+        if "/" not in label:
+            return True
+
+        robot = self._env.scene[self._robot_cfg.name]
+        robot_prim_leaf = str(robot.cfg.prim_path).rstrip("/").rsplit("/", 1)[-1]
+        if robot_prim_leaf.startswith("{") or not robot_prim_leaf:
+            return True
+        return (
+            label.startswith(f"{robot_prim_leaf}/")
+            or f"/{robot_prim_leaf}/" in label
+            or label.endswith(f"/{robot_prim_leaf}")
+        )
 
 
 _SOFT_CONTACT_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()

@@ -55,7 +55,11 @@ def _recurse(initial_value, final_value, data, frac):
 
 
 class DeformableCommandDifficultyScheduler(ManagerTermBase):
-    """Adaptive difficulty scheduler driven by the deformable command success metric."""
+    """Adaptive difficulty scheduler driven by the deformable command success metric.
+
+    Unlike rigid Dexsuite's sticky success reward, this task currently promotes
+    difficulty from the command term's final-step success metric at reset time.
+    """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
