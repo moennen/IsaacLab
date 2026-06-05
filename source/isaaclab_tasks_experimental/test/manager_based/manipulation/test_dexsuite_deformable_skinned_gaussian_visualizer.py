@@ -1,0 +1,133 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+import numpy as np
+import warp as wp
+from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.skinned_gaussian_visualizer import (
+    DEFAULT_SKINNED_GAUSSIAN_USD_PATH,
+    SkinnedGaussianNewtonVisualizerCfg,
+    load_skinned_gaussian_visual_data,
+    skin_gaussian_points_kernel,
+)
+from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.tools.package_skinned_gaussian_tet_asset import (  # noqa: E501
+    package_skinned_gaussian_tet_asset,
+)
+
+from pxr import Gf, Sdf, Usd
+
+from isaaclab_tasks.utils.hydra import resolve_presets
+from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+
+TASK_NAME = "Isaac-Dexsuite-Deformable-Kuka-Allegro-Lift-v0"
+
+
+def _load_env_cfg():
+    return load_cfg_from_registry(TASK_NAME, "env_cfg_entry_point")
+
+
+def _write_tiny_skinned_asset(tmp_path):
+    gaussian_path = tmp_path / "gaussian.usda"
+    tet_path = tmp_path / "tet.usda"
+    output_path = tmp_path / "combined.usda"
+
+    gaussian_stage = Usd.Stage.CreateNew(str(gaussian_path))
+    gaussian_prim = gaussian_stage.DefinePrim("/World/Gaussians/gaussians_0", "ParticleField3DGaussianSplat")
+    gaussian_prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set(
+        [Gf.Vec3f(0.25, 0.25, 0.25), Gf.Vec3f(0.50, 0.25, 0.125)]
+    )
+    gaussian_prim.CreateAttribute("scales", Sdf.ValueTypeNames.Float3Array).Set(
+        [Gf.Vec3f(0.001, 0.002, 0.003), Gf.Vec3f(0.004, 0.005, 0.006)]
+    )
+    gaussian_prim.CreateAttribute("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Color3fArray).Set(
+        [
+            Gf.Vec3f(0.0, 0.0, 0.0),
+            Gf.Vec3f(1.0, 1.0, 1.0),
+            Gf.Vec3f(0.5, 0.0, -0.5),
+            Gf.Vec3f(1.0, 1.0, 1.0),
+        ]
+    )
+    gaussian_stage.Save()
+
+    tet_stage = Usd.Stage.CreateNew(str(tet_path))
+    tet_prim = tet_stage.DefinePrim("/TetMesh", "Xform")
+    tet_prim.CreateAttribute("vbd:vertices", Sdf.ValueTypeNames.Point3fArray).Set(
+        [Gf.Vec3f(0.0, 0.0, 0.0), Gf.Vec3f(1.0, 0.0, 0.0), Gf.Vec3f(0.0, 1.0, 0.0), Gf.Vec3f(0.0, 0.0, 1.0)]
+    )
+    tet_prim.CreateAttribute("vbd:tet_indices", Sdf.ValueTypeNames.IntArray).Set([0, 1, 2, 3])
+    tet_stage.Save()
+
+    package_skinned_gaussian_tet_asset(
+        gaussian_usd_path=str(gaussian_path),
+        tet_usd_path=str(tet_path),
+        output_usd_path=str(output_path),
+        rotate_tet_y_up_to_z_up=False,
+        center_tet_to_origin=False,
+        chunk_size=16,
+    )
+    return output_path
+
+
+def test_skinned_gaussian_visualizer_is_disabled_by_default():
+    env_cfg = resolve_presets(_load_env_cfg(), frozenset())
+
+    assert env_cfg.sim.visualizer_cfgs == []
+
+
+def test_skinned_gaussian_visualizer_preset_installs_task_newton_visualizer():
+    env_cfg = resolve_presets(_load_env_cfg(), {"skinned_gaussian_visualizer"})
+
+    assert isinstance(env_cfg.sim.visualizer_cfgs, SkinnedGaussianNewtonVisualizerCfg)
+    assert env_cfg.sim.visualizer_cfgs.visualizer_type == "newton"
+    assert env_cfg.sim.visualizer_cfgs.skinned_gaussian_usd_path == DEFAULT_SKINNED_GAUSSIAN_USD_PATH
+    assert env_cfg.sim.visualizer_cfgs.max_visible_envs == 1
+    assert env_cfg.sim.visualizer_cfgs.show_tet_surface is False
+    assert env_cfg.sim.visualizer_cfgs.show_tet_particles is False
+
+
+def test_load_skinned_gaussian_visual_data_reads_custom_binding(tmp_path):
+    usd_path = _write_tiny_skinned_asset(tmp_path)
+
+    data = load_skinned_gaussian_visual_data(str(usd_path), max_gaussians_per_env=None, radius_scale=2.0)
+
+    assert data.source_count == 2
+    assert data.selected_count == 2
+    np.testing.assert_array_equal(data.influence_indices, np.asarray([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int32))
+    np.testing.assert_allclose(data.influence_weights.reshape(-1, 4)[0], [0.25, 0.25, 0.25, 0.25], atol=1.0e-7)
+    np.testing.assert_allclose(data.radii, [0.004, 0.010], atol=1.0e-7)
+    np.testing.assert_allclose(data.colors[0], [0.5, 0.5, 0.5], atol=1.0e-7)
+
+
+def test_skin_gaussian_points_kernel_skins_visible_envs():
+    particle_q = wp.array(
+        [
+            wp.vec3f(0.0, 0.0, 0.0),
+            wp.vec3f(1.0, 0.0, 0.0),
+            wp.vec3f(0.0, 1.0, 0.0),
+            wp.vec3f(0.0, 0.0, 1.0),
+            wp.vec3f(10.0, 0.0, 0.0),
+            wp.vec3f(11.0, 0.0, 0.0),
+            wp.vec3f(10.0, 1.0, 0.0),
+            wp.vec3f(10.0, 0.0, 1.0),
+        ],
+        dtype=wp.vec3f,
+        device="cpu",
+    )
+    particle_offsets = wp.array([0, 4], dtype=wp.int32, device="cpu")
+    visible_env_ids = wp.array([0, 1], dtype=wp.int32, device="cpu")
+    influence_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device="cpu")
+    influence_weights = wp.array([0.25, 0.25, 0.25, 0.25], dtype=wp.float32, device="cpu")
+    out_points = wp.empty(2, dtype=wp.vec3f, device="cpu")
+
+    wp.launch(
+        skin_gaussian_points_kernel,
+        dim=2,
+        inputs=[particle_q, particle_offsets, visible_env_ids, influence_indices, influence_weights, 1],
+        outputs=[out_points],
+        device="cpu",
+    )
+
+    np.testing.assert_allclose(out_points.numpy(), [[0.25, 0.25, 0.25], [10.25, 0.25, 0.25]], atol=1.0e-7)

@@ -47,6 +47,7 @@ from isaaclab_tasks.utils import PresetCfg
 from isaaclab_assets.robots import KUKA_ALLEGRO_CFG
 
 from . import mdp
+from .skinned_gaussian_visualizer import SkinnedGaussianNewtonVisualizerCfg
 from .spawners import NewtonVbdTetAssetCfg
 
 FINGERTIP_LIST = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]
@@ -203,6 +204,14 @@ class PhysicsCfg(PresetCfg):
     )
 
     default = stable_kinematic
+
+
+@configclass
+class TaskVisualizerCfg(PresetCfg):
+    """Optional task-specific visualizer presets."""
+
+    default: list = []
+    skinned_gaussian_visualizer: SkinnedGaussianNewtonVisualizerCfg = SkinnedGaussianNewtonVisualizerCfg()
 
 
 DEFORMABLE_OBJECT_CFG = DeformableObjectCfg(
@@ -610,6 +619,7 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.render_interval = self.decimation
         self.sim.gravity = (0.0, 0.0, -9.81)
         self.sim.physics = PhysicsCfg()
+        self.sim.visualizer_cfgs = TaskVisualizerCfg()
 
 
 @configclass
