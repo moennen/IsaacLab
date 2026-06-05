@@ -151,6 +151,7 @@ def test_kit_play_env_registers_kit_and_newton_visualizer_cfgs():
     assert kit_visualizer.visualizer_type == "kit"
     assert isinstance(newton_visualizer, SkinnedGaussianNewtonVisualizerCfg)
     assert newton_visualizer.visualizer_type == "newton"
+    assert newton_visualizer.max_visible_envs is None
     assert env_cfg.viewer.eye == TASK_VIEW_EYE
     assert env_cfg.viewer.lookat == TASK_VIEW_LOOKAT
     assert kit_visualizer.eye == TASK_VIEW_EYE

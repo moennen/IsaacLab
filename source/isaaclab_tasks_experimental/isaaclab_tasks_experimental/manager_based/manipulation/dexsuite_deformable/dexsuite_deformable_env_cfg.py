@@ -651,5 +651,5 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg_KIT_PLAY(DexsuiteDeformableKukaAll
         self.sim.visualizer_cfgs = [
             SkinnedGaussianKitVisualizerCfg(max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV),
             KitVisualizerCfg(eye=TASK_VIEW_EYE, lookat=TASK_VIEW_LOOKAT),
-            SkinnedGaussianNewtonVisualizerCfg(),
+            SkinnedGaussianNewtonVisualizerCfg(max_visible_envs=None),
         ]
