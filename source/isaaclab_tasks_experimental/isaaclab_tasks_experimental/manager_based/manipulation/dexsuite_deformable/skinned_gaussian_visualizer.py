@@ -182,6 +182,12 @@ def _selected_sequence_values(value, selected: np.ndarray, source_count: int):
     return value
 
 
+def _set_gaussian_casts_shadows(gaussian_prim) -> None:
+    from pxr import Sdf, UsdGeom
+
+    UsdGeom.PrimvarsAPI(gaussian_prim).CreatePrimvar("doNotCastShadows", Sdf.ValueTypeNames.Bool).Set(False)
+
+
 def load_skinned_gaussian_visual_data(
     usd_path: str,
     gaussian_prim_path: str | None = None,
@@ -412,6 +418,7 @@ class SkinnedGaussianKitVisualizer(BaseVisualizer):
             gaussian_prim = stage.DefinePrim(prim_path, "ParticleField3DGaussianSplat")
             UsdGeom.Xformable(gaussian_prim).SetResetXformStack(True)
             self._copy_kit_gaussian_attrs(source_gaussian_prim, gaussian_prim, visual_data)
+            _set_gaussian_casts_shadows(gaussian_prim)
             position_attr = gaussian_prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray)
             position_attr.Set(zero_positions)
             position_attrs.append(position_attr)

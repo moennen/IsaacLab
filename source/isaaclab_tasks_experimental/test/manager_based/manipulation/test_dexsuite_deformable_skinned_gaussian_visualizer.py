@@ -19,6 +19,7 @@ from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.
     DEFAULT_SKINNED_GAUSSIAN_USD_PATH,
     SkinnedGaussianKitVisualizerCfg,
     SkinnedGaussianNewtonVisualizerCfg,
+    _set_gaussian_casts_shadows,
     load_skinned_gaussian_visual_data,
     skin_gaussian_points_env_local_kernel,
     skin_gaussian_points_kernel,
@@ -166,6 +167,19 @@ def test_load_skinned_gaussian_visual_data_reads_custom_binding(tmp_path):
     np.testing.assert_allclose(data.influence_weights.reshape(-1, 4)[0], [0.25, 0.25, 0.25, 0.25], atol=1.0e-7)
     np.testing.assert_allclose(data.radii, [0.004, 0.010], atol=1.0e-7)
     np.testing.assert_allclose(data.colors[0], [0.5, 0.5, 0.5], atol=1.0e-7)
+
+
+def test_set_gaussian_casts_shadows_disables_do_not_cast_shadow_primvar(tmp_path):
+    stage = Usd.Stage.CreateNew(str(tmp_path / "gaussian.usda"))
+    gaussian_prim = stage.DefinePrim("/World/Gaussian", "ParticleField3DGaussianSplat")
+    gaussian_prim.CreateAttribute("primvars:doNotCastShadows", Sdf.ValueTypeNames.Bool).Set(True)
+
+    _set_gaussian_casts_shadows(gaussian_prim)
+
+    attr = gaussian_prim.GetAttribute("primvars:doNotCastShadows")
+    assert attr.IsValid()
+    assert attr.GetTypeName() == Sdf.ValueTypeNames.Bool
+    assert attr.Get() is False
 
 
 def test_skin_gaussian_points_kernel_skins_visible_envs():
