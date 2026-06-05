@@ -17,6 +17,7 @@ from pathlib import Path
 from isaaclab_newton.physics import FeatherstoneSolverCfg, MJWarpSolverCfg, NewtonCfg
 from isaaclab_newton.physics.newton_collision_cfg import NewtonCollisionPipelineCfg
 from isaaclab_newton.sim.spawners.materials import NewtonDeformableBodyMaterialCfg
+from isaaclab_visualizers.kit import KitVisualizerCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
@@ -69,7 +70,6 @@ DEFORMABLE_K_MU = 1.0e5
 DEFORMABLE_K_LAMBDA = 1.0e5
 TASK_VIEW_EYE = (-2.25, 0.0, 0.75)
 TASK_VIEW_LOOKAT = (0.0, 0.0, 0.45)
-KIT_VIEW_MAX_VISIBLE_ENVS = 1
 KIT_VIEW_MAX_GAUSSIANS_PER_ENV = None
 # Covers the 1024-env ragdoll candidate space while preserving deterministic CUDA graph replay.
 SOFT_CONTACT_MAX = 8_388_608
@@ -215,13 +215,10 @@ class TaskVisualizerCfg(PresetCfg):
     """Optional task-specific visualizer presets."""
 
     default: list = []
-    kit_visualizer: SkinnedGaussianKitVisualizerCfg = SkinnedGaussianKitVisualizerCfg(
-        eye=TASK_VIEW_EYE,
-        lookat=TASK_VIEW_LOOKAT,
-        max_visible_envs=KIT_VIEW_MAX_VISIBLE_ENVS,
-        randomly_sample_visible_envs=False,
-        max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
-    )
+    kit_visualizer: list = [
+        SkinnedGaussianKitVisualizerCfg(max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV),
+        KitVisualizerCfg(eye=TASK_VIEW_EYE, lookat=TASK_VIEW_LOOKAT),
+    ]
     skinned_gaussian_visualizer: SkinnedGaussianNewtonVisualizerCfg = SkinnedGaussianNewtonVisualizerCfg()
 
 
@@ -651,10 +648,7 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg_KIT_PLAY(DexsuiteDeformableKukaAll
         super().__post_init__()
         self.viewer.eye = TASK_VIEW_EYE
         self.viewer.lookat = TASK_VIEW_LOOKAT
-        self.sim.visualizer_cfgs = SkinnedGaussianKitVisualizerCfg(
-            eye=TASK_VIEW_EYE,
-            lookat=TASK_VIEW_LOOKAT,
-            max_visible_envs=KIT_VIEW_MAX_VISIBLE_ENVS,
-            randomly_sample_visible_envs=False,
-            max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
-        )
+        self.sim.visualizer_cfgs = [
+            SkinnedGaussianKitVisualizerCfg(max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV),
+            KitVisualizerCfg(eye=TASK_VIEW_EYE, lookat=TASK_VIEW_LOOKAT),
+        ]

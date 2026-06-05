@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Task-local Newton visualizer for Gaussian splats skinned to the deformable tet proxy."""
+"""Task-local visualizers for Gaussian splats skinned to the deformable tet proxy."""
 
 from __future__ import annotations
 
@@ -13,10 +13,12 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
-from isaaclab_visualizers.kit import KitVisualizerCfg
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
+from isaaclab_visualizers.newton_adapter import resolve_visible_env_indices
 
 from isaaclab.utils.configclass import configclass
+from isaaclab.visualizers.base_visualizer import BaseVisualizer
+from isaaclab.visualizers.visualizer_cfg import VisualizerCfg
 
 logger = logging.getLogger(__name__)
 
@@ -97,9 +99,6 @@ class _SkinnedGaussianKitRuntime:
     position_attrs: list[object]
     gaussian_count: int
     total_points: int
-
-
-_KIT_CAMERA_REAPPLY_FRAMES = 30
 
 
 def _find_first_gaussian_prim(stage):
@@ -220,8 +219,11 @@ def load_skinned_gaussian_visual_data(
 
 
 @configclass
-class SkinnedGaussianKitVisualizerCfg(KitVisualizerCfg):
-    """Kit visualizer that renders skinned Gaussian splats for the deformable task."""
+class SkinnedGaussianKitVisualizerCfg(VisualizerCfg):
+    """Kit overlay that renders skinned Gaussian splats for the deformable task."""
+
+    visualizer_type: str = "kit"
+    """Type identifier used so ``--visualizer kit`` selects this overlay."""
 
     skinned_gaussian_usd_path: str = DEFAULT_SKINNED_GAUSSIAN_USD_PATH
     """Combined Gaussian + tet USD containing ``newton:deformableSkin:*`` metadata."""
@@ -238,31 +240,19 @@ class SkinnedGaussianKitVisualizerCfg(KitVisualizerCfg):
     hide_tet_visual_mesh: bool = True
     """Hide the coarse tetrahedral surface mesh when the Gaussian visual is available."""
 
-    camera_reapply_frames: int = _KIT_CAMERA_REAPPLY_FRAMES
-    """Number of initial Kit updates that re-apply the configured viewport camera pose."""
-
-    gaussian_scope_path: str = "/World/SkinnedGaussianVisuals"
-    """Root path for task-authored Gaussian visualization prims."""
+    gaussian_scope_path: str = "SkinnedGaussianVisuals"
+    """Per-environment scope path for task-authored Gaussian visualization prims."""
 
     gaussian_prim_name: str = "gaussians"
     """Per-environment Gaussian prim name under :attr:`gaussian_scope_path`."""
 
     def create_visualizer(self):
-        """Create the task-specific Kit visualizer."""
-        return _create_skinned_gaussian_kit_visualizer(self)
+        """Create the task-specific Kit Gaussian overlay."""
+        return SkinnedGaussianKitVisualizer(self)
 
 
-def _create_skinned_gaussian_kit_visualizer(cfg: SkinnedGaussianKitVisualizerCfg):
-    from isaaclab_visualizers.kit import KitVisualizer
-
-    class SkinnedGaussianKitVisualizer(_SkinnedGaussianKitVisualizerMixin, KitVisualizer):
-        pass
-
-    return SkinnedGaussianKitVisualizer(cfg)
-
-
-class _SkinnedGaussianKitVisualizerMixin:
-    """Kit visualizer overlaying task-authored Gaussian splats skinned to Newton particles."""
+class SkinnedGaussianKitVisualizer(BaseVisualizer):
+    """Kit overlay that authors task-local Gaussian splats skinned to Newton particles."""
 
     cfg: SkinnedGaussianKitVisualizerCfg
 
@@ -271,32 +261,35 @@ class _SkinnedGaussianKitVisualizerMixin:
         self._skinned_gaussian_kit: _SkinnedGaussianKitRuntime | None = None
         self._kit_hidden_tet_mesh_paths: list[str] = []
         self._kit_gaussian_load_error: str | None = None
-        self._kit_camera_reapply_frames_remaining = int(cfg.camera_reapply_frames)
+        self._env_ids: list[int] | None = None
+        self._resolved_visible_env_ids: list[int] | None = None
 
     def initialize(self, scene_data_provider) -> None:
         """Initialize Kit visualizer and author task-local Gaussian prims."""
-        super().initialize(scene_data_provider)
+        scene_data_provider = self._set_scene_data_provider(scene_data_provider)
+        self._env_ids = self._compute_visualized_env_ids()
+        self._resolved_visible_env_ids = resolve_visible_env_indices(
+            self._env_ids, self.cfg.max_visible_envs, scene_data_provider.num_envs
+        )
         self._initialize_kit_skinned_gaussian_runtime()
+        self._is_initialized = True
 
     def step(self, dt: float) -> None:
-        """Update Gaussian positions before Kit pumps the viewport."""
-        reapply_camera = self._kit_camera_reapply_frames_remaining > 0
-        if reapply_camera:
-            self._reapply_configured_camera()
+        """Update Gaussian positions before the standard Kit visualizer pumps the viewport."""
+        if not self._is_initialized or self._is_closed:
+            return
         self._update_kit_skinned_gaussians()
-        super().step(dt)
-        if reapply_camera:
-            self._reapply_configured_camera()
-            self._kit_camera_reapply_frames_remaining -= 1
-
-    def _reapply_configured_camera(self) -> None:
-        """Keep the task camera pose stable while the Kit viewport settles."""
-        self.set_camera_view(self.cfg.eye, self.cfg.lookat)
 
     def close(self) -> None:
         """Restore coarse mesh visibility before closing Kit resources."""
         self._restore_tet_visual_mesh_visibility()
-        super().close()
+        self._skinned_gaussian_kit = None
+        self._is_initialized = False
+        self._is_closed = True
+
+    def is_running(self) -> bool:
+        """Return whether the overlay should continue updating."""
+        return not self._is_closed
 
     def _initialize_kit_skinned_gaussian_runtime(self) -> None:
         from pxr import Sdf, Usd, UsdGeom, Vt
@@ -376,18 +369,14 @@ class _SkinnedGaussianKitVisualizerMixin:
             logger.info("[SkinnedGaussianKitVisualizer] No visible envs selected; Gaussian overlay disabled.")
             return
 
-        scope_path = str(self.cfg.gaussian_scope_path).rstrip("/")
-        stage.DefinePrim(scope_path, "Scope")
         position_attrs = []
         zero_positions = Vt.Vec3fArray.FromNumpy(np.zeros((visual_data.selected_count, 3), dtype=np.float32))
         for env_id in visible_env_ids:
-            env_scope_path = f"{scope_path}/env_{int(env_id)}"
+            env_scope_path = self._kit_gaussian_scope_path(int(env_id))
             prim_path = f"{env_scope_path}/{self.cfg.gaussian_prim_name}"
             stage.DefinePrim(env_scope_path, "Xform")
             gaussian_prim = stage.DefinePrim(prim_path, "ParticleField3DGaussianSplat")
             UsdGeom.Xformable(gaussian_prim).SetResetXformStack(True)
-            partition_attr = gaussian_prim.CreateAttribute("omni:scenePartition", Sdf.ValueTypeNames.Token)
-            partition_attr.Set(f"env_{int(env_id)}")
             self._copy_kit_gaussian_attrs(source_gaussian_prim, gaussian_prim, visual_data)
             position_attr = gaussian_prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray)
             position_attr.Set(zero_positions)
@@ -417,6 +406,14 @@ class _SkinnedGaussianKitVisualizerMixin:
             visual_data.stride,
             visible_env_ids.size,
         )
+
+    def _kit_gaussian_scope_path(self, env_id: int) -> str:
+        scope_path = str(self.cfg.gaussian_scope_path).strip()
+        if not scope_path:
+            scope_path = "SkinnedGaussianVisuals"
+        if scope_path.startswith("/"):
+            return f"{scope_path.rstrip('/')}/env_{env_id}"
+        return f"/World/envs/env_{env_id}/{scope_path.strip('/')}"
 
     def _copy_kit_gaussian_attrs(self, source_prim, gaussian_prim, visual_data: SkinnedGaussianVisualData) -> None:
         for source_attr in source_prim.GetAttributes():
