@@ -11,6 +11,8 @@ import sys
 import numpy as np
 import warp as wp
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.dexsuite_deformable_env_cfg import (
+    KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
+    KIT_VIEW_MAX_VISIBLE_ENVS,
     TASK_VIEW_EYE,
     TASK_VIEW_LOOKAT,
 )
@@ -121,7 +123,8 @@ def test_kit_visualizer_preset_installs_task_kit_visualizer():
 
     assert isinstance(env_cfg.sim.visualizer_cfgs, SkinnedGaussianKitVisualizerCfg)
     assert env_cfg.sim.visualizer_cfgs.visualizer_type == "kit"
-    assert env_cfg.sim.visualizer_cfgs.max_visible_envs is None
+    assert env_cfg.sim.visualizer_cfgs.max_visible_envs == KIT_VIEW_MAX_VISIBLE_ENVS
+    assert env_cfg.sim.visualizer_cfgs.max_gaussians_per_env == KIT_VIEW_MAX_GAUSSIANS_PER_ENV
     assert env_cfg.sim.visualizer_cfgs.hide_tet_visual_mesh is True
     assert env_cfg.sim.visualizer_cfgs.eye == TASK_VIEW_EYE
     assert env_cfg.sim.visualizer_cfgs.lookat == TASK_VIEW_LOOKAT
@@ -133,7 +136,8 @@ def test_kit_play_env_uses_kit_visualizer_cfg():
     assert env_cfg.scene.num_envs == 16
     assert isinstance(env_cfg.sim.visualizer_cfgs, SkinnedGaussianKitVisualizerCfg)
     assert env_cfg.sim.visualizer_cfgs.visualizer_type == "kit"
-    assert env_cfg.sim.visualizer_cfgs.max_visible_envs is None
+    assert env_cfg.sim.visualizer_cfgs.max_visible_envs == KIT_VIEW_MAX_VISIBLE_ENVS
+    assert env_cfg.sim.visualizer_cfgs.max_gaussians_per_env == KIT_VIEW_MAX_GAUSSIANS_PER_ENV
     assert env_cfg.sim.visualizer_cfgs.hide_tet_visual_mesh is True
     assert env_cfg.viewer.eye == TASK_VIEW_EYE
     assert env_cfg.viewer.lookat == TASK_VIEW_LOOKAT

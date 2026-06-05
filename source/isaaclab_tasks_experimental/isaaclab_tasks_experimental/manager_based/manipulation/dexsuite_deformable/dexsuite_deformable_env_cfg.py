@@ -69,6 +69,8 @@ DEFORMABLE_K_MU = 1.0e5
 DEFORMABLE_K_LAMBDA = 1.0e5
 TASK_VIEW_EYE = (-2.25, 0.0, 0.75)
 TASK_VIEW_LOOKAT = (0.0, 0.0, 0.45)
+KIT_VIEW_MAX_VISIBLE_ENVS = 1
+KIT_VIEW_MAX_GAUSSIANS_PER_ENV = None
 # Covers the 1024-env ragdoll candidate space while preserving deterministic CUDA graph replay.
 SOFT_CONTACT_MAX = 8_388_608
 
@@ -216,8 +218,9 @@ class TaskVisualizerCfg(PresetCfg):
     kit_visualizer: SkinnedGaussianKitVisualizerCfg = SkinnedGaussianKitVisualizerCfg(
         eye=TASK_VIEW_EYE,
         lookat=TASK_VIEW_LOOKAT,
-        max_visible_envs=None,
+        max_visible_envs=KIT_VIEW_MAX_VISIBLE_ENVS,
         randomly_sample_visible_envs=False,
+        max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
     )
     skinned_gaussian_visualizer: SkinnedGaussianNewtonVisualizerCfg = SkinnedGaussianNewtonVisualizerCfg()
 
@@ -651,6 +654,7 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg_KIT_PLAY(DexsuiteDeformableKukaAll
         self.sim.visualizer_cfgs = SkinnedGaussianKitVisualizerCfg(
             eye=TASK_VIEW_EYE,
             lookat=TASK_VIEW_LOOKAT,
-            max_visible_envs=None,
+            max_visible_envs=KIT_VIEW_MAX_VISIBLE_ENVS,
             randomly_sample_visible_envs=False,
+            max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
         )

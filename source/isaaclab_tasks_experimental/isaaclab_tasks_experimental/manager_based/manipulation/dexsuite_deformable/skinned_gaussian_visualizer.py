@@ -99,6 +99,9 @@ class _SkinnedGaussianKitRuntime:
     total_points: int
 
 
+_KIT_CAMERA_REAPPLY_FRAMES = 30
+
+
 def _find_first_gaussian_prim(stage):
     for prim in stage.Traverse():
         if prim.GetTypeName() == "ParticleField3DGaussianSplat":
@@ -235,6 +238,9 @@ class SkinnedGaussianKitVisualizerCfg(KitVisualizerCfg):
     hide_tet_visual_mesh: bool = True
     """Hide the coarse tetrahedral surface mesh when the Gaussian visual is available."""
 
+    camera_reapply_frames: int = _KIT_CAMERA_REAPPLY_FRAMES
+    """Number of initial Kit updates that re-apply the configured viewport camera pose."""
+
     gaussian_scope_path: str = "/World/SkinnedGaussianVisuals"
     """Root path for task-authored Gaussian visualization prims."""
 
@@ -265,6 +271,7 @@ class _SkinnedGaussianKitVisualizerMixin:
         self._skinned_gaussian_kit: _SkinnedGaussianKitRuntime | None = None
         self._kit_hidden_tet_mesh_paths: list[str] = []
         self._kit_gaussian_load_error: str | None = None
+        self._kit_camera_reapply_frames_remaining = int(cfg.camera_reapply_frames)
 
     def initialize(self, scene_data_provider) -> None:
         """Initialize Kit visualizer and author task-local Gaussian prims."""
@@ -273,8 +280,18 @@ class _SkinnedGaussianKitVisualizerMixin:
 
     def step(self, dt: float) -> None:
         """Update Gaussian positions before Kit pumps the viewport."""
+        reapply_camera = self._kit_camera_reapply_frames_remaining > 0
+        if reapply_camera:
+            self._reapply_configured_camera()
         self._update_kit_skinned_gaussians()
         super().step(dt)
+        if reapply_camera:
+            self._reapply_configured_camera()
+            self._kit_camera_reapply_frames_remaining -= 1
+
+    def _reapply_configured_camera(self) -> None:
+        """Keep the task camera pose stable while the Kit viewport settles."""
+        self.set_camera_view(self.cfg.eye, self.cfg.lookat)
 
     def close(self) -> None:
         """Restore coarse mesh visibility before closing Kit resources."""
