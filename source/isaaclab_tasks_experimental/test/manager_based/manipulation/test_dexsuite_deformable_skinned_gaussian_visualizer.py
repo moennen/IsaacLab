@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import numpy as np
 import warp as wp
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.skinned_gaussian_visualizer import (
@@ -16,6 +19,7 @@ from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.tools.package_skinned_gaussian_tet_asset import (  # noqa: E501
     package_skinned_gaussian_tet_asset,
 )
+from isaaclab_visualizers.kit import KitVisualizerCfg
 
 from pxr import Gf, Sdf, Usd
 
@@ -23,10 +27,30 @@ from isaaclab_tasks.utils.hydra import resolve_presets
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 
 TASK_NAME = "Isaac-Dexsuite-Deformable-Kuka-Allegro-Lift-v0"
+KIT_PLAY_TASK_NAME = "Isaac-Dexsuite-Deformable-Kuka-Allegro-Lift-Kit-Play-v0"
 
 
 def _load_env_cfg():
     return load_cfg_from_registry(TASK_NAME, "env_cfg_entry_point")
+
+
+def test_kit_play_cfg_import_does_not_preload_newton_or_pxr():
+    code = f"""
+import sys
+
+import isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable
+from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+
+load_cfg_from_registry({KIT_PLAY_TASK_NAME!r}, "env_cfg_entry_point")
+
+if any(name == "pxr" or name.startswith("pxr.") for name in sys.modules):
+    raise SystemExit("pxr was imported while loading the Kit play env cfg")
+if any(name == "newton" or name.startswith("newton.") for name in sys.modules):
+    raise SystemExit("newton was imported while loading the Kit play env cfg")
+"""
+    result = subprocess.run([sys.executable, "-c", code], check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
 
 
 def _write_tiny_skinned_asset(tmp_path):
@@ -86,6 +110,23 @@ def test_skinned_gaussian_visualizer_preset_installs_task_newton_visualizer():
     assert env_cfg.sim.visualizer_cfgs.max_visible_envs == 1
     assert env_cfg.sim.visualizer_cfgs.show_tet_surface is False
     assert env_cfg.sim.visualizer_cfgs.show_tet_particles is False
+
+
+def test_kit_visualizer_preset_installs_task_kit_visualizer():
+    env_cfg = resolve_presets(_load_env_cfg(), {"kit_visualizer"})
+
+    assert isinstance(env_cfg.sim.visualizer_cfgs, KitVisualizerCfg)
+    assert env_cfg.sim.visualizer_cfgs.visualizer_type == "kit"
+    assert env_cfg.sim.visualizer_cfgs.max_visible_envs is None
+
+
+def test_kit_play_env_uses_kit_visualizer_cfg():
+    env_cfg = load_cfg_from_registry(KIT_PLAY_TASK_NAME, "env_cfg_entry_point")
+
+    assert env_cfg.scene.num_envs == 16
+    assert isinstance(env_cfg.sim.visualizer_cfgs, KitVisualizerCfg)
+    assert env_cfg.sim.visualizer_cfgs.visualizer_type == "kit"
+    assert env_cfg.sim.visualizer_cfgs.max_visible_envs is None
 
 
 def test_load_skinned_gaussian_visual_data_reads_custom_binding(tmp_path):

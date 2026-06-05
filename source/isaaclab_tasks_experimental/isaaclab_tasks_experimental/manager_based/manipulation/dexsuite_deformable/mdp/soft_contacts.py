@@ -15,11 +15,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import warp as wp
-from isaaclab_newton.physics import NewtonManager
 
 from isaaclab.managers import SceneEntityCfg
-
-from isaaclab_contrib.deformable.kernels import aggregate_soft_contact_counts
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -83,6 +80,10 @@ class _SoftContactAggregator:
 
     def counts(self) -> torch.Tensor:
         """Return raw active soft-contact counts shaped ``(num_envs, num_slots)``."""
+        from isaaclab_newton.physics import NewtonManager
+
+        from isaaclab_contrib.deformable.kernels import aggregate_soft_contact_counts
+
         model = NewtonManager._model
         contacts = NewtonManager._contacts
         if model is None or contacts is None:

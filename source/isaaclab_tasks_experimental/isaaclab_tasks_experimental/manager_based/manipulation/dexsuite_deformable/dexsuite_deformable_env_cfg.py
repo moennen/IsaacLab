@@ -17,6 +17,7 @@ from pathlib import Path
 from isaaclab_newton.physics import FeatherstoneSolverCfg, MJWarpSolverCfg, NewtonCfg
 from isaaclab_newton.physics.newton_collision_cfg import NewtonCollisionPipelineCfg
 from isaaclab_newton.sim.spawners.materials import NewtonDeformableBodyMaterialCfg
+from isaaclab_visualizers.kit import KitVisualizerCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
@@ -211,6 +212,12 @@ class TaskVisualizerCfg(PresetCfg):
     """Optional task-specific visualizer presets."""
 
     default: list = []
+    kit_visualizer: KitVisualizerCfg = KitVisualizerCfg(
+        eye=(-2.20, 0.10, 0.90),
+        lookat=(-0.55, 0.05, 0.45),
+        max_visible_envs=None,
+        randomly_sample_visible_envs=False,
+    )
     skinned_gaussian_visualizer: SkinnedGaussianNewtonVisualizerCfg = SkinnedGaussianNewtonVisualizerCfg()
 
 
@@ -630,3 +637,17 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg_PLAY(DexsuiteDeformableKukaAllegro
         super().__post_init__()
         self.scene.num_envs = 16
         self.commands.deformable_position.debug_vis = True
+
+
+@configclass
+class DexsuiteDeformableKukaAllegroLiftEnvCfg_KIT_PLAY(DexsuiteDeformableKukaAllegroLiftEnvCfg_PLAY):
+    """Interactive Kit viewport variant for checking the USD/Fabric visual state."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.sim.visualizer_cfgs = KitVisualizerCfg(
+            eye=(-2.20, 0.10, 0.90),
+            lookat=(-0.55, 0.05, 0.45),
+            max_visible_envs=None,
+            randomly_sample_visible_envs=False,
+        )

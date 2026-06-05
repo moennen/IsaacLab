@@ -13,9 +13,6 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
-from isaaclab_newton.physics import NewtonManager
-from isaaclab_visualizers.newton.newton_visualization_markers import render_newton_visualization_markers
-from isaaclab_visualizers.newton.newton_visualizer import NewtonVisualizer
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
 
 from isaaclab.utils.configclass import configclass
@@ -226,10 +223,19 @@ class SkinnedGaussianNewtonVisualizerCfg(NewtonVisualizerCfg):
 
     def create_visualizer(self):
         """Create the task-specific Newton visualizer."""
-        return SkinnedGaussianNewtonVisualizer(self)
+        return _create_skinned_gaussian_newton_visualizer(self)
 
 
-class SkinnedGaussianNewtonVisualizer(NewtonVisualizer):
+def _create_skinned_gaussian_newton_visualizer(cfg: SkinnedGaussianNewtonVisualizerCfg):
+    from isaaclab_visualizers.newton.newton_visualizer import NewtonVisualizer
+
+    class SkinnedGaussianNewtonVisualizer(_SkinnedGaussianNewtonVisualizerMixin, NewtonVisualizer):
+        pass
+
+    return SkinnedGaussianNewtonVisualizer(cfg)
+
+
+class _SkinnedGaussianNewtonVisualizerMixin:
     """Newton visualizer overlaying skinned Gaussian proxy points."""
 
     cfg: SkinnedGaussianNewtonVisualizerCfg
@@ -249,6 +255,8 @@ class SkinnedGaussianNewtonVisualizer(NewtonVisualizer):
 
     def step(self, dt: float) -> None:
         """Advance visualization and log the skinned Gaussian point cloud inside the Newton frame."""
+        from isaaclab_newton.physics import NewtonManager
+
         if not self._is_initialized or self._is_closed:
             return
 
@@ -278,6 +286,10 @@ class SkinnedGaussianNewtonVisualizer(NewtonVisualizer):
                         self._viewer.log_state(self._state)
                         self._log_skinned_gaussians()
                         if self.cfg.enable_markers:
+                            from isaaclab_visualizers.newton.newton_visualization_markers import (
+                                render_newton_visualization_markers,
+                            )
+
                             render_newton_visualization_markers(
                                 self._viewer, self._resolved_visible_env_ids, num_envs=num_envs
                             )
@@ -376,6 +388,8 @@ class SkinnedGaussianNewtonVisualizer(NewtonVisualizer):
         )
 
     def _log_skinned_gaussians(self) -> None:
+        from isaaclab_newton.physics import NewtonManager
+
         runtime = self._skinned_gaussian
         if runtime is None or self._viewer is None:
             return

@@ -7,20 +7,34 @@
 
 from __future__ import annotations
 
+import functools
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import MISSING
+from typing import TYPE_CHECKING
 
 import numpy as np
-
-from pxr import Usd, UsdGeom, UsdShade
 
 from isaaclab.sim.spawners.materials.physics_materials_cfg import DeformableBodyMaterialBaseCfg
 from isaaclab.sim.spawners.materials.visual_materials_cfg import VisualMaterialCfg
 from isaaclab.sim.spawners.spawner_cfg import DeformableObjectSpawnerCfg
-from isaaclab.sim.utils import bind_visual_material, clone, create_prim, get_current_stage
 from isaaclab.utils.configclass import configclass
 from isaaclab.utils.version import has_kit
+
+if TYPE_CHECKING:
+    from pxr import Usd
+
+
+def _clone(func: Callable) -> Callable:
+    """Defer IsaacLab USD helper imports until spawning time."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        from isaaclab.sim.utils import clone
+
+        return clone(func)(*args, **kwargs)
+
+    return wrapper
 
 
 @configclass
@@ -133,6 +147,8 @@ def _vbd_tet_asset_geometry(
     center_to_origin: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load a legacy VBD tet asset and return vertices, tetrahedra, and surface triangles."""
+    from pxr import Usd
+
     source_stage = Usd.Stage.Open(str(usd_path))
     if source_stage is None:
         raise FileNotFoundError(f"Failed to open VBD tet asset: '{usd_path}'.")
@@ -217,6 +233,8 @@ def _cuboid_tet_grid(
 
 def _bind_physics_material_any_prim(stage: Usd.Stage, prim_path: str, material_path: str) -> None:
     """Bind a physics material without requiring PhysX/Omni deformable APIs."""
+    from pxr import UsdShade
+
     prim = stage.GetPrimAtPath(prim_path)
     material = UsdShade.Material(stage.GetPrimAtPath(material_path))
     if not prim.HasAPI(UsdShade.MaterialBindingAPI):
@@ -230,7 +248,7 @@ def _bind_physics_material_any_prim(stage: Usd.Stage, prim_path: str, material_p
     )
 
 
-@clone
+@_clone
 def spawn_newton_tet_cuboid(
     prim_path: str,
     cfg: NewtonTetCuboidCfg,
@@ -239,6 +257,10 @@ def spawn_newton_tet_cuboid(
     **kwargs,
 ) -> Usd.Prim:
     """Spawn a pre-tetrahedralized Newton cuboid deformable."""
+    from pxr import UsdGeom
+
+    from isaaclab.sim.utils import bind_visual_material, create_prim, get_current_stage
+
     stage = get_current_stage()
     if stage.GetPrimAtPath(prim_path).IsValid():
         raise ValueError(f"A prim already exists at path: '{prim_path}'.")
@@ -280,7 +302,7 @@ def spawn_newton_tet_cuboid(
     return root_prim
 
 
-@clone
+@_clone
 def spawn_newton_vbd_tet_asset(
     prim_path: str,
     cfg: NewtonVbdTetAssetCfg,
@@ -289,6 +311,10 @@ def spawn_newton_vbd_tet_asset(
     **kwargs,
 ) -> Usd.Prim:
     """Spawn a legacy VBD tet asset as a standard Newton deformable TetMesh."""
+    from pxr import UsdGeom
+
+    from isaaclab.sim.utils import bind_visual_material, create_prim, get_current_stage
+
     stage = get_current_stage()
     if stage.GetPrimAtPath(prim_path).IsValid():
         raise ValueError(f"A prim already exists at path: '{prim_path}'.")
