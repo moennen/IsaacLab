@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
+from isaaclab_visualizers.kit import KitVisualizerCfg
 from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonVisualizerCfg
 
 from isaaclab.utils.configclass import configclass
@@ -58,6 +59,7 @@ def skin_gaussian_points_kernel(
 class SkinnedGaussianVisualData:
     """CPU-side Gaussian skinning data loaded from USD."""
 
+    selected_indices: np.ndarray
     influence_indices: np.ndarray
     influence_weights: np.ndarray
     radii: np.ndarray
@@ -81,6 +83,20 @@ class _SkinnedGaussianRuntime:
     gaussian_count: int
     total_points: int
     colors_pending_upload: bool = True
+
+
+@dataclass
+class _SkinnedGaussianKitRuntime:
+    """Runtime buffers and USD attrs owned by the skinned Gaussian Kit visualizer."""
+
+    asset: object
+    influence_indices: wp.array
+    influence_weights: wp.array
+    visible_env_ids: wp.array
+    points: wp.array
+    position_attrs: list[object]
+    gaussian_count: int
+    total_points: int
 
 
 def _find_first_gaussian_prim(stage):
@@ -114,6 +130,20 @@ def _colors_from_gaussian_prim(gaussian_prim, point_count: int, selected: np.nda
             return np.ascontiguousarray(colors, dtype=np.float32)
 
     return np.ascontiguousarray(np.tile(np.asarray((0.45, 0.55, 0.95), dtype=np.float32), (selected.size, 1)))
+
+
+def _selected_sequence_values(value, selected: np.ndarray, source_count: int):
+    try:
+        value_count = len(value)
+    except TypeError:
+        return value
+
+    if value_count == source_count:
+        return [value[int(index)] for index in selected]
+    if source_count > 0 and value_count > source_count and value_count % source_count == 0:
+        stride = value_count // source_count
+        return [value[int(index) * stride + offset] for index in selected for offset in range(stride)]
+    return value
 
 
 def load_skinned_gaussian_visual_data(
@@ -175,6 +205,7 @@ def load_skinned_gaussian_visual_data(
     colors = _colors_from_gaussian_prim(gaussian_prim, point_count, selected)
 
     return SkinnedGaussianVisualData(
+        selected_indices=np.ascontiguousarray(selected, dtype=np.int32),
         influence_indices=np.ascontiguousarray(influence_indices, dtype=np.int32),
         influence_weights=np.ascontiguousarray(influence_weights, dtype=np.float32),
         radii=np.ascontiguousarray(radii, dtype=np.float32),
@@ -183,6 +214,261 @@ def load_skinned_gaussian_visual_data(
         selected_count=int(selected.size),
         stride=stride,
     )
+
+
+@configclass
+class SkinnedGaussianKitVisualizerCfg(KitVisualizerCfg):
+    """Kit visualizer that renders skinned Gaussian splats for the deformable task."""
+
+    skinned_gaussian_usd_path: str = DEFAULT_SKINNED_GAUSSIAN_USD_PATH
+    """Combined Gaussian + tet USD containing ``newton:deformableSkin:*`` metadata."""
+
+    gaussian_prim_path: str | None = None
+    """Optional Gaussian prim path. When omitted, the first ParticleField3DGaussianSplat prim is used."""
+
+    deformable_asset_name: str = "deformable"
+    """Scene asset name of the deformable object whose tet particles drive the Gaussians."""
+
+    max_gaussians_per_env: int | None = 20_000
+    """Maximum rendered Gaussian points per visible environment. Non-positive means all points."""
+
+    hide_tet_visual_mesh: bool = True
+    """Hide the coarse tetrahedral surface mesh when the Gaussian visual is available."""
+
+    gaussian_scope_path: str = "/World/SkinnedGaussianVisuals"
+    """Root path for task-authored Gaussian visualization prims."""
+
+    gaussian_prim_name: str = "gaussians"
+    """Per-environment Gaussian prim name under :attr:`gaussian_scope_path`."""
+
+    def create_visualizer(self):
+        """Create the task-specific Kit visualizer."""
+        return _create_skinned_gaussian_kit_visualizer(self)
+
+
+def _create_skinned_gaussian_kit_visualizer(cfg: SkinnedGaussianKitVisualizerCfg):
+    from isaaclab_visualizers.kit import KitVisualizer
+
+    class SkinnedGaussianKitVisualizer(_SkinnedGaussianKitVisualizerMixin, KitVisualizer):
+        pass
+
+    return SkinnedGaussianKitVisualizer(cfg)
+
+
+class _SkinnedGaussianKitVisualizerMixin:
+    """Kit visualizer overlaying task-authored Gaussian splats skinned to Newton particles."""
+
+    cfg: SkinnedGaussianKitVisualizerCfg
+
+    def __init__(self, cfg: SkinnedGaussianKitVisualizerCfg):
+        super().__init__(cfg)
+        self._skinned_gaussian_kit: _SkinnedGaussianKitRuntime | None = None
+        self._kit_hidden_tet_mesh_paths: list[str] = []
+        self._kit_gaussian_load_error: str | None = None
+
+    def initialize(self, scene_data_provider) -> None:
+        """Initialize Kit visualizer and author task-local Gaussian prims."""
+        super().initialize(scene_data_provider)
+        self._initialize_kit_skinned_gaussian_runtime()
+
+    def step(self, dt: float) -> None:
+        """Update Gaussian positions before Kit pumps the viewport."""
+        self._update_kit_skinned_gaussians()
+        super().step(dt)
+
+    def close(self) -> None:
+        """Restore coarse mesh visibility before closing Kit resources."""
+        self._restore_tet_visual_mesh_visibility()
+        super().close()
+
+    def _initialize_kit_skinned_gaussian_runtime(self) -> None:
+        from pxr import Sdf, Usd, UsdGeom, Vt
+
+        if self._scene_data_provider is None:
+            return
+        stage = self._scene_data_provider.usd_stage
+        if stage is None:
+            return
+
+        usd_path = Path(self.cfg.skinned_gaussian_usd_path).expanduser()
+        if not usd_path.is_file():
+            self._kit_gaussian_load_error = f"skinned Gaussian USD does not exist: '{usd_path}'"
+            logger.warning("[SkinnedGaussianKitVisualizer] %s", self._kit_gaussian_load_error)
+            return
+
+        scene = self._scene_data_provider.get_interactive_scene()
+        if scene is None:
+            self._kit_gaussian_load_error = "interactive scene is unavailable"
+            logger.warning("[SkinnedGaussianKitVisualizer] %s", self._kit_gaussian_load_error)
+            return
+        try:
+            asset = scene[self.cfg.deformable_asset_name]
+        except KeyError:
+            self._kit_gaussian_load_error = f"scene has no deformable asset named '{self.cfg.deformable_asset_name}'"
+            logger.warning("[SkinnedGaussianKitVisualizer] %s", self._kit_gaussian_load_error)
+            return
+
+        particle_offsets = getattr(asset.data, "_particle_offsets", None)
+        particles_per_body = getattr(asset.data, "_particles_per_body", None)
+        if particle_offsets is None or particles_per_body is None:
+            self._kit_gaussian_load_error = "deformable asset does not expose Newton particle offsets"
+            logger.warning("[SkinnedGaussianKitVisualizer] %s", self._kit_gaussian_load_error)
+            return
+
+        try:
+            visual_data = load_skinned_gaussian_visual_data(
+                str(usd_path),
+                self.cfg.gaussian_prim_path,
+                max_gaussians_per_env=self.cfg.max_gaussians_per_env,
+                radius_scale=1.0,
+            )
+        except Exception as exc:
+            self._kit_gaussian_load_error = str(exc)
+            logger.warning("[SkinnedGaussianKitVisualizer] Failed to load skinned Gaussian data: %s", exc)
+            return
+
+        if int(visual_data.influence_indices.max(initial=0)) >= int(particles_per_body):
+            self._kit_gaussian_load_error = (
+                f"skinning references tet vertex {int(visual_data.influence_indices.max())}, "
+                f"but deformable asset has only {int(particles_per_body)} particles per body"
+            )
+            logger.warning("[SkinnedGaussianKitVisualizer] %s", self._kit_gaussian_load_error)
+            return
+
+        source_stage = Usd.Stage.Open(str(usd_path))
+        if source_stage is None:
+            self._kit_gaussian_load_error = f"failed to open skinned Gaussian USD: '{usd_path}'"
+            logger.warning("[SkinnedGaussianKitVisualizer] %s", self._kit_gaussian_load_error)
+            return
+        source_gaussian_prim = (
+            source_stage.GetPrimAtPath(self.cfg.gaussian_prim_path)
+            if self.cfg.gaussian_prim_path
+            else _find_first_gaussian_prim(source_stage)
+        )
+        if not source_gaussian_prim.IsValid():
+            self._kit_gaussian_load_error = f"could not find Gaussian prim '{self.cfg.gaussian_prim_path}'"
+            logger.warning("[SkinnedGaussianKitVisualizer] %s", self._kit_gaussian_load_error)
+            return
+
+        num_envs = self._scene_data_provider.num_envs
+        env_ids = self._resolved_visible_env_ids
+        visible_env_ids = (
+            np.arange(num_envs, dtype=np.int32) if env_ids is None else np.asarray(env_ids, dtype=np.int32)
+        )
+        if visible_env_ids.size == 0:
+            logger.info("[SkinnedGaussianKitVisualizer] No visible envs selected; Gaussian overlay disabled.")
+            return
+
+        scope_path = str(self.cfg.gaussian_scope_path).rstrip("/")
+        stage.DefinePrim(scope_path, "Scope")
+        position_attrs = []
+        zero_positions = Vt.Vec3fArray.FromNumpy(np.zeros((visual_data.selected_count, 3), dtype=np.float32))
+        for env_id in visible_env_ids:
+            env_scope_path = f"{scope_path}/env_{int(env_id)}"
+            prim_path = f"{env_scope_path}/{self.cfg.gaussian_prim_name}"
+            stage.DefinePrim(env_scope_path, "Xform")
+            gaussian_prim = stage.DefinePrim(prim_path, "ParticleField3DGaussianSplat")
+            UsdGeom.Xformable(gaussian_prim).SetResetXformStack(True)
+            partition_attr = gaussian_prim.CreateAttribute("omni:scenePartition", Sdf.ValueTypeNames.Token)
+            partition_attr.Set(f"env_{int(env_id)}")
+            self._copy_kit_gaussian_attrs(source_gaussian_prim, gaussian_prim, visual_data)
+            position_attr = gaussian_prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray)
+            position_attr.Set(zero_positions)
+            position_attrs.append(position_attr)
+
+        if self.cfg.hide_tet_visual_mesh:
+            self._hide_tet_visual_mesh(stage, visible_env_ids)
+
+        device = getattr(particle_offsets, "device", None) or "cuda:0"
+        gaussian_count = visual_data.selected_count
+        total_points = int(visible_env_ids.size) * gaussian_count
+        self._skinned_gaussian_kit = _SkinnedGaussianKitRuntime(
+            asset=asset,
+            influence_indices=wp.array(visual_data.influence_indices, dtype=wp.int32, device=device),
+            influence_weights=wp.array(visual_data.influence_weights, dtype=wp.float32, device=device),
+            visible_env_ids=wp.array(visible_env_ids, dtype=wp.int32, device=device),
+            points=wp.empty(total_points, dtype=wp.vec3f, device=device),
+            position_attrs=position_attrs,
+            gaussian_count=gaussian_count,
+            total_points=total_points,
+        )
+        self._update_kit_skinned_gaussians()
+        logger.info(
+            "[SkinnedGaussianKitVisualizer] Authored %d/%d Gaussian splats per env (stride=%d), visible_envs=%d.",
+            visual_data.selected_count,
+            visual_data.source_count,
+            visual_data.stride,
+            visible_env_ids.size,
+        )
+
+    def _copy_kit_gaussian_attrs(self, source_prim, gaussian_prim, visual_data: SkinnedGaussianVisualData) -> None:
+        for source_attr in source_prim.GetAttributes():
+            name = source_attr.GetName()
+            if name == "positions" or name.startswith("newton:deformableSkin:"):
+                continue
+            value = source_attr.Get()
+            if value is None:
+                continue
+            value = _selected_sequence_values(value, visual_data.selected_indices, visual_data.source_count)
+            dst_attr = gaussian_prim.CreateAttribute(name, source_attr.GetTypeName(), custom=source_attr.IsCustom())
+            dst_attr.Set(value)
+
+    def _hide_tet_visual_mesh(self, stage, visible_env_ids: np.ndarray) -> None:
+        from pxr import UsdGeom
+
+        for env_id in visible_env_ids:
+            mesh_path = f"/World/envs/env_{int(env_id)}/Deformable/geometry/visual_mesh"
+            prim = stage.GetPrimAtPath(mesh_path)
+            if prim.IsValid():
+                UsdGeom.Imageable(prim).MakeInvisible()
+                self._kit_hidden_tet_mesh_paths.append(mesh_path)
+
+    def _restore_tet_visual_mesh_visibility(self) -> None:
+        if not self._kit_hidden_tet_mesh_paths or self._scene_data_provider is None:
+            return
+        from pxr import UsdGeom
+
+        stage = self._scene_data_provider.usd_stage
+        if stage is None:
+            return
+        for mesh_path in self._kit_hidden_tet_mesh_paths:
+            prim = stage.GetPrimAtPath(mesh_path)
+            if prim.IsValid():
+                UsdGeom.Imageable(prim).MakeVisible()
+        self._kit_hidden_tet_mesh_paths.clear()
+
+    def _update_kit_skinned_gaussians(self) -> None:
+        runtime = self._skinned_gaussian_kit
+        if runtime is None:
+            return
+
+        from isaaclab_newton.physics import NewtonManager
+
+        from pxr import Vt
+
+        state = NewtonManager.get_state_0()
+        particle_q = getattr(state, "particle_q", None) if state is not None else None
+        if particle_q is None:
+            return
+
+        particle_offsets = getattr(runtime.asset.data, "_particle_offsets")
+        wp.launch(
+            skin_gaussian_points_kernel,
+            dim=runtime.total_points,
+            inputs=[
+                particle_q,
+                particle_offsets,
+                runtime.visible_env_ids,
+                runtime.influence_indices,
+                runtime.influence_weights,
+                runtime.gaussian_count,
+            ],
+            outputs=[runtime.points],
+            device=runtime.points.device,
+        )
+        points = runtime.points.numpy().reshape(len(runtime.position_attrs), runtime.gaussian_count, 3)
+        for env_points, position_attr in zip(points, runtime.position_attrs):
+            position_attr.Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(env_points, dtype=np.float32)))
 
 
 @configclass

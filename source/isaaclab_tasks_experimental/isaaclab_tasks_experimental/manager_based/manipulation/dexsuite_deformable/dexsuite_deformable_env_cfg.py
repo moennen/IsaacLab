@@ -17,7 +17,6 @@ from pathlib import Path
 from isaaclab_newton.physics import FeatherstoneSolverCfg, MJWarpSolverCfg, NewtonCfg
 from isaaclab_newton.physics.newton_collision_cfg import NewtonCollisionPipelineCfg
 from isaaclab_newton.sim.spawners.materials import NewtonDeformableBodyMaterialCfg
-from isaaclab_visualizers.kit import KitVisualizerCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
@@ -48,7 +47,7 @@ from isaaclab_tasks.utils import PresetCfg
 from isaaclab_assets.robots import KUKA_ALLEGRO_CFG
 
 from . import mdp
-from .skinned_gaussian_visualizer import SkinnedGaussianNewtonVisualizerCfg
+from .skinned_gaussian_visualizer import SkinnedGaussianKitVisualizerCfg, SkinnedGaussianNewtonVisualizerCfg
 from .spawners import NewtonVbdTetAssetCfg
 
 FINGERTIP_LIST = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]
@@ -68,6 +67,8 @@ TABLE_TOP_Z = TABLE_POS[2] + 0.02
 DEFORMABLE_DENSITY = 300.0
 DEFORMABLE_K_MU = 1.0e5
 DEFORMABLE_K_LAMBDA = 1.0e5
+TASK_VIEW_EYE = (-2.25, 0.0, 0.75)
+TASK_VIEW_LOOKAT = (0.0, 0.0, 0.45)
 # Covers the 1024-env ragdoll candidate space while preserving deterministic CUDA graph replay.
 SOFT_CONTACT_MAX = 8_388_608
 
@@ -212,9 +213,9 @@ class TaskVisualizerCfg(PresetCfg):
     """Optional task-specific visualizer presets."""
 
     default: list = []
-    kit_visualizer: KitVisualizerCfg = KitVisualizerCfg(
-        eye=(-2.20, 0.10, 0.90),
-        lookat=(-0.55, 0.05, 0.45),
+    kit_visualizer: SkinnedGaussianKitVisualizerCfg = SkinnedGaussianKitVisualizerCfg(
+        eye=TASK_VIEW_EYE,
+        lookat=TASK_VIEW_LOOKAT,
         max_visible_envs=None,
         randomly_sample_visible_envs=False,
     )
@@ -603,7 +604,7 @@ class TerminationsCfg:
 class DexsuiteDeformableKukaAllegroLiftEnvCfg(ManagerBasedRLEnvCfg):
     """Manager-based RL config for Kuka/Allegro deformable lifting."""
 
-    viewer: ViewerCfg = ViewerCfg(eye=(-2.20, 0.10, 0.90), lookat=(-0.55, 0.05, 0.45), origin_type="env")
+    viewer: ViewerCfg = ViewerCfg(eye=TASK_VIEW_EYE, lookat=TASK_VIEW_LOOKAT, origin_type="env")
     scene: KukaAllegroDeformableSceneCfg = KukaAllegroDeformableSceneCfg(
         num_envs=1024,
         env_spacing=3.0,
@@ -645,9 +646,11 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg_KIT_PLAY(DexsuiteDeformableKukaAll
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.sim.visualizer_cfgs = KitVisualizerCfg(
-            eye=(-2.20, 0.10, 0.90),
-            lookat=(-0.55, 0.05, 0.45),
+        self.viewer.eye = TASK_VIEW_EYE
+        self.viewer.lookat = TASK_VIEW_LOOKAT
+        self.sim.visualizer_cfgs = SkinnedGaussianKitVisualizerCfg(
+            eye=TASK_VIEW_EYE,
+            lookat=TASK_VIEW_LOOKAT,
             max_visible_envs=None,
             randomly_sample_visible_envs=False,
         )

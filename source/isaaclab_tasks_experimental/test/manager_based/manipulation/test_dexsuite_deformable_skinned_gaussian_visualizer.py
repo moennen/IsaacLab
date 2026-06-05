@@ -10,8 +10,13 @@ import sys
 
 import numpy as np
 import warp as wp
+from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.dexsuite_deformable_env_cfg import (
+    TASK_VIEW_EYE,
+    TASK_VIEW_LOOKAT,
+)
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.skinned_gaussian_visualizer import (
     DEFAULT_SKINNED_GAUSSIAN_USD_PATH,
+    SkinnedGaussianKitVisualizerCfg,
     SkinnedGaussianNewtonVisualizerCfg,
     load_skinned_gaussian_visual_data,
     skin_gaussian_points_kernel,
@@ -19,7 +24,6 @@ from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.tools.package_skinned_gaussian_tet_asset import (  # noqa: E501
     package_skinned_gaussian_tet_asset,
 )
-from isaaclab_visualizers.kit import KitVisualizerCfg
 
 from pxr import Gf, Sdf, Usd
 
@@ -115,18 +119,26 @@ def test_skinned_gaussian_visualizer_preset_installs_task_newton_visualizer():
 def test_kit_visualizer_preset_installs_task_kit_visualizer():
     env_cfg = resolve_presets(_load_env_cfg(), {"kit_visualizer"})
 
-    assert isinstance(env_cfg.sim.visualizer_cfgs, KitVisualizerCfg)
+    assert isinstance(env_cfg.sim.visualizer_cfgs, SkinnedGaussianKitVisualizerCfg)
     assert env_cfg.sim.visualizer_cfgs.visualizer_type == "kit"
     assert env_cfg.sim.visualizer_cfgs.max_visible_envs is None
+    assert env_cfg.sim.visualizer_cfgs.hide_tet_visual_mesh is True
+    assert env_cfg.sim.visualizer_cfgs.eye == TASK_VIEW_EYE
+    assert env_cfg.sim.visualizer_cfgs.lookat == TASK_VIEW_LOOKAT
 
 
 def test_kit_play_env_uses_kit_visualizer_cfg():
     env_cfg = load_cfg_from_registry(KIT_PLAY_TASK_NAME, "env_cfg_entry_point")
 
     assert env_cfg.scene.num_envs == 16
-    assert isinstance(env_cfg.sim.visualizer_cfgs, KitVisualizerCfg)
+    assert isinstance(env_cfg.sim.visualizer_cfgs, SkinnedGaussianKitVisualizerCfg)
     assert env_cfg.sim.visualizer_cfgs.visualizer_type == "kit"
     assert env_cfg.sim.visualizer_cfgs.max_visible_envs is None
+    assert env_cfg.sim.visualizer_cfgs.hide_tet_visual_mesh is True
+    assert env_cfg.viewer.eye == TASK_VIEW_EYE
+    assert env_cfg.viewer.lookat == TASK_VIEW_LOOKAT
+    assert env_cfg.sim.visualizer_cfgs.eye == TASK_VIEW_EYE
+    assert env_cfg.sim.visualizer_cfgs.lookat == TASK_VIEW_LOOKAT
 
 
 def test_load_skinned_gaussian_visual_data_reads_custom_binding(tmp_path):
@@ -136,6 +148,7 @@ def test_load_skinned_gaussian_visual_data_reads_custom_binding(tmp_path):
 
     assert data.source_count == 2
     assert data.selected_count == 2
+    np.testing.assert_array_equal(data.selected_indices, np.asarray([0, 1], dtype=np.int32))
     np.testing.assert_array_equal(data.influence_indices, np.asarray([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int32))
     np.testing.assert_allclose(data.influence_weights.reshape(-1, 4)[0], [0.25, 0.25, 0.25, 0.25], atol=1.0e-7)
     np.testing.assert_allclose(data.radii, [0.004, 0.010], atol=1.0e-7)
