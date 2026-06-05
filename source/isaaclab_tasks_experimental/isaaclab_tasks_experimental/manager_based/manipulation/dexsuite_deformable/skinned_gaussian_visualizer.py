@@ -57,6 +57,39 @@ def skin_gaussian_points_kernel(
     out_points[tid] = particle_q[i0] * w0 + particle_q[i1] * w1 + particle_q[i2] * w2 + particle_q[i3] * w3
 
 
+@wp.kernel
+def skin_gaussian_points_env_local_kernel(
+    particle_q: wp.array(dtype=wp.vec3f),
+    particle_offsets: wp.array(dtype=wp.int32),
+    visible_env_ids: wp.array(dtype=wp.int32),
+    env_position_offsets: wp.array(dtype=wp.vec3f),
+    influence_indices: wp.array(dtype=wp.int32),
+    influence_weights: wp.array(dtype=wp.float32),
+    gaussian_count: int,
+    out_points: wp.array(dtype=wp.vec3f),
+):
+    """Skin selected Gaussian centers into each authored Kit prim's local frame."""
+    tid = wp.tid()
+    env_slot = tid // gaussian_count
+    gaussian_slot = tid - env_slot * gaussian_count
+    env_id = visible_env_ids[env_slot]
+    influence_offset = gaussian_slot * 4
+    particle_offset = particle_offsets[env_id]
+
+    i0 = particle_offset + influence_indices[influence_offset + 0]
+    i1 = particle_offset + influence_indices[influence_offset + 1]
+    i2 = particle_offset + influence_indices[influence_offset + 2]
+    i3 = particle_offset + influence_indices[influence_offset + 3]
+
+    w0 = influence_weights[influence_offset + 0]
+    w1 = influence_weights[influence_offset + 1]
+    w2 = influence_weights[influence_offset + 2]
+    w3 = influence_weights[influence_offset + 3]
+
+    world_point = particle_q[i0] * w0 + particle_q[i1] * w1 + particle_q[i2] * w2 + particle_q[i3] * w3
+    out_points[tid] = world_point - env_position_offsets[env_id]
+
+
 @dataclass(frozen=True)
 class SkinnedGaussianVisualData:
     """CPU-side Gaussian skinning data loaded from USD."""
@@ -95,6 +128,7 @@ class _SkinnedGaussianKitRuntime:
     influence_indices: wp.array
     influence_weights: wp.array
     visible_env_ids: wp.array
+    env_position_offsets: wp.array
     points: wp.array
     position_attrs: list[object]
     gaussian_count: int
@@ -386,6 +420,7 @@ class SkinnedGaussianKitVisualizer(BaseVisualizer):
             self._hide_tet_visual_mesh(stage, visible_env_ids)
 
         device = getattr(particle_offsets, "device", None) or "cuda:0"
+        env_position_offsets = self._kit_env_position_offsets(scene, num_envs)
         gaussian_count = visual_data.selected_count
         total_points = int(visible_env_ids.size) * gaussian_count
         self._skinned_gaussian_kit = _SkinnedGaussianKitRuntime(
@@ -393,6 +428,7 @@ class SkinnedGaussianKitVisualizer(BaseVisualizer):
             influence_indices=wp.array(visual_data.influence_indices, dtype=wp.int32, device=device),
             influence_weights=wp.array(visual_data.influence_weights, dtype=wp.float32, device=device),
             visible_env_ids=wp.array(visible_env_ids, dtype=wp.int32, device=device),
+            env_position_offsets=wp.array(env_position_offsets, dtype=wp.vec3f, device=device),
             points=wp.empty(total_points, dtype=wp.vec3f, device=device),
             position_attrs=position_attrs,
             gaussian_count=gaussian_count,
@@ -414,6 +450,27 @@ class SkinnedGaussianKitVisualizer(BaseVisualizer):
         if scope_path.startswith("/"):
             return f"{scope_path.rstrip('/')}/env_{env_id}"
         return f"/World/envs/env_{env_id}/{scope_path.strip('/')}"
+
+    def _kit_env_position_offsets(self, scene, num_envs: int) -> np.ndarray:
+        env_position_offsets = np.zeros((num_envs, 3), dtype=np.float32)
+        scope_path = str(self.cfg.gaussian_scope_path).strip()
+        if scope_path.startswith("/"):
+            return env_position_offsets
+
+        env_origins = getattr(scene, "env_origins", None)
+        if env_origins is None:
+            return env_position_offsets
+        if hasattr(env_origins, "detach"):
+            env_origins = env_origins.detach().cpu().numpy()
+        env_origins = np.asarray(env_origins, dtype=np.float32)
+        if env_origins.ndim != 2 or env_origins.shape[1] != 3:
+            logger.warning(
+                "[SkinnedGaussianKitVisualizer] Ignoring unexpected env_origins shape: %s",
+                env_origins.shape,
+            )
+            return env_position_offsets
+        env_position_offsets[: min(num_envs, env_origins.shape[0])] = env_origins[:num_envs]
+        return env_position_offsets
 
     def _copy_kit_gaussian_attrs(self, source_prim, gaussian_prim, visual_data: SkinnedGaussianVisualData) -> None:
         for source_attr in source_prim.GetAttributes():
@@ -467,12 +524,13 @@ class SkinnedGaussianKitVisualizer(BaseVisualizer):
 
         particle_offsets = getattr(runtime.asset.data, "_particle_offsets")
         wp.launch(
-            skin_gaussian_points_kernel,
+            skin_gaussian_points_env_local_kernel,
             dim=runtime.total_points,
             inputs=[
                 particle_q,
                 particle_offsets,
                 runtime.visible_env_ids,
+                runtime.env_position_offsets,
                 runtime.influence_indices,
                 runtime.influence_weights,
                 runtime.gaussian_count,

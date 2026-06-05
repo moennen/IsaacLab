@@ -20,6 +20,7 @@ from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.
     SkinnedGaussianKitVisualizerCfg,
     SkinnedGaussianNewtonVisualizerCfg,
     load_skinned_gaussian_visual_data,
+    skin_gaussian_points_env_local_kernel,
     skin_gaussian_points_kernel,
 )
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.tools.package_skinned_gaussian_tet_asset import (  # noqa: E501
@@ -197,3 +198,48 @@ def test_skin_gaussian_points_kernel_skins_visible_envs():
     )
 
     np.testing.assert_allclose(out_points.numpy(), [[0.25, 0.25, 0.25], [10.25, 0.25, 0.25]], atol=1.0e-7)
+
+
+def test_skin_gaussian_points_env_local_kernel_subtracts_env_origins():
+    particle_q = wp.array(
+        [
+            wp.vec3f(0.0, 0.0, 0.0),
+            wp.vec3f(1.0, 0.0, 0.0),
+            wp.vec3f(0.0, 1.0, 0.0),
+            wp.vec3f(0.0, 0.0, 1.0),
+            wp.vec3f(10.0, 0.0, 0.0),
+            wp.vec3f(11.0, 0.0, 0.0),
+            wp.vec3f(10.0, 1.0, 0.0),
+            wp.vec3f(10.0, 0.0, 1.0),
+        ],
+        dtype=wp.vec3f,
+        device="cpu",
+    )
+    particle_offsets = wp.array([0, 4], dtype=wp.int32, device="cpu")
+    visible_env_ids = wp.array([0, 1], dtype=wp.int32, device="cpu")
+    env_position_offsets = wp.array(
+        [wp.vec3f(0.0, 0.0, 0.0), wp.vec3f(10.0, 0.0, 0.0)],
+        dtype=wp.vec3f,
+        device="cpu",
+    )
+    influence_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device="cpu")
+    influence_weights = wp.array([0.25, 0.25, 0.25, 0.25], dtype=wp.float32, device="cpu")
+    out_points = wp.empty(2, dtype=wp.vec3f, device="cpu")
+
+    wp.launch(
+        skin_gaussian_points_env_local_kernel,
+        dim=2,
+        inputs=[
+            particle_q,
+            particle_offsets,
+            visible_env_ids,
+            env_position_offsets,
+            influence_indices,
+            influence_weights,
+            1,
+        ],
+        outputs=[out_points],
+        device="cpu",
+    )
+
+    np.testing.assert_allclose(out_points.numpy(), [[0.25, 0.25, 0.25], [0.25, 0.25, 0.25]], atol=1.0e-7)
