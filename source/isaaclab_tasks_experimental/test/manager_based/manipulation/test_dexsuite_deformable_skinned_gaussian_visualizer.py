@@ -136,19 +136,21 @@ def test_kit_visualizer_preset_installs_task_kit_visualizer():
     assert kit_visualizer.lookat == TASK_VIEW_LOOKAT
 
 
-def test_kit_play_env_uses_kit_visualizer_cfg():
+def test_kit_play_env_registers_kit_and_newton_visualizer_cfgs():
     env_cfg = load_cfg_from_registry(KIT_PLAY_TASK_NAME, "env_cfg_entry_point")
 
     assert env_cfg.scene.num_envs == 16
     assert isinstance(env_cfg.sim.visualizer_cfgs, list)
-    assert len(env_cfg.sim.visualizer_cfgs) == 2
-    gaussian_overlay, kit_visualizer = env_cfg.sim.visualizer_cfgs
+    assert len(env_cfg.sim.visualizer_cfgs) == 3
+    gaussian_overlay, kit_visualizer, newton_visualizer = env_cfg.sim.visualizer_cfgs
     assert isinstance(gaussian_overlay, SkinnedGaussianKitVisualizerCfg)
     assert gaussian_overlay.visualizer_type == "kit"
     assert gaussian_overlay.max_gaussians_per_env == KIT_VIEW_MAX_GAUSSIANS_PER_ENV
     assert gaussian_overlay.hide_tet_visual_mesh is True
     assert isinstance(kit_visualizer, KitVisualizerCfg)
     assert kit_visualizer.visualizer_type == "kit"
+    assert isinstance(newton_visualizer, SkinnedGaussianNewtonVisualizerCfg)
+    assert newton_visualizer.visualizer_type == "newton"
     assert env_cfg.viewer.eye == TASK_VIEW_EYE
     assert env_cfg.viewer.lookat == TASK_VIEW_LOOKAT
     assert kit_visualizer.eye == TASK_VIEW_EYE
