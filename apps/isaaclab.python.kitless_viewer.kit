@@ -1,0 +1,210 @@
+##
+# Isaac Lab Kit viewport for kitless physics backends.
+#
+# This experience is intentionally not based on isaaclab.python.kit or
+# isaaclab.python.headless.kit because those apps load PhysX simulator
+# extensions. It provides a Kit/RTX viewport for IsaacLab-owned physics
+# backends such as Newton, where Kit is only a renderer/UI.
+##
+
+[package]
+title = "Isaac Lab Kitless Physics Viewer"
+description = "Isaac Lab Kit viewport without an active Kit physics simulator"
+version = "3.0.0"
+keywords = ["experience", "app", "isaaclab", "python", "viewer", "kitless"]
+
+[dependencies]
+# Bare Kit viewport and navigation.
+"omni.kit.viewport.window" = {}
+"omni.kit.viewport.utility" = {}
+"omni.kit.manipulator.camera" = {}
+"omni.kit.viewport.ready" = {}
+"omni.kit.mainwindow" = {}
+"omni.kit.window.stage" = {}
+"omni.kit.window.property" = {}
+"omni.kit.window.status_bar" = {}
+"omni.kit.window.toolbar" = {}
+"omni.kit.menu.common" = { order = 1000 }
+"omni.kit.menu.create" = {}
+"omni.kit.menu.stage" = {}
+"omni.kit.menu.utils" = {}
+"omni.kit.primitive.mesh" = {}
+"omni.kit.property.bundle" = {}
+"omni.kit.material.library" = {}
+"omni.kit.usd.mdl" = {}
+"omni.kit.commands" = {}
+"omni.kit.telemetry" = {}
+
+# USD/Fabric/RTX rendering. These do not register a physics simulator.
+"usdrt.scenegraph" = {}
+"omni.hydra.rtx" = {}
+"omni.hydra.usdrt_delegate" = {}
+"omni.rtx.settings.core" = {}
+
+# Isaac Sim utility extensions used by IsaacLab scene construction.
+"isaacsim.simulation_app" = {}
+"isaacsim.core.version" = {}
+"isaacsim.storage.native" = {}
+"isaacsim.core.deprecation_manager" = { order = -100 }
+
+# Newton schemas are data-only here; the Isaac Sim Newton simulator extension is not loaded.
+"omni.usd.schema.newton" = {}
+
+########################
+# Isaac Lab Extensions #
+########################
+
+"isaaclab" = { order = 1000 }
+"isaaclab_newton" = { order = 1000 }
+"isaaclab_assets" = { order = 1000 }
+"isaaclab_tasks" = { order = 1000 }
+"isaaclab_visualizers" = { order = 1000 }
+"isaaclab_rl" = { order = 1000 }
+
+[settings]
+app.name = "IsaacLab"
+app.version = "3.0.0"
+app.versionFile = "${exe-path}/VERSION"
+app.content.emptyStageOnStart = true
+app.file.ignoreUnsavedOnExit = true
+app.fastShutdown = true
+app.vulkan = true
+app.window.title = "Isaac Lab Kitless Physics Viewer"
+app.window.width = 1280
+app.window.height = 720
+app.font.file = "${fonts}/OpenSans-SemiBold.ttf"
+app.font.size = 16
+app.settings.persistent = true
+app.settings.fabricDefaultStageFrameHistoryCount = 3
+app.asyncRendering = false
+app.asyncRenderingLowLatency = false
+app.enableStdoutOutput = false
+app.audio.enabled = false
+app.runLoops.main.rateLimitEnabled = false
+
+renderer.enabled = "rtx"
+renderer.active = "rtx"
+renderer.asyncInit = true
+renderer.scenePartitioning.enabled = true
+renderer.gpuEnumeration.glInterop.enabled = false
+renderer.multiGpu.autoEnable = false
+renderer.multiGpu.enabled = false
+rtx.hydra.readTransformsFromFabricInRenderDelegate = true
+rtx-transient.dlssg.enabled = false
+omni.replicator.asyncRendering = false
+
+# Fabric scene delegate is required so NewtonManager can sync body transforms and
+# deformable mesh points into Fabric for Kit rendering.
+app.useFabricSceneDelegate = true
+
+exts."omni.kit.viewport.window".windowMenu.entryCount = 2
+exts."omni.kit.viewport.window".windowMenu.label = ""
+exts."omni.kit.material.library".ui_show_list = [
+    "OmniPBR",
+    "OmniGlass",
+    "OmniSurface",
+    "USD Preview Surface",
+]
+exts."omni.kit.viewport.ready".activity_progress.enabled = false
+
+log.level = "Warn"
+log.outputStreamLevel = "Warn"
+foundation.verifyOsVersion.enabled = false
+metricsAssembler.changeListenerEnabled = false
+isaac.startup.ros_bridge_extension = ""
+
+# Keep PhysX / Isaac Sim Newton simulators out of this viewer process.
+app.extensions.excluded = [
+    "omni.kit.pip_archive",
+    "omni.isaac.ml_archive",
+    "isaacsim.pip.newton",
+    "isaacsim.physics.newton",
+    "isaacsim.physics.newton.tensors",
+    "isaacsim.physics.newton.ui",
+    "omni.physics",
+    "omni.physics.ui",
+    "omni.physics.physx",
+    "omni.physics.physx.ui",
+    "omni.physx",
+    "omni.physx.bundle",
+    "omni.physx.tensors",
+    "omni.physx.fabric",
+    "omni.physx.ui",
+    "omni.physics.stageupdate",
+    "isaaclab_physx",
+]
+
+[settings.app.viewport]
+defaultCamPos.x = 5
+defaultCamPos.y = 5
+defaultCamPos.z = 5
+defaults.fillViewport = false
+grid.enabled = true
+outline.enabled = true
+boundingBoxes.enabled = false
+show.camera = false
+show.lights = false
+
+[settings.app.python]
+interceptSysStdOutput = false
+logSysStdOutput = false
+
+[settings.app.renderer]
+resolution.height = 720
+resolution.width = 1280
+skipWhileMinimized = false
+sleepMsOnFocus = 0
+sleepMsOutOfFocus = 0
+
+[settings.app.exts]
+folders = [
+    "${exe-path}/exts",
+    "${exe-path}/extscore",
+    "${exe-path}/../exts",
+    "${exe-path}/../extscache",
+    "${exe-path}/../extsPhysics",
+    "${exe-path}/../isaacsim/exts",
+    "${exe-path}/../isaacsim/extscache",
+    "${exe-path}/../isaacsim/extsPhysics",
+    "${app}",
+    "${app}/../source",
+]
+
+[settings.physics]
+autoPopupSimulationOutputWindow = false
+updateToUsd = false
+updateVelocitiesToUsd = false
+updateParticlesToUsd = false
+updateForceSensorsToUsd = false
+outputVelocitiesLocalSpace = false
+useFastCache = false
+visualizationDisplayJoints = false
+fabricUpdateTransformations = false
+fabricUpdateVelocities = false
+fabricUpdateForceSensors = false
+fabricUpdateJointStates = false
+fabricUseGPUInterop = true
+
+[settings.persistent]
+app.primCreation.DefaultXformOpOrder = "xformOp:translate, xformOp:orient, xformOp:scale"
+app.primCreation.DefaultXformOpType = "Scale, Orient, Translate"
+app.primCreation.DefaultXformOpPrecision = "Double"
+app.primCreation.DefaultRotationOrder = "ZYX"
+app.primCreation.PrimCreationWithDefaultXformOps = true
+app.primCreation.typedDefaults.camera.clippingRange = [0.01, 10000000.0]
+app.stage.timeCodeRange = [0, 1000000]
+app.stage.upAxis = "Z"
+app.viewport.camMoveVelocity = 0.05
+app.viewport.gizmo.scale = 0.01
+app.viewport.grid.scale = 1.0
+app.viewport.camShowSpeedOnStart = false
+app.omniverse.gamepadCameraControl = false
+renderer.startupMessageDisplayed = true
+simulation.defaultMetersPerUnit = 1.0
+UJITSO.geometry = true
+UJITSO.enabled = true
+
+[settings]
+persistent.isaac.asset_root.default = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0"
+persistent.isaac.asset_root.cloud = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0"
+persistent.isaac.asset_root.nvidia = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0"
