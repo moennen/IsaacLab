@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +23,11 @@ from isaaclab.visualizers.visualizer_cfg import VisualizerCfg
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SKINNED_GAUSSIAN_USD_PATH = "/tmp/blueHairRagdoll_skinned_gaussian_tet.usdc"
+_ISAACLAB_ROOT = Path(__file__).resolve().parents[6]
+DEFAULT_SKINNED_GAUSSIAN_USD_PATH = os.environ.get(
+    "ISAACLAB_DEXSUITE_SKINNED_GAUSSIAN_USD_PATH",
+    str(_ISAACLAB_ROOT / "outputs" / "assets" / "blueHairRagdoll_skinned_gaussian_tet.usdc"),
+)
 
 _SH_C0 = 0.28209479177387814
 
