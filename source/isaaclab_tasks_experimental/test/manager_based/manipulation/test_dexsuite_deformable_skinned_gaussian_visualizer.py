@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
 import numpy as np
 import warp as wp
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.dexsuite_deformable_env_cfg import (
+    DEFORMABLE_ASSET_PATH,
     KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
     TASK_VIEW_EYE,
     TASK_VIEW_LOOKAT,
@@ -156,6 +158,21 @@ def test_kit_play_env_registers_kit_and_newton_visualizer_cfgs():
     assert env_cfg.viewer.lookat == TASK_VIEW_LOOKAT
     assert kit_visualizer.eye == TASK_VIEW_EYE
     assert kit_visualizer.lookat == TASK_VIEW_LOOKAT
+
+
+def test_kit_play_newton_visualizer_uses_heterogeneous_gaussian_paths():
+    code = f"""
+import isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable
+from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+
+env_cfg = load_cfg_from_registry({KIT_PLAY_TASK_NAME!r}, "env_cfg_entry_point")
+newton_visualizer = env_cfg.sim.visualizer_cfgs[-1]
+assert len(newton_visualizer.skinned_gaussian_usd_paths) == 2
+"""
+    environment = os.environ | {"DEXSUITE_DEFORMABLE_ASSETS": f"{DEFORMABLE_ASSET_PATH},{DEFORMABLE_ASSET_PATH}"}
+    result = subprocess.run([sys.executable, "-c", code], check=False, capture_output=True, text=True, env=environment)
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_load_skinned_gaussian_visual_data_reads_custom_binding(tmp_path):

@@ -88,6 +88,9 @@ class NewtonVbdTetAssetCfg(DeformableObjectSpawnerCfg):
     center_to_origin: bool = True
     """Recentre vertices around their mean so ``init_state.pos`` is the deformable COM."""
 
+    asset_index: int = 0
+    """Stable multi-asset dataset index authored onto the spawned root prim."""
+
     visual_material_path: str = "visual_material"
     """Relative path for the visual material."""
 
@@ -311,7 +314,7 @@ def spawn_newton_vbd_tet_asset(
     **kwargs,
 ) -> Usd.Prim:
     """Spawn a legacy VBD tet asset as a standard Newton deformable TetMesh."""
-    from pxr import UsdGeom
+    from pxr import Sdf, UsdGeom
 
     from isaaclab.sim.utils import bind_visual_material, create_prim, get_current_stage
 
@@ -320,6 +323,7 @@ def spawn_newton_vbd_tet_asset(
         raise ValueError(f"A prim already exists at path: '{prim_path}'.")
 
     root_prim = create_prim(prim_path, "Xform", translation=translation, orientation=orientation, stage=stage)
+    root_prim.CreateAttribute("newton:deformableAssetIndex", Sdf.ValueTypeNames.Int, custom=True).Set(cfg.asset_index)
     geom_path = f"{prim_path}/geometry"
     create_prim(geom_path, "Scope", stage=stage)
 

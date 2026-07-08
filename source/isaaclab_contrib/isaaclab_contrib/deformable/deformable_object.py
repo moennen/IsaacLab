@@ -68,6 +68,114 @@ class DeformableRegistryEntry:
     # Filled by newton_physics_replicate:
     particle_offsets: list[int] = field(default_factory=list)
     particles_per_body: int = 0
+    variants_by_env: dict[int, DeformableRegistryEntry] = field(default_factory=dict, repr=False)
+    asset_indices: list[int] = field(default_factory=list)
+    asset_index: int = 0
+    prototype_paths: tuple[str, ...] = ()
+
+
+def _variant_entry_for_env(entry: DeformableRegistryEntry, env_idx: int) -> DeformableRegistryEntry:
+    """Load the deformable geometry selected for one heterogeneous clone world.
+
+    ``MultiAssetSpawnerCfg`` authors the selected prototype into each concrete
+    ``env_N`` before Newton replication begins.  The old registry cached only
+    the first prototype, making every Newton world use its topology even when
+    USD cloning selected a different one.  Resolve the concrete clone here so
+    the per-world builder hook uses the matching tet mesh and material.
+    """
+    if env_idx in entry.variants_by_env:
+        return entry.variants_by_env[env_idx]
+    if not entry.prototype_paths:
+        return entry
+
+    from dataclasses import replace
+
+    from pxr import Gf, Usd, UsdGeom, UsdShade
+
+    from isaaclab.sim.utils.stage import get_current_stage
+
+    # Builder hooks run before destination USD clones are necessarily
+    # materialized.  Resolve the actual source prototype through Isaac Lab's
+    # clone plan instead of inferring a round-robin assignment: the default
+    # heterogeneous clone strategy is random.
+    concrete_path = entry.prim_path.replace("env_.*", f"env_{env_idx}")
+    expected_asset_index: int | None = None
+    if entry.prototype_paths:
+        from isaaclab.sim import SimulationContext
+
+        clone_plan = SimulationContext.instance().get_clone_plan()
+        if clone_plan is not None:
+            sources = tuple(str(path) for path in clone_plan.sources)
+            clone_mask = clone_plan.clone_mask.detach().cpu().numpy()
+            for asset_index, prototype_path in enumerate(entry.prototype_paths):
+                matching_rows = [row for row, source in enumerate(sources) if source == prototype_path]
+                if any(clone_mask[row, env_idx] for row in matching_rows):
+                    concrete_path = prototype_path
+                    expected_asset_index = asset_index
+                    break
+        if expected_asset_index is None:
+            # Direct scenes or legacy clone plans may not expose the mapping.
+            # Keep the deterministic fallback for those configurations only.
+            expected_asset_index = env_idx % len(entry.prototype_paths)
+            concrete_path = entry.prototype_paths[expected_asset_index]
+    stage = get_current_stage()
+    root = stage.GetPrimAtPath(concrete_path)
+    if not root.IsValid():
+        # Non-cloned/direct scenes retain the prototype parsed at registration.
+        return entry
+
+    tet_prims = [prim for prim in Usd.PrimRange(root) if prim.GetTypeName() == "TetMesh"]
+    if len(tet_prims) != 1:
+        raise ValueError(
+            f"Expected one TetMesh below heterogeneous deformable '{concrete_path}', found {len(tet_prims)}."
+        )
+    tet = UsdGeom.TetMesh(tet_prims[0])
+    raw_points = tet.GetPointsAttr().Get()
+    raw_indices = tet.GetTetVertexIndicesAttr().Get()
+    if raw_points is None or raw_indices is None:
+        raise ValueError(f"TetMesh '{tet.GetPath()}' is missing points or tetrahedron indices.")
+
+    # Match _register_deformable's root-relative transform baking.
+    xform_cache = UsdGeom.XformCache()
+    mesh_to_root = (
+        xform_cache.GetLocalToWorldTransform(tet.GetPrim())
+        * xform_cache.GetLocalToWorldTransform(root.GetParent()).GetInverse()
+    )
+    vertices = []
+    for point in raw_points:
+        transformed = mesh_to_root.Transform(Gf.Vec3d(float(point[0]), float(point[1]), float(point[2])))
+        vertices.append(wp.vec3(float(transformed[0]), float(transformed[1]), float(transformed[2])))
+    indices = [component for tet_index in raw_indices for component in map(int, tet_index)]
+
+    material = entry
+    if root.HasAPI(UsdShade.MaterialBindingAPI):
+        for material_path in UsdShade.MaterialBindingAPI(root).GetDirectBindingRel("physics").GetTargets():
+            candidate = stage.GetPrimAtPath(material_path)
+            if candidate.GetAttribute("newton:density").IsValid():
+
+                def attr(name, default):
+                    value = candidate.GetAttribute(name)
+                    return value.Get() if value.IsValid() else default
+
+                material = replace(
+                    entry,
+                    density=attr("newton:density", entry.density),
+                    particle_radius=attr("newton:particleRadius", entry.particle_radius),
+                    k_mu=attr("newton:kMu", entry.k_mu),
+                    k_lambda=attr("newton:kLambda", entry.k_lambda),
+                    k_damp=attr("newton:kDamp", entry.k_damp),
+                )
+                break
+
+    asset_index_attr = root.GetAttribute("newton:deformableAssetIndex")
+    asset_index = (
+        int(asset_index_attr.Get())
+        if asset_index_attr.IsValid() and asset_index_attr.HasValue()
+        else (expected_asset_index if expected_asset_index is not None else 0)
+    )
+    variant = replace(material, vertices=vertices, indices=indices, variants_by_env={}, asset_index=asset_index)
+    entry.variants_by_env[env_idx] = variant
+    return variant
 
 
 if TYPE_CHECKING:
@@ -102,7 +210,11 @@ def add_deformable_entry_to_builder(
     if env_idx == 0:
         entry.particle_offsets.clear()
         entry.particles_per_body = 0
+        entry.variants_by_env.clear()
+        entry.asset_indices.clear()
 
+    variant = _variant_entry_for_env(entry, env_idx)
+    entry.asset_indices.append(variant.asset_index)
     before_count = getattr(builder, "particle_count", 0)
 
     env_pos = wp.vec3(float(env_position[0]), float(env_position[1]), float(env_position[2]))
@@ -112,45 +224,45 @@ def add_deformable_entry_to_builder(
         float(env_rotation[2]),
         float(env_rotation[3]),
     )
-    init_pos = wp.vec3(float(entry.init_pos[0]), float(entry.init_pos[1]), float(entry.init_pos[2]))
+    init_pos = wp.vec3(float(variant.init_pos[0]), float(variant.init_pos[1]), float(variant.init_pos[2]))
     init_rot = wp.quat(
-        float(entry.init_rot[0]),
-        float(entry.init_rot[1]),
-        float(entry.init_rot[2]),
-        float(entry.init_rot[3]),
+        float(variant.init_rot[0]),
+        float(variant.init_rot[1]),
+        float(variant.init_rot[2]),
+        float(variant.init_rot[3]),
     )
     body_pos = env_pos + wp.quat_rotate(env_rot, init_pos)
     body_rot = env_rot * init_rot
 
-    if entry.deformable_type == "volume":
+    if variant.deformable_type == "volume":
         builder.add_soft_mesh(
             pos=body_pos,
             rot=body_rot,
             scale=1.0,
             vel=wp.vec3(0.0, 0.0, 0.0),
-            vertices=entry.vertices,
-            indices=entry.indices,
-            density=entry.density,
-            k_mu=entry.k_mu,
-            k_lambda=entry.k_lambda,
-            k_damp=entry.k_damp,
-            particle_radius=entry.particle_radius,
+            vertices=variant.vertices,
+            indices=variant.indices,
+            density=variant.density,
+            k_mu=variant.k_mu,
+            k_lambda=variant.k_lambda,
+            k_damp=variant.k_damp,
+            particle_radius=variant.particle_radius,
         )
-    elif entry.deformable_type == "surface":
+    elif variant.deformable_type == "surface":
         builder.add_cloth_mesh(
             pos=body_pos,
             rot=body_rot,
             scale=1.0,
             vel=wp.vec3(0.0, 0.0, 0.0),
-            vertices=entry.vertices,
-            indices=entry.indices,
-            density=entry.density,
-            tri_ke=entry.tri_ke,
-            tri_ka=entry.tri_ka,
-            tri_kd=entry.tri_kd,
-            edge_ke=entry.edge_ke,
-            edge_kd=entry.edge_kd,
-            particle_radius=entry.particle_radius,
+            vertices=variant.vertices,
+            indices=variant.indices,
+            density=variant.density,
+            tri_ke=variant.tri_ke,
+            tri_ka=variant.tri_ka,
+            tri_kd=variant.tri_kd,
+            edge_ke=variant.edge_ke,
+            edge_kd=variant.edge_kd,
+            particle_radius=variant.particle_radius,
         )
     else:
         raise ValueError(
@@ -867,6 +979,9 @@ class DeformableObject(BaseDeformableObject):
             k_mu=k_mu,
             k_lambda=k_lambda,
             k_damp=k_damp,
+            prototype_paths=tuple(
+                path for path in (getattr(self.cfg.spawn, "spawn_paths", None) or ()) if path is not None
+            ),
         )
         SimulationManager._deformable_registry.append(entry)
         self._deformable_type = deformable_type
@@ -878,6 +993,7 @@ class DeformableObject(BaseDeformableObject):
         self._num_instances = len(entry.particle_offsets)
         self._particles_per_body = entry.particles_per_body
         self._recorded_particle_offsets = entry.particle_offsets
+        self._asset_indices = torch.tensor(entry.asset_indices, dtype=torch.long, device=self.device)
 
         if self._num_instances == 0:
             raise RuntimeError(
@@ -888,6 +1004,7 @@ class DeformableObject(BaseDeformableObject):
         logger.info("Newton deformable object initialized at: %s", self.cfg.prim_path)
         logger.info("Number of instances: %d", self._num_instances)
         logger.info("Particles per body: %d", self._particles_per_body)
+        logger.info("Heterogeneous deformable asset IDs by environment: %s", entry.asset_indices)
 
         # Build particle offset array on device
         self._particle_offsets = wp.array(self._recorded_particle_offsets, dtype=wp.int32, device=self.device)

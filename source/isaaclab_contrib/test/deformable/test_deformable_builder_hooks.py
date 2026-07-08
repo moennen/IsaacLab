@@ -5,6 +5,7 @@
 
 import math
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,7 @@ from isaaclab_newton.cloner.replicate import NewtonReplicateContext
 from isaaclab_newton.physics import NewtonManager
 from isaaclab_newton.sim.spawners.materials import NewtonDeformableMaterialCfg
 
-from isaaclab_contrib.deformable import DeformableObject, VBDSolverCfg
+from isaaclab_contrib.deformable import DeformableObject, VBDSolverCfg, deformable_object
 from isaaclab_contrib.deformable.deformable_object import (
     DeformableRegistryEntry,
     add_deformable_entry_to_builder,
@@ -131,6 +132,38 @@ def test_builder_hook_resets_entry_offsets_on_first_environment():
 
     assert entry.particle_offsets == [0]
     assert entry.particles_per_body == 3
+
+
+def test_builder_hook_uses_resolved_surface_variant(monkeypatch):
+    """Test that heterogeneous cloth bodies use their selected mesh and material."""
+    entry = _make_surface_entry()
+    variant = replace(
+        entry,
+        vertices=[wp.vec3(2.0, 0.0, 0.0), wp.vec3(0.0, 2.0, 0.0), wp.vec3(0.0, 0.0, 2.0)],
+        indices=[2, 1, 0],
+        density=123.0,
+        tri_ke=456.0,
+        tri_ka=789.0,
+        tri_kd=12.0,
+        edge_ke=34.0,
+        edge_kd=56.0,
+        particle_radius=0.078,
+    )
+    monkeypatch.setattr(deformable_object, "_variant_entry_for_env", lambda _entry, _env_idx: variant)
+    builder = _FakeBuilder()
+
+    add_deformable_entry_to_builder(builder, entry, 0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
+
+    mesh = builder.cloth_meshes[0]
+    assert mesh["vertices"] == variant.vertices
+    assert mesh["indices"] == variant.indices
+    assert mesh["density"] == variant.density
+    assert mesh["tri_ke"] == variant.tri_ke
+    assert mesh["tri_ka"] == variant.tri_ka
+    assert mesh["tri_kd"] == variant.tri_kd
+    assert mesh["edge_ke"] == variant.edge_ke
+    assert mesh["edge_kd"] == variant.edge_kd
+    assert mesh["particle_radius"] == variant.particle_radius
 
 
 def test_newton_physics_context_is_replicate_context():

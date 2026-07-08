@@ -183,7 +183,7 @@ def deformable_velocity_l2(
 
 def deformable_spread_l2(
     env: ManagerBasedRLEnv,
-    nominal_extent: tuple[float, float, float],
+    nominal_extent: tuple[float, float, float] | None,
     margin: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("deformable"),
 ) -> torch.Tensor:
@@ -191,6 +191,13 @@ def deformable_spread_l2(
     asset: DeformableObject = env.scene[asset_cfg.name]
     nodal_pos = asset.data.nodal_pos_w.torch
     extent = nodal_pos.max(dim=1).values - nodal_pos.min(dim=1).values
-    target_extent = torch.tensor(nominal_extent, device=extent.device, dtype=extent.dtype)
+    if nominal_extent is None:
+        # Heterogeneous assets have distinct rest aspect ratios.  Their default
+        # nodal state is captured after the matching clone prototype is added
+        # to Newton, so it provides one rest extent per environment.
+        default_state = asset.data.default_nodal_state_w.torch[..., :3]
+        target_extent = default_state.max(dim=1).values - default_state.min(dim=1).values
+    else:
+        target_extent = torch.tensor(nominal_extent, device=extent.device, dtype=extent.dtype)
     excess = torch.relu(torch.abs(extent - target_extent) - margin)
     return torch.sum(torch.square(excess), dim=1).clamp(0.0, 1000.0)

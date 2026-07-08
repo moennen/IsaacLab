@@ -229,6 +229,7 @@ def _write_gaussian_prim(
     positions: np.ndarray,
     *,
     max_gaussians: int | None = None,
+    scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> Usd.Prim:
     parent_path = str(Sdf.Path(gaussian_path).GetParentPath())
     if parent_path and parent_path != "/":
@@ -250,6 +251,15 @@ def _write_gaussian_prim(
                 value = value[:max_gaussians]
             elif source_positions_count > 0 and value_len % source_positions_count == 0:
                 value = value[: max_gaussians * (value_len // source_positions_count)]
+        # ``scales`` are physical Gaussian radii, not log-scale parameters in
+        # the ParticleField assets used here.  Keep them in the same metric
+        # frame as transformed positions; otherwise a 0.2 m normalized asset
+        # retains metre-scale splats and appears as a blurred blob in RTX.
+        if attr.GetName() == "scales":
+            scale_values = np.asarray(value, dtype=np.float32).copy()
+            if scale_values.ndim == 2 and scale_values.shape[1] == 3:
+                scale_values *= np.asarray(scale, dtype=np.float32).reshape(1, 3)
+                value = [Gf.Vec3f(float(x), float(y), float(z)) for x, y, z in scale_values]
         if value is not None:
             dst_attr = gaussian_prim.CreateAttribute(attr.GetName(), attr.GetTypeName(), custom=attr.IsCustom())
             dst_attr.Set(value)
@@ -359,6 +369,7 @@ def package_skinned_gaussian_tet_asset(
         source_gaussian_prim,
         gaussian_positions,
         max_gaussians=max_gaussians,
+        scale=gaussian_scale,
     )
     _write_skinning_attrs(
         gaussian_prim,

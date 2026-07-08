@@ -12,6 +12,7 @@ and position control; no synthetic deformable orientation is exposed.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from isaaclab_newton.physics import FeatherstoneSolverCfg, MJWarpSolverCfg, NewtonCfg
@@ -63,11 +64,59 @@ DEFORMABLE_SIZE = (0.085, 0.335, 0.149)
 DEFORMABLE_INIT_POS = (-0.55, 0.10, 0.38)
 DEFORMABLE_LIFT_HEIGHT = 0.50
 DEFORMABLE_ASSET_PATH = str(Path(__file__).resolve().parent / "assets" / "blueHairRagdoll100k_tet.usda")
+# Comma-separated VBD USD paths for heterogeneous training.  The preparation
+# pipeline emits these under ``outputs/dexsuite_toys/vbd_tets``.  Keeping the
+# bundled ragdoll as the default preserves the original single-asset task.
+_DEFORMABLE_ASSET_PATHS_ENV = os.environ.get("DEXSUITE_DEFORMABLE_ASSETS", DEFORMABLE_ASSET_PATH)
+# Shell line continuations are often copied into this value.  Strip indentation
+# around embedded newlines while preserving legitimate spaces within filenames.
+DEFORMABLE_ASSET_PATHS = tuple(
+    "".join(line.strip() for line in path.splitlines())
+    for path in _DEFORMABLE_ASSET_PATHS_ENV.split(",")
+    if path.strip()
+)
+# Generated Gaussian assets retain their source axis in the intermediate VBD
+# file. Set this for a dataset built with ``--source-z-up``.
+DEFORMABLE_ASSETS_ARE_Z_UP = os.environ.get("DEXSUITE_DEFORMABLE_ASSETS_ARE_Z_UP", "0") in {"1", "true", "True"}
+_SKINNED_GAUSSIANS_ENV = tuple(
+    "".join(line.strip() for line in path.splitlines())
+    for path in os.environ.get("DEXSUITE_SKINNED_GAUSSIAN_ASSETS", "").split(",")
+    if path.strip()
+)
+
+
+def _default_skinned_gaussian_paths(asset_paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Infer builder output paths when no explicit Gaussian manifest is supplied."""
+    if len(asset_paths) <= 1:
+        return ()
+    return tuple(
+        str(Path(path).parent.parent / "packaged" / f"{Path(path).stem.replace('_vbd_tet', '')}_skinned_vbd_tet.usda")
+        for path in asset_paths
+    )
+
+
+DEFORMABLE_SKINNED_GAUSSIAN_ASSET_PATHS = _SKINNED_GAUSSIANS_ENV or _default_skinned_gaussian_paths(
+    DEFORMABLE_ASSET_PATHS
+)
 TABLE_POS = (-0.55, 0.0, 0.235)
 TABLE_TOP_Z = TABLE_POS[2] + 0.02
 DEFORMABLE_DENSITY = 300.0
 DEFORMABLE_K_MU = 1.0e5
 DEFORMABLE_K_LAMBDA = 1.0e5
+# The asset builder's --collision-shell must equal this value.  The bundled
+# legacy ragdoll preserves its historical 12 mm default; the normalized
+# Gaussian toy set uses 4 mm so its thin visual features can contain contact.
+DEFORMABLE_PARTICLE_RADIUS = float(os.environ.get("DEXSUITE_DEFORMABLE_PARTICLE_RADIUS", "0.012"))
+if DEFORMABLE_PARTICLE_RADIUS <= 0.0:
+    raise ValueError("DEXSUITE_DEFORMABLE_PARTICLE_RADIUS must be positive.")
+_SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS_RAW = os.environ.get("DEXSUITE_SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS", "1")
+SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS = (
+    None
+    if _SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS_RAW.lower() in {"all", "none"}
+    else int(_SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS_RAW)
+)
+if SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS is not None and SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS <= 0:
+    raise ValueError("DEXSUITE_SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS must be positive, 'all', or 'none'.")
 TASK_VIEW_EYE = (-2.25, 0.0, 0.75)
 TASK_VIEW_LOOKAT = (0.0, 0.0, 0.45)
 KIT_VIEW_MAX_GAUSSIANS_PER_ENV = None
@@ -216,26 +265,53 @@ class TaskVisualizerCfg(PresetCfg):
 
     default: list = []
     kit_visualizer: list = [
-        SkinnedGaussianKitVisualizerCfg(max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV),
+        SkinnedGaussianKitVisualizerCfg(
+            max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
+            skinned_gaussian_usd_paths=DEFORMABLE_SKINNED_GAUSSIAN_ASSET_PATHS,
+        ),
         KitVisualizerCfg(eye=TASK_VIEW_EYE, lookat=TASK_VIEW_LOOKAT),
     ]
-    skinned_gaussian_visualizer: SkinnedGaussianNewtonVisualizerCfg = SkinnedGaussianNewtonVisualizerCfg()
+    skinned_gaussian_visualizer: SkinnedGaussianNewtonVisualizerCfg = SkinnedGaussianNewtonVisualizerCfg(
+        skinned_gaussian_usd_paths=DEFORMABLE_SKINNED_GAUSSIAN_ASSET_PATHS,
+        max_visible_envs=SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS,
+    )
+
+
+def _deformable_spawn_cfg(asset_paths: tuple[str, ...]):
+    """Build one VBD spawner or a heterogeneous multi-asset VBD spawner."""
+    missing_paths = [path for path in asset_paths if not Path(path).is_file()]
+    if missing_paths:
+        raise FileNotFoundError(
+            "DEXSUITE_DEFORMABLE_ASSETS contains missing VBD USD files: "
+            + ", ".join(repr(path) for path in missing_paths)
+        )
+    asset_cfgs = [
+        NewtonVbdTetAssetCfg(
+            usd_path=asset_path,
+            asset_index=asset_index,
+            rotate_y_up_to_z_up=not DEFORMABLE_ASSETS_ARE_Z_UP,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.16, 0.22)),
+            physics_material=NewtonDeformableBodyMaterialCfg(
+                density=DEFORMABLE_DENSITY,
+                k_mu=DEFORMABLE_K_MU,
+                k_lambda=DEFORMABLE_K_LAMBDA,
+                k_damp=1.0e-5,
+                particle_radius=DEFORMABLE_PARTICLE_RADIUS,
+            ),
+        )
+        for asset_index, asset_path in enumerate(asset_paths)
+    ]
+    if not asset_cfgs:
+        raise ValueError("DEXSUITE_DEFORMABLE_ASSETS must contain at least one VBD asset path.")
+    if len(asset_cfgs) == 1:
+        return asset_cfgs[0]
+    return sim_utils.MultiAssetSpawnerCfg(assets_cfg=asset_cfgs)
 
 
 DEFORMABLE_OBJECT_CFG = DeformableObjectCfg(
     prim_path="/World/envs/env_.*/Deformable",
     init_state=DeformableObjectCfg.InitialStateCfg(pos=DEFORMABLE_INIT_POS),
-    spawn=NewtonVbdTetAssetCfg(
-        usd_path=DEFORMABLE_ASSET_PATH,
-        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.16, 0.22)),
-        physics_material=NewtonDeformableBodyMaterialCfg(
-            density=DEFORMABLE_DENSITY,
-            k_mu=DEFORMABLE_K_MU,
-            k_lambda=DEFORMABLE_K_LAMBDA,
-            k_damp=1.0e-5,
-            particle_radius=0.012,
-        ),
-    ),
+    spawn=_deformable_spawn_cfg(DEFORMABLE_ASSET_PATHS),
 )
 
 
@@ -552,7 +628,7 @@ class RewardsCfg:
     deformable_velocity = RewTerm(func=mdp.deformable_velocity_l2, weight=-0.01)
     deformable_spread = RewTerm(
         func=mdp.deformable_spread_l2,
-        params={"nominal_extent": DEFORMABLE_SIZE, "margin": 0.08},
+        params={"nominal_extent": None, "margin": 0.08},
         weight=-1.0,
     )
     fingertip_table_scrape = RewTerm(
@@ -649,7 +725,13 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg_KIT_PLAY(DexsuiteDeformableKukaAll
         self.viewer.eye = TASK_VIEW_EYE
         self.viewer.lookat = TASK_VIEW_LOOKAT
         self.sim.visualizer_cfgs = [
-            SkinnedGaussianKitVisualizerCfg(max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV),
+            SkinnedGaussianKitVisualizerCfg(
+                max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
+                skinned_gaussian_usd_paths=DEFORMABLE_SKINNED_GAUSSIAN_ASSET_PATHS,
+            ),
             KitVisualizerCfg(eye=TASK_VIEW_EYE, lookat=TASK_VIEW_LOOKAT),
-            SkinnedGaussianNewtonVisualizerCfg(max_visible_envs=None),
+            SkinnedGaussianNewtonVisualizerCfg(
+                skinned_gaussian_usd_paths=DEFORMABLE_SKINNED_GAUSSIAN_ASSET_PATHS,
+                max_visible_envs=None,
+            ),
         ]
