@@ -8,11 +8,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from isaaclab_tasks_experimental.manager_based.manipulation.dexsuite_deformable.tools.build_gaussian_vbd_asset_set import (  # noqa: E501
+    _align_vomp_positions_to_tet_bounds,
     _scaled_proxy_vertices,
+    _vomp_lookup_vertices,
+    _vomp_youngs_modulus_correction_scale,
     _voxel_solid_from_gaussians,
     farthest_point_sample,
     filter_spawner_degenerate_tets,
     inset_tet_surface_for_collision_shell,
+    material_arrays_from_vomp,
     tetrahedralize_proxy,
 )
 
@@ -35,6 +39,78 @@ def test_scaled_proxy_preserves_gaussian_mean_and_target_extent():
     np.testing.assert_allclose(proxy.mean(axis=0), points.mean(axis=0), atol=1.0e-7)
     assert np.isclose(scale, 0.2)
     assert np.isclose(np.ptp(proxy, axis=0).max(), 0.4)
+
+
+def test_vomp_position_alignment_preserves_relative_material_coordinates():
+    vomp_positions = np.asarray([[-0.5, -0.25, -0.5], [0.5, 0.25, 0.5]], dtype=np.float32)
+    tet_vertices = np.asarray([[1.0, 2.0, 3.0], [1.4, 2.2, 3.4]], dtype=np.float32)
+
+    aligned = _align_vomp_positions_to_tet_bounds(vomp_positions, tet_vertices)
+
+    np.testing.assert_allclose(aligned, tet_vertices, atol=1.0e-7)
+
+
+def test_vomp_lookup_vertices_rotates_default_y_up_tet_meshes_into_z_up():
+    tet_vertices = np.asarray([[1.0, 2.0, 3.0], [-4.0, 5.0, -6.0]], dtype=np.float32)
+
+    lookup_vertices = _vomp_lookup_vertices(tet_vertices, source_y_up=True)
+
+    np.testing.assert_array_equal(lookup_vertices, [[1.0, -3.0, 2.0], [-4.0, 6.0, 5.0]])
+    np.testing.assert_array_equal(_vomp_lookup_vertices(tet_vertices, source_y_up=False), tet_vertices)
+
+
+def test_vomp_material_mapping_uses_z_up_lookup_frame_for_y_up_sources(tmp_path):
+    pytest.importorskip("scipy")
+    voxels = np.zeros(
+        8,
+        dtype=[
+            ("x", "f4"),
+            ("y", "f4"),
+            ("z", "f4"),
+            ("youngs_modulus", "f4"),
+            ("poisson_ratio", "f4"),
+            ("density", "f4"),
+        ],
+    )
+    grid = np.asarray([[x, y, z] for x in (-0.5, 0.5) for y in (-0.5, 0.5) for z in (-0.5, 0.5)])
+    voxels["x"], voxels["y"], voxels["z"] = grid.T
+    voxels["youngs_modulus"] = 10.0
+    voxels["youngs_modulus"][np.all(grid == (-0.5, 0.5, -0.5), axis=1)] = 100.0
+    voxels["poisson_ratio"] = 0.25
+    voxels["density"] = 1.0
+    material_path = tmp_path / "vomp.npz"
+    np.savez(material_path, voxel_data=voxels)
+
+    vertices = np.asarray([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 6.0]])
+    tets = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+
+    material_arrays = material_arrays_from_vomp(vertices, tets, material_path, source_y_up=True)
+
+    np.testing.assert_allclose(material_arrays["newton:tetMu"], [40.0])
+    np.testing.assert_allclose(material_arrays["newton:tetLambda"], [40.0])
+
+    scaled_material_arrays = material_arrays_from_vomp(
+        vertices, tets, material_path, source_y_up=True, youngs_modulus_scale=0.5
+    )
+    np.testing.assert_allclose(scaled_material_arrays["newton:tetMu"], [20.0])
+    np.testing.assert_allclose(scaled_material_arrays["newton:tetLambda"], [20.0])
+
+
+def test_vomp_youngs_modulus_correction_uses_one_global_mean_and_can_be_disabled(tmp_path):
+    dtype = [("youngs_modulus", "f4")]
+    first = np.zeros(2, dtype=dtype)
+    second = np.zeros(2, dtype=dtype)
+    first["youngs_modulus"] = [2.0, 4.0]
+    second["youngs_modulus"] = [6.0, 8.0]
+    first_path = tmp_path / "first.npz"
+    second_path = tmp_path / "second.npz"
+    np.savez(first_path, voxel_data=first)
+    np.savez(second_path, voxel_data=second)
+
+    scale = _vomp_youngs_modulus_correction_scale([first_path, second_path], 1.0e5)
+
+    assert scale == pytest.approx(2.0e4)
+    assert _vomp_youngs_modulus_correction_scale([first_path, second_path], 1.0) == 1.0
 
 
 def test_tetrahedralize_proxy_uses_all_vertices_when_scipy_is_available():

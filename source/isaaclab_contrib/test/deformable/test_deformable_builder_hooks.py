@@ -8,6 +8,7 @@ import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import warp as wp
 from isaaclab_newton.cloner.replicate import NewtonReplicateContext
@@ -30,6 +31,19 @@ class _FakeBuilder:
     def add_cloth_mesh(self, **kwargs) -> None:
         self.cloth_meshes.append(kwargs)
         self.particle_count += len(kwargs["vertices"])
+
+
+class _FakeVolumeBuilder:
+    def __init__(self):
+        self.particle_count = 0
+        self.particle_mass = []
+        self.soft_meshes = []
+
+    def add_soft_mesh(self, **kwargs) -> None:
+        self.soft_meshes.append(kwargs)
+        particle_count = len(kwargs["vertices"])
+        self.particle_mass.extend([0.0] * particle_count)
+        self.particle_count += particle_count
 
 
 class _FakePath:
@@ -164,6 +178,36 @@ def test_builder_hook_uses_resolved_surface_variant(monkeypatch):
     assert mesh["edge_ke"] == variant.edge_ke
     assert mesh["edge_kd"] == variant.edge_kd
     assert mesh["particle_radius"] == variant.particle_radius
+
+
+def test_builder_hook_uses_authored_volume_material_arrays(monkeypatch):
+    """Test that per-tet stiffness and per-particle masses override uniform material values."""
+    entry = DeformableRegistryEntry(
+        prim_path="/World/envs/env_.*/deformable",
+        sim_mesh_prim_path="/World/envs/env_.*/deformable/mesh",
+        vis_mesh_prim_path="/World/envs/env_.*/deformable/mesh",
+        vertices=[wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0), wp.vec3(0.0, 0.0, 1.0)],
+        indices=[0, 1, 2, 3],
+        init_pos=(0.0, 0.0, 0.0),
+        init_rot=(0.0, 0.0, 0.0, 1.0),
+        deformable_type="volume",
+        density=300.0,
+        k_mu=1.0e5,
+        k_lambda=1.0e5,
+        tet_mu=np.asarray([12.0], dtype=np.float32),
+        tet_lambda=np.asarray([34.0], dtype=np.float32),
+        particle_mass=np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32),
+    )
+    monkeypatch.setattr(deformable_object, "_variant_entry_for_env", lambda _entry, _env_idx: entry)
+    builder = _FakeVolumeBuilder()
+
+    add_deformable_entry_to_builder(builder, entry, 0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
+
+    mesh = builder.soft_meshes[0]
+    assert mesh["density"] == 1.0
+    np.testing.assert_array_equal(mesh["k_mu"], entry.tet_mu)
+    np.testing.assert_array_equal(mesh["k_lambda"], entry.tet_lambda)
+    np.testing.assert_allclose(builder.particle_mass, entry.particle_mass)
 
 
 def test_newton_physics_context_is_replicate_context():

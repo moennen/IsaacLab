@@ -65,6 +65,9 @@ class DeformableRegistryEntry:
     k_mu: float = 1e5
     k_lambda: float = 1e5
     k_damp: float = 0.0
+    tet_mu: np.ndarray | None = None
+    tet_lambda: np.ndarray | None = None
+    particle_mass: np.ndarray | None = None
     # Filled by newton_physics_replicate:
     particle_offsets: list[int] = field(default_factory=list)
     particles_per_body: int = 0
@@ -72,6 +75,26 @@ class DeformableRegistryEntry:
     asset_indices: list[int] = field(default_factory=list)
     asset_index: int = 0
     prototype_paths: tuple[str, ...] = ()
+
+
+def _tet_material_array(prim: Usd.Prim, name: str, expected: int) -> np.ndarray | None:
+    """Load an optional per-tet or per-particle material array authored on a TetMesh prim.
+
+    Args:
+        prim: The USD prim carrying the custom ``newton:*`` float-array attribute.
+        name: The attribute name to read.
+        expected: The required flattened length (per-tet or per-particle count).
+
+    Returns:
+        The array as a flat ``float32`` array, or ``None`` when the attribute is absent.
+    """
+    attr = prim.GetAttribute(name)
+    if not attr.IsValid() or not attr.HasValue():
+        return None
+    values = np.asarray(attr.Get(), dtype=np.float32).reshape(-1)
+    if len(values) != expected:
+        raise ValueError(f"TetMesh '{prim.GetPath()}' has {len(values)} {name} values, expected {expected}.")
+    return values
 
 
 def _variant_entry_for_env(entry: DeformableRegistryEntry, env_idx: int) -> DeformableRegistryEntry:
@@ -173,12 +196,23 @@ def _variant_entry_for_env(entry: DeformableRegistryEntry, env_idx: int) -> Defo
         if asset_index_attr.IsValid() and asset_index_attr.HasValue()
         else (expected_asset_index if expected_asset_index is not None else 0)
     )
-    variant = replace(material, vertices=vertices, indices=indices, variants_by_env={}, asset_index=asset_index)
+    variant = replace(
+        material,
+        vertices=vertices,
+        indices=indices,
+        tet_mu=_tet_material_array(tet.GetPrim(), "newton:tetMu", len(indices) // 4),
+        tet_lambda=_tet_material_array(tet.GetPrim(), "newton:tetLambda", len(indices) // 4),
+        particle_mass=_tet_material_array(tet.GetPrim(), "newton:particleMass", len(vertices)),
+        variants_by_env={},
+        asset_index=asset_index,
+    )
     entry.variants_by_env[env_idx] = variant
     return variant
 
 
 if TYPE_CHECKING:
+    from pxr import Usd
+
     from isaaclab.assets.deformable_object.deformable_object_cfg import DeformableObjectCfg
 
 logger = logging.getLogger(__name__)
@@ -242,12 +276,16 @@ def add_deformable_entry_to_builder(
             vel=wp.vec3(0.0, 0.0, 0.0),
             vertices=variant.vertices,
             indices=variant.indices,
-            density=variant.density,
-            k_mu=variant.k_mu,
-            k_lambda=variant.k_lambda,
+            density=1.0 if variant.particle_mass is not None else variant.density,
+            k_mu=variant.tet_mu if variant.tet_mu is not None else variant.k_mu,
+            k_lambda=variant.tet_lambda if variant.tet_lambda is not None else variant.k_lambda,
             k_damp=variant.k_damp,
             particle_radius=variant.particle_radius,
         )
+        if variant.particle_mass is not None:
+            builder.particle_mass[before_count : before_count + len(variant.particle_mass)] = (
+                variant.particle_mass.tolist()
+            )
     elif variant.deformable_type == "surface":
         builder.add_cloth_mesh(
             pos=body_pos,
@@ -979,6 +1017,21 @@ class DeformableObject(BaseDeformableObject):
             k_mu=k_mu,
             k_lambda=k_lambda,
             k_damp=k_damp,
+            tet_mu=(
+                _tet_material_array(mesh_prim, "newton:tetMu", len(indices) // 4)
+                if deformable_type == "volume"
+                else None
+            ),
+            tet_lambda=(
+                _tet_material_array(mesh_prim, "newton:tetLambda", len(indices) // 4)
+                if deformable_type == "volume"
+                else None
+            ),
+            particle_mass=(
+                _tet_material_array(mesh_prim, "newton:particleMass", len(vertices))
+                if deformable_type == "volume"
+                else None
+            ),
             prototype_paths=tuple(
                 path for path in (getattr(self.cfg.spawn, "spawn_paths", None) or ()) if path is not None
             ),

@@ -109,25 +109,28 @@ def skin_gaussian_points_to_fabric_kernel(
     max_gaussian_count: int,
 ):
     """Skin Gaussian fields directly into Fabric-owned USD positions on the GPU."""
-    prim_slot = wp.tid()
+    tid = wp.tid()
+    prim_slot = tid // max_gaussian_count
+    gaussian_slot = tid - prim_slot * max_gaussian_count
     env_id = int(fabric_env_ids[prim_slot])
     asset_id = int(fabric_asset_ids[prim_slot])
     particle_offset = particle_offsets[env_id]
     gaussian_count = gaussian_counts[asset_id]
+    if gaussian_slot >= gaussian_count:
+        return
     asset_offset = asset_id * max_gaussian_count * 4
-    for gaussian_slot in range(gaussian_count):
-        influence_offset = asset_offset + gaussian_slot * 4
-        i0 = particle_offset + influence_indices[influence_offset + 0]
-        i1 = particle_offset + influence_indices[influence_offset + 1]
-        i2 = particle_offset + influence_indices[influence_offset + 2]
-        i3 = particle_offset + influence_indices[influence_offset + 3]
-        world_point = (
-            particle_q[i0] * influence_weights[influence_offset + 0]
-            + particle_q[i1] * influence_weights[influence_offset + 1]
-            + particle_q[i2] * influence_weights[influence_offset + 2]
-            + particle_q[i3] * influence_weights[influence_offset + 3]
-        )
-        fabric_positions[prim_slot][gaussian_slot] = world_point - env_position_offsets[env_id]
+    influence_offset = asset_offset + gaussian_slot * 4
+    i0 = particle_offset + influence_indices[influence_offset + 0]
+    i1 = particle_offset + influence_indices[influence_offset + 1]
+    i2 = particle_offset + influence_indices[influence_offset + 2]
+    i3 = particle_offset + influence_indices[influence_offset + 3]
+    world_point = (
+        particle_q[i0] * influence_weights[influence_offset + 0]
+        + particle_q[i1] * influence_weights[influence_offset + 1]
+        + particle_q[i2] * influence_weights[influence_offset + 2]
+        + particle_q[i3] * influence_weights[influence_offset + 3]
+    )
+    fabric_positions[prim_slot][gaussian_slot] = world_point - env_position_offsets[env_id]
 
 
 @dataclass(frozen=True)
@@ -663,7 +666,7 @@ class SkinnedGaussianKitVisualizer(BaseVisualizer):
             particle_offsets = getattr(fabric_runtime.asset.data, "_particle_offsets")
             wp.launch(
                 skin_gaussian_points_to_fabric_kernel,
-                dim=fabric_runtime.prim_count,
+                dim=fabric_runtime.prim_count * fabric_runtime.max_gaussian_count,
                 inputs=[
                     fabric_runtime.fabric_positions,
                     fabric_runtime.fabric_env_ids,

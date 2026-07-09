@@ -22,6 +22,7 @@ compatibility: tet vertices are the deformation handles, not skeleton joints.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -133,6 +134,7 @@ def compute_tet_barycentric_skinning(
     *,
     chunk_size: int = 4096,
     inside_tolerance: float = 1.0e-5,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> SkinningResult:
     """Compute four-vertex barycentric skinning weights from query points to a tet mesh.
 
@@ -169,6 +171,7 @@ def compute_tet_barycentric_skinning(
     selected_weights = np.empty((points.shape[0], 4), dtype=np.float32)
     selected_violation = np.empty(points.shape[0], dtype=np.float32)
 
+    report_interval = max(chunk_size, (points.shape[0] + 9) // 10)
     for start in range(0, points.shape[0], chunk_size):
         end = min(start + chunk_size, points.shape[0])
         rel = points[start:end, None, :] - tet_points[None, :, 0, :]
@@ -185,6 +188,8 @@ def compute_tet_barycentric_skinning(
         selected_tets[start:end] = best_tet
         selected_weights[start:end] = weights[rows, best_tet]
         selected_violation[start:end] = violation[rows, best_tet]
+        if progress_callback is not None and (end == points.shape[0] or end % report_interval < chunk_size):
+            progress_callback(end, points.shape[0])
 
     return SkinningResult(
         tet_indices=selected_tets,
@@ -326,8 +331,11 @@ def package_skinned_gaussian_tet_asset(
     chunk_size: int = 4096,
     inside_tolerance: float = 1.0e-5,
     max_gaussians: int | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> SkinningResult:
     """Create a combined Gaussian + TetMesh USD with custom deformable skinning data."""
+    if progress_callback is not None:
+        progress_callback("loading splats for skinning")
     source_gaussian_stage, source_gaussian_prim, gaussian_positions = _load_gaussian_prim_data(
         gaussian_usd_path,
         gaussian_prim_path,
@@ -344,14 +352,23 @@ def package_skinned_gaussian_tet_asset(
         rotate_y_up_to_z_up=rotate_tet_y_up_to_z_up,
         center_to_origin=center_tet_to_origin,
     )
+    if progress_callback is not None:
+        progress_callback(f"skinning {len(gaussian_positions):,} splats")
     result = compute_tet_barycentric_skinning(
         gaussian_positions,
         tet_vertices,
         tets,
         chunk_size=chunk_size,
         inside_tolerance=inside_tolerance,
+        progress_callback=(
+            (lambda completed, total: progress_callback(f"skinning: {completed:,}/{total:,} splats"))
+            if progress_callback is not None
+            else None
+        ),
     )
 
+    if progress_callback is not None:
+        progress_callback("writing packaged USD")
     output_path = Path(output_usd_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stage = Usd.Stage.CreateNew(str(output_path))
@@ -379,6 +396,8 @@ def package_skinned_gaussian_tet_asset(
         source_tet_usd=str(tet_usd_path),
     )
     stage.Save()
+    if progress_callback is not None:
+        progress_callback("packaged USD saved")
     return result
 
 

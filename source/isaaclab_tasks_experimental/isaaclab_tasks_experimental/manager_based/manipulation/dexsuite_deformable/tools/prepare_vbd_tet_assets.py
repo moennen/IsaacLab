@@ -115,7 +115,9 @@ def normalize_vbd_tet_geometry(
     return vertices, _ensure_positive_winding(vertices, tets), scale
 
 
-def write_vbd_tet_asset(path: str | Path, vertices: np.ndarray, tets: np.ndarray) -> None:
+def write_vbd_tet_asset(
+    path: str | Path, vertices: np.ndarray, tets: np.ndarray, material_arrays: dict[str, np.ndarray] | None = None
+) -> None:
     """Write a minimal VBD-compatible USD asset."""
     from pxr import Sdf, Usd
 
@@ -127,6 +129,10 @@ def write_vbd_tet_asset(path: str | Path, vertices: np.ndarray, tets: np.ndarray
     prim = stage.DefinePrim("/TetMesh", "Xform")
     prim.CreateAttribute("vbd:vertices", Sdf.ValueTypeNames.Point3fArray, custom=True).Set(vertices.tolist())
     prim.CreateAttribute("vbd:tet_indices", Sdf.ValueTypeNames.IntArray, custom=True).Set(tets.reshape(-1).tolist())
+    for name, values in (material_arrays or {}).items():
+        prim.CreateAttribute(name, Sdf.ValueTypeNames.FloatArray, custom=True).Set(
+            np.asarray(values, dtype=np.float32).reshape(-1).tolist()
+        )
     stage.GetRootLayer().Save()
 
 

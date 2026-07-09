@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -248,6 +248,7 @@ def _voxel_solid_from_gaussians(
     *,
     voxel_size: float,
     collision_shell: float,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
     """Build an eroded dense occupancy grid from a Gaussian-splat field.
 
@@ -278,24 +279,35 @@ def _voxel_solid_from_gaussians(
 
     axes = [bounds_min[axis] + voxel_size * np.arange(shape[axis], dtype=np.float32) for axis in range(3)]
     grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    if progress_callback is not None:
+        progress_callback(f"voxel occupancy: grid={tuple(shape)}, samples={len(grid):,}, splats={len(positions):,}")
     tree = cKDTree(positions)
     max_radius = float(np.max(radii))
     occupancy = np.empty(len(grid), dtype=bool)
-    for start in range(0, len(grid), 65_536):
-        end = min(start + 65_536, len(grid))
+    # ``query_ball_point`` yields Python lists.  Evaluating every list entry
+    # one ``np.linalg.norm`` call at a time is prohibitively slow for dense
+    # Gaussian fields.  Keep the query batches bounded, then flatten and test
+    # all candidate point/splat pairs in one NumPy operation below.
+    batch_size = 8_192
+    report_interval = max(batch_size, (len(grid) + 9) // 10)
+    for start in range(0, len(grid), batch_size):
+        end = min(start + batch_size, len(grid))
         points = grid[start:end]
         # Nearest centre is not necessarily the splat that contains a point:
         # a large-radius Gaussian can sit behind many smaller, closer centres.
         # Query every centre that could overlap, then apply its own radius.
         candidates = tree.query_ball_point(points, r=max_radius, workers=-1)
-        occupancy[start:end] = np.fromiter(
-            (
-                any(np.linalg.norm(point - positions[index]) <= radii[index] for index in indices)
-                for point, indices in zip(points, candidates, strict=True)
-            ),
-            dtype=bool,
-            count=len(points),
-        )
+        candidate_counts = np.fromiter((len(indices) for indices in candidates), dtype=np.int64, count=len(points))
+        inside = np.zeros(len(points), dtype=bool)
+        if candidate_counts.sum() > 0:
+            point_ids = np.repeat(np.arange(len(points), dtype=np.int64), candidate_counts)
+            splat_ids = np.concatenate(candidates).astype(np.int64, copy=False)
+            offsets = points[point_ids] - positions[splat_ids]
+            pair_is_inside = np.einsum("ij,ij->i", offsets, offsets) <= radii[splat_ids] ** 2
+            np.logical_or.at(inside, point_ids, pair_is_inside)
+        occupancy[start:end] = inside
+        if progress_callback is not None and (end == len(grid) or end % report_interval < batch_size):
+            progress_callback(f"voxel occupancy: {end:,}/{len(grid):,}")
     occupancy = occupancy.reshape(tuple(shape))
     # Close sub-voxel splat gaps, then turn the Gaussian shell into a solid.
     occupancy = ndimage.binary_closing(occupancy, structure=np.ones((3, 3, 3), dtype=bool), iterations=1)
@@ -322,6 +334,7 @@ def _sample_collision_aware_proxy(
     collision_shell: float,
     voxel_size: float,
     allow_convex_fallback: bool = False,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Generate a fixed-budget, non-convex tet proxy from an eroded voxel solid."""
     try:
@@ -330,7 +343,11 @@ def _sample_collision_aware_proxy(
         raise ImportError("Collision-aware Gaussian VBD preparation needs scipy.") from exc
 
     inner, origin, spacing, applied_shell = _voxel_solid_from_gaussians(
-        positions, radii, voxel_size=voxel_size, collision_shell=collision_shell
+        positions,
+        radii,
+        voxel_size=voxel_size,
+        collision_shell=collision_shell,
+        progress_callback=progress_callback,
     )
     cell_indices = np.argwhere(inner)
     if len(cell_indices) < target_num_vertices:
@@ -339,7 +356,11 @@ def _sample_collision_aware_proxy(
             f"{target_num_vertices} simulation vertices. Decrease --collision-voxel-size or target_num_vertices."
         )
     candidates = origin[None, :] + spacing * cell_indices.astype(np.float32)
+    if progress_callback is not None:
+        progress_callback(f"sampling {target_num_vertices} VBD vertices from {len(candidates):,} interior voxels")
     vertices = farthest_point_sample(candidates, target_num_vertices, max_candidates=max(50_000, target_num_vertices))
+    if progress_callback is not None:
+        progress_callback("tetrahedralizing collision proxy")
     all_tets = tetrahedralize_proxy(vertices)
 
     # Retain cells that lie inside (or immediately next to) the eroded solid.
@@ -390,6 +411,8 @@ def _sample_collision_aware_proxy(
         used = np.unique(tets.reshape(-1))
     if len(used) != target_num_vertices:
         raise ValueError("Delaunay tetrahedralization did not connect every requested simulation vertex.")
+    if progress_callback is not None:
+        progress_callback(f"collision proxy ready: vertices={len(vertices)}, tetrahedra={len(tets)}")
     return np.ascontiguousarray(vertices, dtype=np.float32), np.ascontiguousarray(tets, dtype=np.int32), applied_shell
 
 
@@ -411,6 +434,152 @@ def _scaled_proxy_vertices(
     return np.ascontiguousarray(proxy, dtype=np.float32), float(scale)
 
 
+def _align_vomp_positions_to_tet_bounds(vomp_positions: np.ndarray, tet_vertices: np.ndarray) -> np.ndarray:
+    """Map VoMP's centered normalization frame into the tet rest frame.
+
+    VoMP commonly normalizes its input field to an approximately unit longest
+    extent (its sparse voxel coordinates consequently span about ``0.98``),
+    whereas the VBD builder may choose any physical target extent.  Both
+    frames retain the source axes, so a uniform bounding-box alignment keeps
+    the inferred spatial material variation while matching the VBD rest mesh.
+    """
+    vomp_min = vomp_positions.min(axis=0)
+    vomp_max = vomp_positions.max(axis=0)
+    tet_min = tet_vertices.min(axis=0)
+    tet_max = tet_vertices.max(axis=0)
+    vomp_extent = float(np.max(vomp_max - vomp_min))
+    tet_extent = float(np.max(tet_max - tet_min))
+    if vomp_extent <= 0.0 or tet_extent <= 0.0:
+        raise ValueError("VoMP voxels and tet vertices must both have non-zero spatial extent.")
+    return np.ascontiguousarray(
+        (vomp_positions - (vomp_min + vomp_max) * 0.5) * (tet_extent / vomp_extent) + (tet_min + tet_max) * 0.5,
+        dtype=np.float32,
+    )
+
+
+def _vomp_lookup_vertices(tet_vertices: np.ndarray, *, source_y_up: bool) -> np.ndarray:
+    """Return tet vertices in VoMP's PLY coordinate frame.
+
+    The PLY exporter rotates default Y-up Gaussian sources into Z-up before VoMP
+    inference.  The VBD source remains Y-up until its later packaging step, so
+    material nearest-neighbour queries must apply the same rotation here.
+    """
+    if not source_y_up:
+        return np.ascontiguousarray(tet_vertices, dtype=np.float32)
+    return np.ascontiguousarray(
+        np.stack((tet_vertices[:, 0], -tet_vertices[:, 2], tet_vertices[:, 1]), axis=1), dtype=np.float32
+    )
+
+
+def _vomp_youngs_modulus_correction_scale(
+    material_paths: Iterable[Path], youngs_modulus_correction_factor: float
+) -> float:
+    """Compute one Young's-modulus scale for all supplied VoMP material fields.
+
+    Args:
+        material_paths: VoMP NPZ material files included in the current asset build.
+        youngs_modulus_correction_factor: Desired arithmetic mean Young's modulus [Pa].
+            Set to ``1.0`` to disable correction and preserve the raw VoMP values.
+
+    Returns:
+        Dimensionless scale applied to every VoMP Young's-modulus value.
+    """
+    if youngs_modulus_correction_factor <= 0.0:
+        raise ValueError("youngs_modulus_correction_factor must be positive.")
+    if youngs_modulus_correction_factor == 1.0:
+        return 1.0
+
+    total = 0.0
+    count = 0
+    for material_path in material_paths:
+        data = np.load(material_path)["voxel_data"]
+        names = data.dtype.names or ()
+        if "youngs_modulus" not in names:
+            raise ValueError(f"'{material_path}' must contain a youngs_modulus field.")
+        youngs = np.asarray(data["youngs_modulus"], dtype=np.float64)
+        if not np.all(np.isfinite(youngs)) or np.any(youngs <= 0.0):
+            raise ValueError(f"'{material_path}' contains non-positive or non-finite Young's-modulus values.")
+        total += float(youngs.sum())
+        count += int(youngs.size)
+    if count == 0:
+        raise ValueError("Cannot correct VoMP Young's modulus with no voxel values.")
+    return float(youngs_modulus_correction_factor / (total / count))
+
+
+def material_arrays_from_vomp(
+    tet_vertices: np.ndarray,
+    tets: np.ndarray,
+    material_path: str | Path,
+    *,
+    source_y_up: bool = True,
+    youngs_modulus_scale: float = 1.0,
+) -> dict[str, np.ndarray]:
+    """Map VoMP's sparse voxel predictions to a VBD mesh by nearest neighbour.
+
+    The material file must contain VoMP's ``voxel_data`` structured array with
+    Young's modulus [Pa], Poisson ratio [-], and density [kg/m^3]. For default
+    Y-up sources, VoMP positions are Z-up because the PLY exporter applies the
+    task's Y-up-to-Z-up conversion; the lookup vertices are converted into that
+    same frame before alignment. Elastic parameters are assigned at tet
+    centroids; density is sampled at vertices and then lumped from each tet to
+    preserve the total mass. ``youngs_modulus_scale`` is a dimensionless global
+    correction applied to the VoMP modulus before Lamé conversion.
+
+    Args:
+        tet_vertices: Rest-frame tet vertices [m], shape [num_vertices, 3].
+        tets: Tetrahedron vertex indices, shape [num_tets, 4].
+        material_path: Path to the VoMP ``voxel_data`` NPZ material file.
+        source_y_up: Whether the tet source is Y-up (matching the PLY exporter).
+        youngs_modulus_scale: Dimensionless scale applied to the VoMP modulus.
+
+    Returns:
+        Mapping with ``newton:tetMu`` and ``newton:tetLambda`` Lamé parameters
+        [Pa], shape [num_tets], and ``newton:particleMass`` [kg], shape
+        [num_vertices].
+    """
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError as exc:
+        raise ImportError("VoMP material mapping needs scipy in the asset-preparation environment.") from exc
+    data = np.load(material_path)["voxel_data"]
+    names = data.dtype.names or ()
+    poisson_name = "poisson_ratio" if "poisson_ratio" in names else "poissons_ratio"
+    required = {"x", "y", "z", "youngs_modulus", poisson_name, "density"}
+    if not required.issubset(names):
+        raise ValueError(f"'{material_path}' must contain VoMP voxel_data fields {sorted(required)}.")
+    positions = np.column_stack((data["x"], data["y"], data["z"])).astype(np.float32)
+    lookup_vertices = _vomp_lookup_vertices(tet_vertices, source_y_up=source_y_up)
+    positions = _align_vomp_positions_to_tet_bounds(positions, lookup_vertices)
+    tree = cKDTree(positions)
+    lookup_tet_points = lookup_vertices[tets]
+    centroids = lookup_tet_points.mean(axis=1)
+    _, tet_ids = tree.query(centroids)
+    youngs = np.asarray(data["youngs_modulus"][tet_ids], dtype=np.float32) * float(youngs_modulus_scale)
+    poisson = np.asarray(data[poisson_name][tet_ids], dtype=np.float32)
+    if np.any(youngs <= 0.0) or np.any((poisson <= -1.0) | (poisson >= 0.5)):
+        raise ValueError("VoMP material values require E > 0 and -1 < nu < 0.5.")
+    tet_mu = youngs / (2.0 * (1.0 + poisson))
+    tet_lambda = youngs * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson))
+    _, vertex_ids = tree.query(lookup_vertices)
+    vertex_density = np.asarray(data["density"][vertex_ids], dtype=np.float32)
+    tet_points = tet_vertices[tets]
+    volumes = (
+        np.abs(
+            np.einsum(
+                "ij,ij->i",
+                tet_points[:, 1] - tet_points[:, 0],
+                np.cross(tet_points[:, 2] - tet_points[:, 0], tet_points[:, 3] - tet_points[:, 0]),
+            )
+        )
+        / 6.0
+    )
+    tet_density = vertex_density[tets].mean(axis=1)
+    particle_mass = np.zeros(len(tet_vertices), dtype=np.float32)
+    for corner in range(4):
+        np.add.at(particle_mass, tets[:, corner], tet_density * volumes / 4.0)
+    return {"newton:tetMu": tet_mu, "newton:tetLambda": tet_lambda, "newton:particleMass": particle_mass}
+
+
 def build_gaussian_vbd_asset_set(
     gaussian_usd_paths: Iterable[str | Path],
     output_dir: str | Path,
@@ -426,6 +595,8 @@ def build_gaussian_vbd_asset_set(
     source_y_up: bool = True,
     max_candidates: int = 50_000,
     max_gaussians: int | None = None,
+    vomp_material_paths: Iterable[str | Path] | None = None,
+    youngs_modulus_correction_factor: float = 1.0e5,
 ) -> list[GaussianVbdAssetInfo]:
     """Create uniformly-sized, skinned VBD assets from Gaussian-splat USD files.
 
@@ -437,8 +608,19 @@ def build_gaussian_vbd_asset_set(
     paths = [Path(path) for path in gaussian_usd_paths]
     if not paths:
         raise ValueError("At least one Gaussian USD asset is required.")
+    material_paths = (
+        [Path(path) for path in vomp_material_paths] if vomp_material_paths is not None else [None] * len(paths)
+    )
+    if len(material_paths) != len(paths):
+        raise ValueError("--vomp-materials must provide exactly one file per Gaussian USD, in the same order.")
     if skinning_chunk_size <= 0:
         raise ValueError("skinning_chunk_size must be positive.")
+    supplied_material_paths = [path for path in material_paths if path is not None]
+    youngs_modulus_scale = (
+        _vomp_youngs_modulus_correction_scale(supplied_material_paths, youngs_modulus_correction_factor)
+        if supplied_material_paths
+        else 1.0
+    )
 
     output_dir = Path(output_dir)
     tet_dir = output_dir / "vbd_tets"
@@ -450,10 +632,13 @@ def build_gaussian_vbd_asset_set(
         if not isinstance(previous_entries, list):
             raise ValueError(f"Existing manifest '{manifest_path}' must contain a JSON list.")
     result: list[GaussianVbdAssetInfo] = []
-    for source_path in paths:
+    for asset_index, (source_path, material_path) in enumerate(zip(paths, material_paths, strict=True), start=1):
+        prefix = f"[{asset_index}/{len(paths)}] {source_path.stem}"
+        print(f"{prefix}: loading Gaussian source", flush=True)
         _, gaussian_prim, positions = _load_gaussian_prim_data(
             str(source_path), gaussian_prim_path, max_gaussians=max_gaussians
         )
+        print(f"{prefix}: loaded {len(positions):,} splats", flush=True)
         source_extent = float(np.ptp(positions, axis=0).max())
         if source_extent <= 0.0:
             raise ValueError("Gaussian field has zero spatial extent.")
@@ -477,6 +662,7 @@ def build_gaussian_vbd_asset_set(
                 collision_shell=collision_shell,
                 voxel_size=voxel_size,
                 allow_convex_fallback=allow_convex_fallback,
+                progress_callback=lambda message: print(f"{prefix}: {message}", flush=True),
             )
         else:
             vertices = farthest_point_sample(positions, target_num_vertices, max_candidates=max_candidates)
@@ -484,10 +670,24 @@ def build_gaussian_vbd_asset_set(
             vertices, scale = _scaled_proxy_vertices(positions, vertices, target_max_extent)
             applied_collision_shell = 0.0
         tets = filter_spawner_degenerate_tets(vertices, tets)
+        print(f"{prefix}: retained {len(tets):,} non-degenerate tetrahedra", flush=True)
 
         tet_path = tet_dir / f"{source_path.stem}_vbd_tet.usda"
         packaged_path = packaged_dir / f"{source_path.stem}_skinned_vbd_tet.usda"
-        write_vbd_tet_asset(tet_path, vertices, tets)
+        if material_path is not None:
+            print(f"{prefix}: mapping VoMP material field", flush=True)
+            material_arrays = material_arrays_from_vomp(
+                vertices,
+                tets,
+                material_path,
+                source_y_up=source_y_up,
+                youngs_modulus_scale=youngs_modulus_scale,
+            )
+        else:
+            material_arrays = None
+        print(f"{prefix}: writing VBD tet USD", flush=True)
+        write_vbd_tet_asset(tet_path, vertices, tets, material_arrays)
+        print(f"{prefix}: packaging skinned Gaussian USD", flush=True)
         skinning = package_skinned_gaussian_tet_asset(
             gaussian_usd_path=str(source_path),
             tet_usd_path=str(tet_path),
@@ -500,6 +700,7 @@ def build_gaussian_vbd_asset_set(
             gaussian_scale=(scale, scale, scale),
             chunk_size=skinning_chunk_size,
             max_gaussians=max_gaussians,
+            progress_callback=lambda message: print(f"{prefix}: {message}", flush=True),
         )
         violations = skinning.barycentric_violation
         result.append(
@@ -553,6 +754,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-candidates", type=int, default=50_000, help="FPS candidate cap for large splat fields.")
     parser.add_argument("--max-gaussians", type=int, default=None, help="Optional visual/debug splat cap.")
     parser.add_argument(
+        "--vomp-materials", nargs="+", default=None, help="Optional VoMP NPZ files, one per Gaussian USD."
+    )
+    parser.add_argument(
+        "--youngs-modulus-correction-factor",
+        type=float,
+        default=1.0e5,
+        help=(
+            "Desired global arithmetic mean Young's modulus [Pa] across VoMP assets; "
+            "corrects VoMP stiffness bias. Set to 1.0 to preserve raw VoMP values."
+        ),
+    )
+    parser.add_argument(
         "--skinning-chunk-size",
         type=int,
         default=512,
@@ -587,6 +800,8 @@ if __name__ == "__main__":
         source_y_up=not args.source_z_up,
         max_candidates=args.max_candidates,
         max_gaussians=args.max_gaussians,
+        vomp_material_paths=args.vomp_materials,
+        youngs_modulus_correction_factor=args.youngs_modulus_correction_factor,
     )
     for asset in assets:
         print(

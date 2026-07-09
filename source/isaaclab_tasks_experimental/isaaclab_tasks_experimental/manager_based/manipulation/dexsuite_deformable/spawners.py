@@ -190,6 +190,59 @@ def _vbd_tet_asset_geometry(
     return vertices, tets, _surface_faces_from_tets(tets)
 
 
+def _vbd_tet_asset_material_arrays(
+    usd_path: str,
+    *,
+    source_prim_path: str,
+    num_vertices: int,
+    num_tets: int,
+    scale: tuple[float, float, float],
+) -> dict[str, np.ndarray]:
+    """Load optional per-particle and per-tetrahedron material arrays from a VBD source asset.
+
+    ``newton:particleMass`` is a mass [kg] and therefore scales with the authored volume.
+    The Lamé parameters are material properties [Pa] and are unchanged by a geometric scale.
+    """
+    from pxr import Usd
+
+    stage = Usd.Stage.Open(str(usd_path))
+    if stage is None:
+        raise FileNotFoundError(f"Failed to open VBD tet asset: '{usd_path}'.")
+    source_prim = stage.GetPrimAtPath(source_prim_path)
+    if not source_prim.IsValid():
+        raise ValueError(f"Could not find prim '{source_prim_path}' in VBD tet asset '{usd_path}'.")
+
+    expected_counts = {
+        "newton:tetMu": num_tets,
+        "newton:tetLambda": num_tets,
+        "newton:particleMass": num_vertices,
+    }
+    arrays: dict[str, np.ndarray] = {}
+    for name, expected_count in expected_counts.items():
+        attr = source_prim.GetAttribute(name)
+        if not attr.IsValid() or not attr.HasValue():
+            continue
+        # ``np.array`` copies by default, yielding a writable array; the USD
+        # ``Get()`` view is read-only and cannot be scaled in place below.
+        values = np.array(attr.Get(), dtype=np.float32).reshape(-1)
+        if len(values) != expected_count:
+            raise ValueError(f"VBD tet asset '{usd_path}' has {len(values)} {name} values, expected {expected_count}.")
+        arrays[name] = values
+
+    if "newton:particleMass" in arrays:
+        volume_scale = abs(float(np.prod(np.asarray(scale, dtype=np.float32))))
+        arrays["newton:particleMass"] *= volume_scale
+    return arrays
+
+
+def _author_tet_material_arrays(tet_prim, material_arrays: dict[str, np.ndarray]) -> None:
+    """Author VBD material arrays on the spawned simulation TetMesh."""
+    from pxr import Sdf
+
+    for name, values in material_arrays.items():
+        tet_prim.GetPrim().CreateAttribute(name, Sdf.ValueTypeNames.FloatArray, custom=True).Set(values.tolist())
+
+
 def _cuboid_tet_grid(
     size: tuple[float, float, float], resolution: tuple[int, int, int]
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -339,6 +392,16 @@ def spawn_newton_vbd_tet_asset(
     tet.CreatePointsAttr(vertices)
     tet.CreateTetVertexIndicesAttr(tets.reshape(-1))
     tet.CreateSurfaceFaceVertexIndicesAttr(surface_faces.reshape(-1))
+    _author_tet_material_arrays(
+        tet,
+        _vbd_tet_asset_material_arrays(
+            cfg.usd_path,
+            source_prim_path=cfg.source_prim_path,
+            num_vertices=len(vertices),
+            num_tets=len(tets),
+            scale=cfg.scale,
+        ),
+    )
 
     mesh = UsdGeom.Mesh.Define(stage, f"{geom_path}/visual_mesh")
     mesh.CreatePointsAttr(vertices)
