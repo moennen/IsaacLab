@@ -4,6 +4,25 @@ This task simulates a heterogeneous set of Gaussian-splat assets with Newton
 VBD. Each selected asset must have the same number of simulation vertices;
 tetrahedron counts may differ.
 
+## Newton dependency
+
+This task runs against a local Newton checkout that is upstream `main` plus one
+extra commit, *"Scale particle-shape soft contacts for replicated worlds"*. Its
+dependency on that commit is graceful at the API layer but hard at the
+simulation layer:
+
+- **API (soft, feature-detected).** The commit adds a `soft_contact_max`
+  argument to `SolverVBD`. The coupled managers pass it only when the installed
+  `SolverVBD` accepts it (checked via `inspect.signature`), so an upstream
+  Newton without the commit degrades silently instead of erroring.
+- **Simulation (hard).** The commit makes Newton's particle-shape soft-contact
+  allocation and generation *world-aware* (keyed on `particle_world` /
+  `shape_world`) so each replicated world only tests its own and global shapes.
+  Without it, replicated (`--num_envs > 1`) deformable scenes size contacts by
+  global all-pairs, which is incorrect and scales quadratically in the number of
+  worlds. Multi-environment training therefore requires this commit; single-env
+  replay (as in the reference play command below) is only weakly affected.
+
 ## Heterogeneous-asset constraints
 
 ### Common simulation vertex count
@@ -200,13 +219,16 @@ Use the same physics preset that was used for training.  In particular, the
 ### Reference play command
 
 The following is the canonical Kit-visualizer replay of the packaged toy set
-with the `2026-07-05_11-20-48/model_12500.pt` checkpoint. It sets the six VBD
-and skinned-Gaussian assets, forces constant gravity (disabling the gravity
-curriculum and the variable-gravity event so the play episode uses a fixed
-`-9.81` m/s²), and caps the episode at 4 s:
+with the `2026-07-05_11-20-48/model_12500.pt` checkpoint. It uses the global
+(uniform) material variant built without `--vomp-materials`, so every asset
+falls back to the uniform `density`/`k_mu`/`k_lambda` rather than baked
+per-tet VoMP fields. It sets the six VBD and skinned-Gaussian assets, forces
+constant gravity (disabling the gravity curriculum and the variable-gravity
+event so the play episode uses a fixed `-9.81` m/s²), and caps the episode at
+4 s:
 
 ```bash
-ASSET_ROOT="$PWD/outputs/dexsuite_toys_collision_4mm_512"
+ASSET_ROOT="$PWD/outputs/dexsuite_toys_collision_4mm_512_global"
 
 export DEXSUITE_DEFORMABLE_ASSETS="$ASSET_ROOT/vbd_tets/baked.BluehairRagdoll_vbd_tet.usda,$ASSET_ROOT/vbd_tets/baked.bublik_octopus_vbd_tet.usda,$ASSET_ROOT/vbd_tets/baked.knit_meow_vbd_tet.usda,$ASSET_ROOT/vbd_tets/baked.mer_elephant_vbd_tet.usda,$ASSET_ROOT/vbd_tets/baked.stink_raccoon_vbd_tet.usda,$ASSET_ROOT/vbd_tets/baked.sunflower_baby_vbd_tet.usda"
 export DEXSUITE_SKINNED_GAUSSIAN_ASSETS="$ASSET_ROOT/packaged/baked.BluehairRagdoll_skinned_vbd_tet.usda,$ASSET_ROOT/packaged/baked.bublik_octopus_skinned_vbd_tet.usda,$ASSET_ROOT/packaged/baked.knit_meow_skinned_vbd_tet.usda,$ASSET_ROOT/packaged/baked.mer_elephant_skinned_vbd_tet.usda,$ASSET_ROOT/packaged/baked.stink_raccoon_skinned_vbd_tet.usda,$ASSET_ROOT/packaged/baked.sunflower_baby_skinned_vbd_tet.usda"
