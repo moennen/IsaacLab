@@ -1627,7 +1627,9 @@ class _SkinnedGaussianNewtonVisualizerMixin:
         )
         for asset_index, asset in enumerate(objects):
             if asset_index >= len(usd_paths):
-                logger.warning("[SkinnedGaussianNewtonVisualizer] No Gaussian USD configured for asset index %d.", asset_index)
+                logger.warning(
+                    "[SkinnedGaussianNewtonVisualizer] No Gaussian USD configured for asset index %d.", asset_index
+                )
                 continue
             particle_offsets = getattr(asset.data, "_particle_offsets", None)
             particles_per_body = getattr(asset.data, "_particles_per_body", None)
@@ -1672,7 +1674,8 @@ class _SkinnedGaussianNewtonVisualizerMixin:
             )
         if self._skinned_gaussians:
             logger.info(
-                "[SkinnedGaussianNewtonVisualizer] Play swap: loaded %d candidate Gaussian point clouds for %d visible envs.",
+                "[SkinnedGaussianNewtonVisualizer] Play swap: loaded %d candidate Gaussian "
+                "point clouds for %d visible envs.",
                 len(self._skinned_gaussians),
                 visible_env_ids.size,
             )
@@ -1717,7 +1720,11 @@ class _SkinnedGaussianNewtonVisualizerMixin:
 
         for asset_index, runtime in self._skinned_gaussians.items():
             particle_offsets = getattr(runtime.asset.data, "_particle_offsets")
-            kernel = skin_active_asset_gaussian_points_kernel if self._skinned_gaussian_swap is not None else skin_gaussian_points_kernel
+            kernel = (
+                skin_active_asset_gaussian_points_kernel
+                if self._skinned_gaussian_swap is not None
+                else skin_gaussian_points_kernel
+            )
             inputs = [
                 particle_q,
                 particle_offsets,
@@ -1725,11 +1732,13 @@ class _SkinnedGaussianNewtonVisualizerMixin:
             ]
             if self._skinned_gaussian_swap is not None:
                 inputs.extend([self._skinned_gaussian_swap.active_index_wp, asset_index])
-            inputs.extend([
-                runtime.influence_indices,
-                runtime.influence_weights,
-                runtime.gaussian_count,
-            ])
+            inputs.extend(
+                [
+                    runtime.influence_indices,
+                    runtime.influence_weights,
+                    runtime.gaussian_count,
+                ]
+            )
             wp.launch(
                 kernel,
                 dim=runtime.total_points,

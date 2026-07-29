@@ -194,6 +194,12 @@ export DEXSUITE_DEFORMABLE_ASSETS_ARE_Z_UP=1
 export DEXSUITE_DEFORMABLE_PARTICLE_RADIUS=0.004
 ```
 
+Use the packaged `*_skinned_vbd_tet.usda` filenames in
+`DEXSUITE_SKINNED_GAUSSIAN_ASSETS`.  For compatibility with earlier manifests,
+the replay visualizer also resolves a legacy `*_vbd_tet.usda` entry to a
+sibling packaged `*_skinned_vbd_tet.usda` file when one exists, and emits a
+warning.  The manifest should nevertheless be updated to the packaged name.
+
 ## Training and evaluation
 
 Train the RSL-RL policy:
@@ -253,6 +259,22 @@ Run the environment with a zero-action agent:
 ./isaaclab.sh -p scripts/environments/zero_agent.py \
   --task Isaac-Dexsuite-Deformable-Kuka-Allegro-Lift-Kit-Play-v0 --num_envs 1 --visualizer kit
 ```
+
+### Play asset swapping
+
+The `*-Play-v0` tasks bake every configured candidate as
+`deformable_0` through `deformable_N-1` and select one candidate for each
+environment at reset.  Training continues to use the original single-body
+task and therefore requires candidates with a shared particle count; play
+replay may use candidates with different particle counts.  Each Gaussian
+package is validated against the particle budget of its corresponding
+deformable body, rather than that of the first candidate.
+
+Kit replay keeps one padded Gaussian field per environment, sized for the
+largest selected candidate, and updates its appearance when the active
+candidate changes.  Newton replay creates one debug point cloud per candidate
+and hides inactive candidates.  The latter displays colored points/spheres,
+not the actual Gaussian splats.
 
 ## Rendering
 
