@@ -13,6 +13,8 @@ import torch
 
 from isaaclab.managers import SceneEntityCfg
 
+from .active_deformable import active_node_data, segmented_any, segmented_max, segmented_min
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, DeformableObject
     from isaaclab.envs import ManagerBasedRLEnv
@@ -36,14 +38,15 @@ def deformable_nodal_out_of_bounds(
 ) -> torch.Tensor:
     """Terminate when any deformable node leaves the configured env-frame bounds."""
     asset: DeformableObject = env.scene[asset_cfg.name]
-    nodal_pos = asset.data.nodal_pos_w.torch - env.scene.env_origins.unsqueeze(1)
+    nodal_pos, node_env_ids, _ = active_node_data(asset)
+    nodal_pos = nodal_pos - env.scene.env_origins[node_env_ids]
     ranges = torch.tensor(
         [in_bound_range.get(axis, (-float("inf"), float("inf"))) for axis in ("x", "y", "z")],
         device=nodal_pos.device,
         dtype=nodal_pos.dtype,
     )
-    outside = (nodal_pos < ranges[:, 0]) | (nodal_pos > ranges[:, 1])
-    return outside.any(dim=(1, 2))
+    outside = ((nodal_pos < ranges[:, 0]) | (nodal_pos > ranges[:, 1])).any(dim=-1)
+    return segmented_any(outside, node_env_ids, env.num_envs)
 
 
 def deformable_state_invalid(
@@ -54,11 +57,16 @@ def deformable_state_invalid(
 ) -> torch.Tensor:
     """Terminate on non-finite or clearly unstable deformable state."""
     asset: DeformableObject = env.scene[asset_cfg.name]
-    nodal_pos = asset.data.nodal_pos_w.torch
-    nodal_vel = asset.data.nodal_vel_w.torch
-    nonfinite = (~torch.isfinite(nodal_pos)).any(dim=(1, 2)) | (~torch.isfinite(nodal_vel)).any(dim=(1, 2))
-    excessive_velocity = torch.linalg.norm(nodal_vel, dim=-1).max(dim=1).values > max_velocity
-    extent = nodal_pos.max(dim=1).values - nodal_pos.min(dim=1).values
+    nodal_pos, node_env_ids, _ = active_node_data(asset)
+    nodal_vel, _, _ = active_node_data(asset, velocity=True)
+    nonfinite = segmented_any(
+        (~torch.isfinite(nodal_pos)).any(dim=-1) | (~torch.isfinite(nodal_vel)).any(dim=-1), node_env_ids, env.num_envs
+    )
+    excessive_velocity = (
+        segmented_max(torch.linalg.norm(nodal_vel, dim=-1, keepdim=True), node_env_ids, env.num_envs).squeeze(1)
+        > max_velocity
+    )
+    extent = segmented_max(nodal_pos, node_env_ids, env.num_envs) - segmented_min(nodal_pos, node_env_ids, env.num_envs)
     excessive_extent = extent.max(dim=1).values > max_extent
     return nonfinite | excessive_velocity | excessive_extent
 

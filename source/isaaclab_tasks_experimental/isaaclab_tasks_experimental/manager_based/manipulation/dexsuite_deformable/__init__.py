@@ -25,7 +25,7 @@ gym.register(
 
 gym.register(
     id="Isaac-Dexsuite-Deformable-Kuka-Allegro-Lift-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=f"{__name__}.play_env:DexsuiteDeformablePlayEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.dexsuite_deformable_env_cfg:DexsuiteDeformableKukaAllegroLiftEnvCfg_PLAY",
@@ -35,7 +35,7 @@ gym.register(
 
 gym.register(
     id="Isaac-Dexsuite-Deformable-Kuka-Allegro-Lift-Kit-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=f"{__name__}.play_env:DexsuiteDeformablePlayEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": (

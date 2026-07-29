@@ -15,6 +15,7 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import combine_frame_transforms
 
+from .active_deformable import active_node_data, segmented_max, segmented_min
 from .soft_contacts import soft_good_contact_mask
 
 if TYPE_CHECKING:
@@ -55,8 +56,9 @@ def fingertip_deformable_proximity(
     robot: Articulation = env.scene[fingertip_cfg.name]
     asset: DeformableObject = env.scene[asset_cfg.name]
     fingertip_pos_w = robot.data.body_pos_w.torch[:, fingertip_cfg.body_ids]
-    nodal_pos_w = asset.data.nodal_pos_w.torch
-    distance = torch.linalg.norm(fingertip_pos_w.unsqueeze(2) - nodal_pos_w.unsqueeze(1), dim=-1).min(dim=-1).values
+    nodal_pos_w, node_env_ids, _ = active_node_data(asset)
+    distances = torch.linalg.norm(fingertip_pos_w[node_env_ids] - nodal_pos_w.unsqueeze(1), dim=-1)
+    distance = segmented_min(distances, node_env_ids, env.num_envs)
     proximity = 1.0 - torch.tanh(distance / std)
     return proximity.mean(dim=-1)
 
@@ -83,9 +85,9 @@ def fingertip_deformable_reach(
     robot: Articulation = env.scene[fingertip_cfg.name]
     asset: DeformableObject = env.scene[asset_cfg.name]
     fingertip_pos_w = robot.data.body_pos_w.torch[:, fingertip_cfg.body_ids]
-    nodal_pos_w = asset.data.nodal_pos_w.torch
-    distances = torch.linalg.norm(fingertip_pos_w.unsqueeze(2) - nodal_pos_w.unsqueeze(1), dim=-1)
-    max_distance = distances.min(dim=-1).values.max(dim=-1).values
+    nodal_pos_w, node_env_ids, _ = active_node_data(asset)
+    distances = torch.linalg.norm(fingertip_pos_w[node_env_ids] - nodal_pos_w.unsqueeze(1), dim=-1)
+    max_distance = segmented_min(distances, node_env_ids, env.num_envs).max(dim=-1).values
     reward = 1.0 - torch.tanh(max_distance / std)
 
     gate = _soft_contact_gate(env, robot_cfg, contact_body_name_groups, thumb_slot, contact_threshold)
@@ -178,7 +180,10 @@ def deformable_velocity_l2(
 ) -> torch.Tensor:
     """Mean squared nodal velocity penalty."""
     asset: DeformableObject = env.scene[asset_cfg.name]
-    return torch.mean(torch.square(asset.data.nodal_vel_w.torch), dim=(1, 2)).clamp(0.0, 1000.0)
+    nodal_vel, node_env_ids, counts = active_node_data(asset, velocity=True)
+    squared = torch.square(nodal_vel).mean(dim=-1)
+    result = torch.zeros(env.num_envs, device=squared.device).index_add_(0, node_env_ids, squared)
+    return (result / counts.clamp_min(1)).clamp(0.0, 1000.0)
 
 
 def deformable_spread_l2(
@@ -189,14 +194,16 @@ def deformable_spread_l2(
 ) -> torch.Tensor:
     """Penalty for excessive stretching or collapse of the deformable node cloud."""
     asset: DeformableObject = env.scene[asset_cfg.name]
-    nodal_pos = asset.data.nodal_pos_w.torch
-    extent = nodal_pos.max(dim=1).values - nodal_pos.min(dim=1).values
+    nodal_pos, node_env_ids, _ = active_node_data(asset)
+    extent = segmented_max(nodal_pos, node_env_ids, env.num_envs) - segmented_min(nodal_pos, node_env_ids, env.num_envs)
     if nominal_extent is None:
         # Heterogeneous assets have distinct rest aspect ratios.  Their default
         # nodal state is captured after the matching clone prototype is added
         # to Newton, so it provides one rest extent per environment.
-        default_state = asset.data.default_nodal_state_w.torch[..., :3]
-        target_extent = default_state.max(dim=1).values - default_state.min(dim=1).values
+        default_pos, default_env_ids, _ = active_node_data(asset, default=True)
+        target_extent = segmented_max(default_pos, default_env_ids, env.num_envs) - segmented_min(
+            default_pos, default_env_ids, env.num_envs
+        )
     else:
         target_extent = torch.tensor(nominal_extent, device=extent.device, dtype=extent.dtype)
     excess = torch.relu(torch.abs(extent - target_extent) - margin)

@@ -8,6 +8,8 @@ __all__ = [
     "DeformableUniformPositionCommand",
     "DeformableCommandDifficultyScheduler",
     "DeformableSampledNodesInRobotRootFrame",
+    "ActiveDeformableView",
+    "select_active_deformable",
     "body_state_b",
     "deformable_com_b",
     "deformable_extent_b",
@@ -39,6 +41,7 @@ __all__ = [
 
 from isaaclab.envs.mdp import *  # noqa: F403
 
+from .active_deformable import ActiveDeformableView, select_active_deformable
 from .commands import DeformableUniformPositionCommand, DeformableUniformPositionCommandCfg
 from .curriculums import DeformableCommandDifficultyScheduler, initial_final_interpolate_fn
 from .observations import (

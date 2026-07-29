@@ -120,6 +120,15 @@ if SKINNED_GAUSSIAN_MAX_VISIBLE_ENVS is not None and SKINNED_GAUSSIAN_MAX_VISIBL
 TASK_VIEW_EYE = (-2.25, 0.0, 0.75)
 TASK_VIEW_LOOKAT = (0.0, 0.0, 0.45)
 KIT_VIEW_MAX_GAUSSIANS_PER_ENV = None
+# The asset-swap play bakes every asset's Gaussian field per env. Rendering an asset
+# faithfully needs close to its full splat field (up to ~305k for the packaged toys);
+# 300k keeps all of them visually intact (only the largest is trimmed ~1.5%) while
+# bounding per-asset cost. Assets are also loaded lazily (only on first activation), so
+# a run only pays for the assets actually shown. Set "all"/"none" for fully uncapped.
+_KIT_SWAP_MAX_GAUSSIANS_RAW = os.environ.get("DEXSUITE_KIT_SWAP_MAX_GAUSSIANS", "300000")
+KIT_SWAP_MAX_GAUSSIANS_PER_ENV = (
+    None if _KIT_SWAP_MAX_GAUSSIANS_RAW.lower() in {"all", "none"} else int(_KIT_SWAP_MAX_GAUSSIANS_RAW)
+)
 # Covers the 1024-env ragdoll candidate space while preserving deterministic CUDA graph replay.
 SOFT_CONTACT_MAX = 8_388_608
 
@@ -306,6 +315,31 @@ def _deformable_spawn_cfg(asset_paths: tuple[str, ...]):
     if len(asset_cfgs) == 1:
         return asset_cfgs[0]
     return sim_utils.MultiAssetSpawnerCfg(assets_cfg=asset_cfgs)
+
+
+def _single_asset_deformable_cfg(asset_index: int, asset_path: str) -> DeformableObjectCfg:
+    """Build a single-asset VBD deformable object cloned into every environment.
+
+    Used by the play variant to bake all candidate assets in each env (one object
+    per asset); a reset event then activates one and masks the rest.
+    """
+    return DeformableObjectCfg(
+        prim_path=f"/World/envs/env_.*/Deformable_{asset_index}",
+        init_state=DeformableObjectCfg.InitialStateCfg(pos=DEFORMABLE_INIT_POS),
+        spawn=NewtonVbdTetAssetCfg(
+            usd_path=asset_path,
+            asset_index=asset_index,
+            rotate_y_up_to_z_up=not DEFORMABLE_ASSETS_ARE_Z_UP,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.16, 0.22)),
+            physics_material=NewtonDeformableBodyMaterialCfg(
+                density=DEFORMABLE_DENSITY,
+                k_mu=DEFORMABLE_K_MU,
+                k_lambda=DEFORMABLE_K_LAMBDA,
+                k_damp=1.0e-5,
+                particle_radius=DEFORMABLE_PARTICLE_RADIUS,
+            ),
+        ),
+    )
 
 
 DEFORMABLE_OBJECT_CFG = DeformableObjectCfg(
@@ -708,12 +742,31 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg(ManagerBasedRLEnvCfg):
 
 @configclass
 class DexsuiteDeformableKukaAllegroLiftEnvCfg_PLAY(DexsuiteDeformableKukaAllegroLiftEnvCfg):
-    """Small interactive variant with command visualization enabled."""
+    """Small interactive variant that shows a different asset on every reset.
+
+    Requires the :class:`~.play_env.DexsuiteDeformablePlayEnv` entry point, which
+    injects the active-body proxy under the name ``"deformable"``.
+    """
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.scene.num_envs = 16
+        # Fewer envs: each env now bakes all N assets (N x particle-state memory).
+        self.scene.num_envs = 4
         self.commands.deformable_position.debug_vis = True
+
+        # Bake every candidate asset in each env as its own body; a reset event then
+        # activates one (random) and masks the rest. Training is untouched.
+        self.scene.deformable = None
+        for asset_index, asset_path in enumerate(DEFORMABLE_ASSET_PATHS):
+            setattr(self.scene, f"deformable_{asset_index}", _single_asset_deformable_cfg(asset_index, asset_path))
+        # The masking event fully re-poses the active body, so the uniform-reset term
+        # is replaced.
+        self.events.reset_deformable = None
+        self.events.select_active_deformable = EventTerm(
+            func=mdp.select_active_deformable,
+            mode="reset",
+            params={"position_range": {"x": (-0.2, 0.2), "y": (-0.2, 0.2), "z": (0.0, 0.4)}},
+        )
 
 
 @configclass
@@ -726,7 +779,7 @@ class DexsuiteDeformableKukaAllegroLiftEnvCfg_KIT_PLAY(DexsuiteDeformableKukaAll
         self.viewer.lookat = TASK_VIEW_LOOKAT
         self.sim.visualizer_cfgs = [
             SkinnedGaussianKitVisualizerCfg(
-                max_gaussians_per_env=KIT_VIEW_MAX_GAUSSIANS_PER_ENV,
+                max_gaussians_per_env=KIT_SWAP_MAX_GAUSSIANS_PER_ENV,
                 skinned_gaussian_usd_paths=DEFORMABLE_SKINNED_GAUSSIAN_ASSET_PATHS,
             ),
             KitVisualizerCfg(eye=TASK_VIEW_EYE, lookat=TASK_VIEW_LOOKAT),

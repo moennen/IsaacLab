@@ -15,6 +15,8 @@ import torch
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms
 
+from .active_deformable import active_node_data, segmented_min
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, DeformableObject
     from isaaclab.envs import ManagerBasedRLEnv
@@ -91,9 +93,9 @@ def fingertip_deformable_distances(
     robot: Articulation = env.scene[fingertip_cfg.name]
     asset: DeformableObject = env.scene[asset_cfg.name]
     fingertip_pos_w = robot.data.body_pos_w.torch[:, fingertip_cfg.body_ids]
-    nodal_pos_w = asset.data.nodal_pos_w.torch
-    distances = torch.linalg.norm(fingertip_pos_w.unsqueeze(2) - nodal_pos_w.unsqueeze(1), dim=-1)
-    return _finite(distances.min(dim=-1).values)
+    nodal_pos_w, node_env_ids, _ = active_node_data(asset)
+    distances = torch.linalg.norm(fingertip_pos_w[node_env_ids] - nodal_pos_w.unsqueeze(1), dim=-1)
+    return _finite(segmented_min(distances, node_env_ids, env.num_envs))
 
 
 def deformable_extent_b(
@@ -104,13 +106,15 @@ def deformable_extent_b(
     """Axis-aligned nodal extent in the robot root frame."""
     asset: DeformableObject = env.scene[asset_cfg.name]
     robot: Articulation = env.scene[robot_cfg.name]
-    nodal_pos_w = asset.data.nodal_pos_w.torch
-    num_nodes = nodal_pos_w.shape[1]
-    root_pos_w = robot.data.root_pos_w.torch.unsqueeze(1).expand(-1, num_nodes, -1).reshape(-1, 3)
-    root_quat_w = robot.data.root_quat_w.torch.unsqueeze(1).expand(-1, num_nodes, -1).reshape(-1, 4)
-    nodal_pos_b, _ = subtract_frame_transforms(root_pos_w, root_quat_w, nodal_pos_w.reshape(-1, 3))
-    nodal_pos_b = nodal_pos_b.reshape(env.num_envs, num_nodes, 3)
-    extent = nodal_pos_b.max(dim=1).values - nodal_pos_b.min(dim=1).values
+    nodal_pos_w, node_env_ids, _ = active_node_data(asset)
+    nodal_pos_b, _ = subtract_frame_transforms(
+        robot.data.root_pos_w.torch[node_env_ids], robot.data.root_quat_w.torch[node_env_ids], nodal_pos_w
+    )
+    from .active_deformable import segmented_max
+
+    extent = segmented_max(nodal_pos_b, node_env_ids, env.num_envs) - segmented_min(
+        nodal_pos_b, node_env_ids, env.num_envs
+    )
     return _finite(extent)
 
 
@@ -135,7 +139,7 @@ class DeformableSampledNodesInRobotRootFrame(ManagerTermBase):
         self.include_velocities: bool = cfg.params.get("include_velocities", True)
 
         asset: DeformableObject = env.scene[self.asset_cfg.name]
-        self.total_nodes = asset.data.nodal_pos_w.shape[1]
+        self.asset = asset
         self.node_ids = torch.empty(env.num_envs, self.num_nodes, dtype=torch.long, device=env.device)
         self.reset()
 
@@ -147,12 +151,20 @@ class DeformableSampledNodesInRobotRootFrame(ManagerTermBase):
         else:
             num_envs = len(env_ids)
 
-        if self.num_nodes <= self.total_nodes:
-            self.node_ids[env_ids] = (
-                torch.rand((num_envs, self.total_nodes), device=self.device).topk(self.num_nodes, dim=1).indices
-            )
+        _, _, counts = active_node_data(self.asset)
+        counts = counts[env_ids] if not isinstance(env_ids, slice) else counts
+        if bool((counts >= self.num_nodes).all()):
+            # Keep the original no-replacement behavior when every selected asset
+            # has enough nodes. Invalid ragged columns are excluded before top-k.
+            max_count = int(counts.max().item())
+            scores = torch.rand((num_envs, max_count), device=self.device)
+            scores.masked_fill_(torch.arange(max_count, device=self.device).unsqueeze(0) >= counts.unsqueeze(1), -1.0)
+            self.node_ids[env_ids] = scores.topk(self.num_nodes, dim=1).indices
         else:
-            self.node_ids[env_ids] = torch.randint(self.total_nodes, (num_envs, self.num_nodes), device=self.device)
+            # Small assets retain a fixed observation dimension by sampling with replacement.
+            self.node_ids[env_ids] = (
+                torch.rand((num_envs, self.num_nodes), device=self.device) * counts.unsqueeze(1)
+            ).long()
 
     def __call__(
         self,
@@ -174,8 +186,10 @@ class DeformableSampledNodesInRobotRootFrame(ManagerTermBase):
         asset: DeformableObject = env.scene[asset_cfg.name]
         robot: Articulation = env.scene[robot_cfg.name]
 
-        gather_ids = self.node_ids.unsqueeze(-1).expand(-1, -1, 3)
-        sampled_pos_w = asset.data.nodal_pos_w.torch.gather(1, gather_ids)
+        nodal_pos_w, _, counts = active_node_data(asset)
+        offsets = torch.cat((torch.zeros(1, dtype=torch.long, device=env.device), counts.cumsum(0)))
+        flat_ids = offsets[:-1, None] + self.node_ids
+        sampled_pos_w = nodal_pos_w[flat_ids]
 
         root_pos_w = robot.data.root_pos_w.torch.unsqueeze(1).expand(-1, self.num_nodes, -1).reshape(-1, 3)
         root_quat_w = robot.data.root_quat_w.torch.unsqueeze(1).expand(-1, self.num_nodes, -1).reshape(-1, 4)
@@ -185,7 +199,8 @@ class DeformableSampledNodesInRobotRootFrame(ManagerTermBase):
         if not self.include_velocities:
             return _finite(sampled_pos_b.reshape(env.num_envs, -1))
 
-        sampled_vel_w = asset.data.nodal_vel_w.torch.gather(1, gather_ids)
+        nodal_vel_w, _, _ = active_node_data(asset, velocity=True)
+        sampled_vel_w = nodal_vel_w[flat_ids]
         sampled_vel_b = quat_apply_inverse(root_quat_w, sampled_vel_w.reshape(-1, 3))
         sampled_vel_b = sampled_vel_b.reshape(env.num_envs, self.num_nodes, 3)
         sampled_state_b = torch.cat((sampled_pos_b, sampled_vel_b), dim=-1)
