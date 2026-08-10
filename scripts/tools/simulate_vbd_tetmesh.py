@@ -122,6 +122,16 @@ def main() -> None:
 
         step = 0
         while sim.is_headless_or_exist_active_visualizer():
+            # Standalone scripts do not have an environment loop to consume the
+            # reset request emitted by the visualizer's "Reset Episode" button.
+            # Rebuild Newton's state so the deformable particles return to the
+            # initial USD pose and zero velocity.
+            if sim.consume_reset_request():
+                sim.reset()
+                deformable.update(0.0)
+                step = 0
+                print("[INFO] Episode reset.")
+
             sim.step()
             deformable.update(sim.get_physics_dt())
             step += 1
