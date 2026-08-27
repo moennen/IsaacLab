@@ -25,10 +25,13 @@ import warp as wp
 wp.config.enable_backward = False
 
 import argparse
+import sys
 from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
 from isaaclab.utils.string import list_intersection, string_to_callable
+
+from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Teleoperation for Isaac Lab environments.")
@@ -85,8 +88,9 @@ parser.add_argument(
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
-# parse the arguments
-args_cli, remaining_args = parser.parse_known_args()
+# Parse script arguments while preserving Hydra-style task overrides such as
+# ``physics=newton_mjwarp`` for task configuration resolution below.
+args_cli, hydra_args = setup_preset_cli(parser)
 
 app_launcher_args = vars(args_cli)
 
@@ -103,10 +107,15 @@ if args_cli.external_callback:
     external_callback_function = string_to_callable(args_cli.external_callback, separator=".")
     remaining_args_env_registration = external_callback_function()
 
-# Error on unrecognized arguments.
-unrecognized_args = list_intersection(remaining_args, remaining_args_env_registration)
-if unrecognized_args:
-    parser.error(f"unrecognized arguments: {' '.join(unrecognized_args)}")
+if remaining_args_env_registration is not None:
+    unrecognized_args = list_intersection(hydra_args, remaining_args_env_registration)
+    if unrecognized_args:
+        parser.error(f"unrecognized arguments: {' '.join(unrecognized_args)}")
+
+sys.argv = [sys.argv[0]] + hydra_args
+
+# Preset and other Hydra-style overrides are intentionally retained in
+# ``sys.argv`` for ``resolve_task_config``.
 
 """Rest everything follows."""
 
@@ -126,9 +135,7 @@ from isaaclab.devices.teleop_device_factory import create_teleop_device
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 
-import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.core.lift import mdp
-from isaaclab_tasks.utils import parse_env_cfg
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +263,9 @@ def main() -> None:  # noqa: C901
         None
     """
     # parse configuration
-    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    env_cfg, _ = resolve_task_config(args_cli.task, None, overrides=hydra_args)
+    env_cfg.sim.device = args_cli.device
+    env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.env_name = args_cli.task
     if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
         raise ValueError(
@@ -462,6 +471,21 @@ def main() -> None:  # noqa: C901
     # (in ``run_loop``) without it.
     control_keyboard = _make_control_keyboard(teleop_interface, use_isaac_teleop, app_launcher.has_window)  # noqa: F841
 
+    expected_action_dim = env.action_space.shape[-1]
+
+    def _adapt_native_action(action: torch.Tensor) -> torch.Tensor:
+        """Match built-in SE(3) device output to the environment action shape."""
+        if action.shape[-1] == expected_action_dim:
+            return action
+        # Se3Keyboard emits [dx, dy, dz, droll, dpitch, dyaw, gripper].
+        # Reach tasks expose only the six-dimensional arm action.
+        if action.shape[-1] == 7 and expected_action_dim == 6:
+            return action[..., :6]
+        raise ValueError(
+            f"Teleop action shape {tuple(action.shape)} does not match "
+            f"environment action shape {env.action_space.shape}."
+        )
+
     def run_loop():
         """Inner function to run the teleop loop with access to nonlocal variables."""
         nonlocal should_reset_recording_instance, teleoperation_active
@@ -501,6 +525,7 @@ def main() -> None:  # noqa: C901
                         haptic_stop()
                     elif teleoperation_active:
                         # process actions
+                        action = _adapt_native_action(action)
                         actions = action.repeat(env.num_envs, 1)
                         # apply actions
                         env.step(actions)

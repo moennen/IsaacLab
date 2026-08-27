@@ -3,6 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from isaaclab_newton.physics import HydroelasticSDFCfg, NewtonCollisionPipelineCfg
+from isaaclab_newton.sim.spawners.materials import NewtonMaterialCfg
+
+import isaaclab.sim as sim_utils
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.devices.device_base import DevicesCfg
 from isaaclab.devices.keyboard import Se3KeyboardCfg
@@ -12,9 +16,11 @@ from isaaclab.envs.mdp.actions.actions_cfg import (
 )
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sim.schemas.schemas_cfg import MeshCollisionBaseCfg
+from isaaclab.sim.spawners.materials import UsdPhysicsRigidBodyMaterialCfg
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_tasks.contrib.stack.stack_env_cfg import mdp
+from isaaclab_tasks.contrib.stack.stack_env_cfg import PhysicsCfg, mdp
 
 from . import stack_joint_pos_env_cfg
 
@@ -65,6 +71,73 @@ class FrankaCubeStackEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
                 ),
             }
         )
+
+
+@configclass
+class FrankaCubeStackNewtonEnvCfg(FrankaCubeStackEnvCfg):
+    """Newton-specific Franka stack configuration for interactive teleoperation."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Newton currently does not honor PhysX per-body gravity disable.
+        # MuJoCo-style gravity compensation keeps the Franka fixed under gravity.
+        self.decimation = 4
+        self.sim.dt = 1.0 / 120.0
+        self.sim.render_interval = self.decimation
+
+        newton_physics = PhysicsCfg().newton_mjwarp
+        newton_physics.num_substeps = 4
+        # The hydroelastic gripper contact manifold can exceed the default MuJoCo
+        # constraint budget during cube contact.
+        newton_physics.solver_cfg.njmax = 600
+        newton_physics.solver_cfg.nconmax = 400
+        newton_physics.collision_cfg = NewtonCollisionPipelineCfg(
+            soft_contact_max=0,
+            sdf_hydroelastic_config=HydroelasticSDFCfg(
+                reduce_contacts=True,
+                normal_matching=True,
+                anchor_contact=True,
+            ),
+        )
+        newton_physics.default_shape_cfg.gap = 0.005
+        newton_physics.default_shape_cfg.ke = 1.0e6
+        newton_physics.default_shape_cfg.kd = 2.0e3
+        self.sim.physics = newton_physics
+
+        contact_props = sim_utils.NewtonSDFCollisionPropertiesCfg(
+            contact_gap=0.005,
+            rest_offset=0.0,
+            sdf_max_resolution=64,
+            sdf_narrow_band_inner=-0.005,
+            sdf_narrow_band_outer=0.005,
+            hydroelastic_enabled=True,
+            hydroelastic_stiffness=1.0e11,
+            # Preserve SDF meshes: the Franka USD authors convexHull by default,
+            # which conflicts with Newton hydroelastic SDF generation.
+            mesh_collision_property=MeshCollisionBaseCfg(mesh_approximation_name="none"),
+        )
+        contact_material = [
+            UsdPhysicsRigidBodyMaterialCfg(static_friction=2.0, dynamic_friction=2.0),
+            NewtonMaterialCfg(contact_stiffness=1.0e6, contact_damping=2.0e3),
+        ]
+        # Newton must edit the individual finger collision meshes to attach SDF schemas.
+        # The stock Franka asset is instanceable, so opt out for this Newton variant.
+        self.scene.robot.spawn.make_uninstanceable = True
+        self.scene.robot.spawn.collision_props = contact_props
+        self.scene.robot.spawn.physics_material = contact_material
+        self.scene.robot.spawn.rigid_props = sim_utils.MujocoRigidBodyPropertiesCfg(gravcomp=1.0)
+        # Newton hydroelastic contacts need a compliant, force-limited gripper.
+        # The inherited high-PD hand (2e3 Nm/rad, 200 N) launches cubes on contact.
+        self.scene.robot.actuators["panda_hand"].stiffness = 80.0
+        self.scene.robot.actuators["panda_hand"].damping = 40.0
+        self.scene.robot.actuators["panda_hand"].joint_effort_limit = 35.0
+        cube_contact_props = contact_props.replace(
+            mesh_collision_property=MeshCollisionBaseCfg(mesh_approximation_name="sdf")
+        )
+        for cube in (self.scene.cube_1, self.scene.cube_2, self.scene.cube_3):
+            cube.spawn.collision_props = cube_contact_props
+            cube.spawn.physics_material = contact_material
 
 
 @configclass

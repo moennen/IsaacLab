@@ -150,7 +150,34 @@ def _set_fabric_transforms(
     i = int(wp.tid())
     idx = int(newton_indices[i])
     transform = newton_body_q[idx]
-    fabric_transforms[i] = wp.transpose(wp.mat44d(wp.transform_to_matrix(transform)))
+
+    # Newton body poses contain only translation and rotation. Preserve any
+    # authored USD world scale when publishing the pose to Fabric for rendering.
+    current = wp.transpose(wp.mat44f(fabric_transforms[i]))
+    scale_x = wp.length(wp.vec3(current[0, 0], current[1, 0], current[2, 0]))
+    scale_y = wp.length(wp.vec3(current[0, 1], current[1, 1], current[2, 1]))
+    scale_z = wp.length(wp.vec3(current[0, 2], current[1, 2], current[2, 2]))
+    # A mirrored transform has negative determinant. Preserve that handedness;
+    # the original negative axis is not recoverable from a pose-only transform,
+    # so assign the sign to the final scale component deterministically.
+    determinant = (
+        current[0, 0] * (current[1, 1] * current[2, 2] - current[1, 2] * current[2, 1])
+        - current[0, 1] * (current[1, 0] * current[2, 2] - current[1, 2] * current[2, 0])
+        + current[0, 2] * (current[1, 0] * current[2, 1] - current[1, 1] * current[2, 0])
+    )
+    if determinant < 0.0:
+        scale_z = -scale_z
+    matrix = wp.transform_to_matrix(transform)
+    matrix[0, 0] *= scale_x
+    matrix[1, 0] *= scale_x
+    matrix[2, 0] *= scale_x
+    matrix[0, 1] *= scale_y
+    matrix[1, 1] *= scale_y
+    matrix[2, 1] *= scale_y
+    matrix[0, 2] *= scale_z
+    matrix[1, 2] *= scale_z
+    matrix[2, 2] *= scale_z
+    fabric_transforms[i] = wp.transpose(wp.mat44d(matrix))
 
 
 @wp.kernel(enable_backward=False)
