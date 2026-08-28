@@ -3,10 +3,15 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import logging
+import os
+from pathlib import Path
+
 from isaaclab_newton.physics import HydroelasticSDFCfg, NewtonCollisionPipelineCfg
 from isaaclab_newton.sim.spawners.materials import NewtonMaterialCfg
 
 import isaaclab.sim as sim_utils
+from isaaclab.assets import AssetBaseCfg
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.devices.device_base import DevicesCfg
 from isaaclab.devices.keyboard import Se3KeyboardCfg
@@ -17,12 +22,47 @@ from isaaclab.envs.mdp.actions.actions_cfg import (
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sim.schemas.schemas_cfg import MeshCollisionBaseCfg
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab.sim.spawners.materials import UsdPhysicsRigidBodyMaterialCfg
 from isaaclab.utils.configclass import configclass
 
 from isaaclab_tasks.contrib.stack.stack_env_cfg import PhysicsCfg, mdp
 
 from . import stack_joint_pos_env_cfg
+
+_DEFAULT_ALIGNED_BACKGROUND_USD = Path(__file__).resolve().parents[7] / "nova_carter-galileo.usda"
+_LOGGER = logging.getLogger(__name__)
+
+
+def _spawn_aligned_background(prim_path, cfg, translation=None, orientation=None, **kwargs):
+    """Add the alignment layer as a root sublayer, preserving its authored world transforms."""
+    from isaaclab.sim import get_current_stage
+
+    stage = get_current_stage()
+    root_layer = stage.GetRootLayer()
+    background_path = str(Path(cfg.usd_path).resolve())
+    if background_path not in root_layer.subLayerPaths:
+        root_layer.subLayerPaths.append(background_path)
+    # The alignment layer already contains the authored transform. Keep the spawn API contract
+    # explicit and apply non-identity initial-state transforms when a caller provides them.
+    if translation not in (None, (0.0, 0.0, 0.0)) or orientation not in (None, (0.0, 0.0, 0.0, 1.0)):
+        from pxr import Gf, UsdGeom
+
+        background = stage.GetPrimAtPath(prim_path)
+        xform = UsdGeom.Xformable(background)
+        ops = xform.GetOrderedXformOps()
+        translate_op = next((op for op in ops if op.GetOpType() == UsdGeom.XformOp.TypeTranslate), None)
+        orient_op = next((op for op in ops if op.GetOpType() == UsdGeom.XformOp.TypeOrient), None)
+        if translation != (0.0, 0.0, 0.0):
+            if translate_op is None:
+                translate_op = xform.AddTranslateOp()
+            translate_op.Set(Gf.Vec3d(*translation))
+        if orientation != (0.0, 0.0, 0.0, 1.0):
+            if orient_op is None:
+                orient_op = xform.AddOrientOp()
+            orient_op.Set(Gf.Quatd(orientation[3], Gf.Vec3d(*orientation[:3])))
+    return stage.GetPrimAtPath(prim_path)
+
 
 ##
 # Pre-defined configs
@@ -79,6 +119,20 @@ class FrankaCubeStackNewtonEnvCfg(FrankaCubeStackEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        aligned_background = Path(
+            os.environ.get("ISAACLAB_ALIGNED_BACKGROUND_USD", str(_DEFAULT_ALIGNED_BACKGROUND_USD))
+        ).expanduser()
+        if aligned_background.is_file():
+            self.scene.background = AssetBaseCfg(
+                prim_path="/World/GaussianBackground",
+                spawn=UsdFileCfg(
+                    func=_spawn_aligned_background,
+                    usd_path=str(aligned_background),
+                ),
+            )
+        else:
+            _LOGGER.warning("Aligned background USDA not found at '%s'; continuing without it.", aligned_background)
 
         # Newton currently does not honor PhysX per-body gravity disable.
         # MuJoCo-style gravity compensation keeps the Franka fixed under gravity.

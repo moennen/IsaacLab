@@ -28,7 +28,7 @@ import argparse
 import sys
 from collections.abc import Callable
 
-from isaaclab.app import AppLauncher
+from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab.utils.string import list_intersection, string_to_callable
 
 from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
@@ -48,6 +48,13 @@ parser.add_argument(
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
+parser.add_argument(
+    "--gamepad_device",
+    "--gamepad-device",
+    type=str,
+    default=None,
+    help="Linux joystick node for Kitless Newton teleoperation (default: first /dev/input/js* device).",
+)
 parser.add_argument(
     "--cloudxr_env",
     type=str,
@@ -86,20 +93,20 @@ parser.add_argument(
     ),
 )
 
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
+# append launcher cli args
+add_launcher_args(parser)
 # Parse script arguments while preserving Hydra-style task overrides such as
 # ``physics=newton_mjwarp`` for task configuration resolution below.
 args_cli, hydra_args = setup_preset_cli(parser)
 
-app_launcher_args = vars(args_cli)
 
-# Enable external camera rendering by default (``--disable_external_cameras`` turns it off). The
-# ``--enable_cameras`` CLI flag was removed in Isaac Lab 3.0 (see #6656), so pass the intent to
-# AppLauncher as a kwarg; this selects a camera-rendering experience that provides RTX/DLSS support.
-# Everywhere else we read ``args_cli.disable_external_cameras`` directly.
-app_launcher = AppLauncher(app_launcher_args, enable_cameras=not args_cli.disable_external_cameras)
-simulation_app = app_launcher.app
+def _kitless_visualizer_requested(args: argparse.Namespace) -> bool:
+    """Return whether the command selects a Kitless Newton visualizer."""
+    return bool(set(getattr(args, "visualizer", None) or ()) & {"newton_gl", "newton_rtx"})
+
+
+kitless_visualizer_requested = False
+kitless_runtime = None
 
 # Call an external callback if requested.
 remaining_args_env_registration = None
@@ -117,6 +124,22 @@ sys.argv = [sys.argv[0]] + hydra_args
 # Preset and other Hydra-style overrides are intentionally retained in
 # ``sys.argv`` for ``resolve_task_config``.
 
+
+def _close_runtime() -> None:
+    """Close whichever runtime was selected, including the Kitless context."""
+    global kitless_runtime, kitless_visualizer_requested
+    if kitless_runtime is not None:
+        kitless_runtime.__exit__(None, None, None)
+        kitless_runtime = None
+
+
+def _runtime_is_running(env) -> bool:
+    """Return whether the active Kit or Newton visualizer still owns a running window."""
+    if not env.sim.has_active_visualizers():
+        return True
+    return env.sim.is_headless_or_exist_active_visualizer()
+
+
 """Rest everything follows."""
 
 
@@ -124,14 +147,8 @@ import logging
 
 import gymnasium as gym
 import torch
-from isaaclab_physx.renderers import IsaacRtxRendererGlobalSettingsCfg
-from isaaclab_physx.renderers.isaac_rtx_renderer_utils import (
-    apply_isaac_rtx_global_settings,
-)
 
-from isaaclab.devices import Se3Gamepad, Se3GamepadCfg, Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
-from isaaclab.devices.openxr import remove_camera_configs
-from isaaclab.devices.teleop_device_factory import create_teleop_device
+from isaaclab.devices.gamepad.se3_linux_gamepad import Se3LinuxGamepad
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 
@@ -176,6 +193,8 @@ def _rtx_rendering_requested(args: argparse.Namespace) -> bool:
     check keeps working as these scripts grow support for other renderers and kitless runs.
     """
     visualizers = getattr(args, "visualizer", None) or []
+    if _kitless_visualizer_requested(args):
+        return False
     external_cameras = not getattr(args, "disable_external_cameras", False)
     return external_cameras or ("kit" in visualizers) or bool(getattr(args, "xr", False))
 
@@ -194,14 +213,29 @@ def _ensure_replicator_loaded() -> None:
     omni.kit.app.get_app().get_extension_manager().set_extension_enabled_immediate("omni.replicator.core", True)
 
 
-def _create_builtin_device(device_name: str, sensitivity: float) -> object | None:
+def _create_builtin_device(
+    device_name: str, sensitivity: float, gamepad_device: str | None = None, kitless: bool = False
+) -> object | None:
     """Create a built-in teleop device by name, or return None if unrecognized."""
     name = device_name.lower()
     if name == "keyboard":
+        from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg
+
         return Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.05 * sensitivity, rot_sensitivity=0.05 * sensitivity))
     elif name == "spacemouse":
+        from isaaclab.devices import Se3SpaceMouse, Se3SpaceMouseCfg
+
         return Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=0.05 * sensitivity, rot_sensitivity=0.05 * sensitivity))
     elif name == "gamepad":
+        if kitless:
+            return Se3LinuxGamepad(
+                pos_sensitivity=0.1 * sensitivity,
+                rot_sensitivity=0.1 * sensitivity,
+                sim_device="cpu",
+                device=gamepad_device,
+            )
+        from isaaclab.devices import Se3Gamepad, Se3GamepadCfg
+
         return Se3Gamepad(Se3GamepadCfg(pos_sensitivity=0.1 * sensitivity, rot_sensitivity=0.1 * sensitivity))
     return None
 
@@ -241,6 +275,8 @@ def _make_control_keyboard(teleop_interface, use_isaac_teleop: bool, has_window:
     if not use_isaac_teleop or not has_window:
         return None
     try:
+        from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg
+
         keyboard = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.0, rot_sensitivity=0.0))
         keyboard.add_callback("B", teleop_interface.request_start)
         keyboard.add_callback("P", teleop_interface.request_stop)
@@ -280,6 +316,21 @@ def main() -> None:  # noqa: C901
         # add termination condition for reaching the goal otherwise the environment won't reset
         env_cfg.terminations.object_reached_goal = DoneTerm(func=mdp.object_reached_goal)
 
+    # Resolve the runtime once through the shared launcher. This keeps the Kit/kitless decision,
+    # backend validation, and lifecycle ownership in one place.
+    global kitless_runtime
+    kitless_runtime = launch_simulation(env_cfg, args_cli)
+    try:
+        kitless_runtime.__enter__()
+    except BaseException:
+        exc_info = sys.exc_info()
+        kitless_runtime.__exit__(*exc_info)
+        kitless_runtime = None
+        raise
+    # launch_simulation owns runtime selection; this flag only selects the matching built-in
+    # device implementation after the runtime has been initialized.
+    kitless_visualizer_requested = _kitless_visualizer_requested(args_cli)
+
     # When --teleop_device is explicitly provided, use the legacy teleop_devices path
     # even if isaac_teleop is configured. Otherwise prefer isaac_teleop when available.
     teleop_device_explicitly_set = args_cli.teleop_device is not None
@@ -302,11 +353,16 @@ def main() -> None:  # noqa: C901
         # Keep camera configs when external cameras are enabled (defaulted on); otherwise
         # strip them so the XR headset view is the sole render product.
         if args_cli.disable_external_cameras:
+            from isaaclab.devices.openxr import remove_camera_configs
+
             env_cfg = remove_camera_configs(env_cfg)
     # Apply the RTX/DLSS global settings when an RTX render pipeline will run (Kit visualizer,
     # external cameras, or XR). ``apply_isaac_rtx_global_settings`` uses ``omni.replicator``,
     # which some experiences do not preload, so ensure it is loaded first.
     if _rtx_rendering_requested(args_cli):
+        from isaaclab_physx.renderers import IsaacRtxRendererGlobalSettingsCfg
+        from isaaclab_physx.renderers.isaac_rtx_renderer_utils import apply_isaac_rtx_global_settings
+
         _ensure_replicator_loaded()
         apply_isaac_rtx_global_settings(
             IsaacRtxRendererGlobalSettingsCfg(
@@ -330,7 +386,7 @@ def main() -> None:  # noqa: C901
             )
     except Exception as e:
         logger.error(f"Failed to create environment: {e}")
-        simulation_app.close()
+        _close_runtime()
         return
 
     # Flags for controlling teleoperation flow
@@ -416,11 +472,18 @@ def main() -> None:  # noqa: C901
         elif teleop_device_explicitly_set:
             device_name = args_cli.teleop_device
             if hasattr(env_cfg, "teleop_devices") and device_name in env_cfg.teleop_devices.devices:
+                from isaaclab.devices.teleop_device_factory import create_teleop_device
+
                 teleop_interface = create_teleop_device(
                     device_name, env_cfg.teleop_devices.devices, teleoperation_callbacks
                 )
             else:
-                teleop_interface = _create_builtin_device(device_name, args_cli.sensitivity)
+                teleop_interface = _create_builtin_device(
+                    device_name,
+                    args_cli.sensitivity,
+                    gamepad_device=args_cli.gamepad_device,
+                    kitless=kitless_visualizer_requested,
+                )
                 if teleop_interface is None:
                     logger.error(
                         f"--teleop_device={device_name} was passed but no matching entry exists in"
@@ -430,7 +493,7 @@ def main() -> None:  # noqa: C901
                         " Built-in devices: keyboard, spacemouse, gamepad."
                     )
                     env.close()
-                    simulation_app.close()
+                    _close_runtime()
                     return
                 for key, callback in teleoperation_callbacks.items():
                     try:
@@ -439,6 +502,8 @@ def main() -> None:  # noqa: C901
                         logger.warning(f"Failed to add callback for key {key}: {e}")
         else:
             # No --teleop_device and no isaac_teleop: fall back to keyboard
+            from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg
+
             sensitivity = args_cli.sensitivity
             teleop_interface = Se3Keyboard(
                 Se3KeyboardCfg(pos_sensitivity=0.05 * sensitivity, rot_sensitivity=0.05 * sensitivity)
@@ -451,13 +516,13 @@ def main() -> None:  # noqa: C901
     except Exception as e:
         logger.error(f"Failed to create teleop device: {e}")
         env.close()
-        simulation_app.close()
+        _close_runtime()
         return
 
     if teleop_interface is None:
         logger.error("Failed to create teleop interface")
         env.close()
-        simulation_app.close()
+        _close_runtime()
         return
 
     print(f"Using teleop device: {teleop_interface}")
@@ -469,7 +534,9 @@ def main() -> None:  # noqa: C901
     # Optional keyboard for headset-free IsaacTeleop control. Kept in a local so its
     # carb input subscription is not garbage-collected; a headless run auto-starts
     # (in ``run_loop``) without it.
-    control_keyboard = _make_control_keyboard(teleop_interface, use_isaac_teleop, app_launcher.has_window)  # noqa: F841
+    control_keyboard = _make_control_keyboard(  # noqa: F841
+        teleop_interface, use_isaac_teleop, env.sim.has_gui
+    )
 
     expected_action_dim = env.action_space.shape[-1]
 
@@ -504,7 +571,7 @@ def main() -> None:  # noqa: C901
         print(f"{stack_name} teleoperation started. Press 'R' to reset the environment.")
 
         # simulate environment
-        while simulation_app.is_running():
+        while _runtime_is_running(env):
             try:
                 # run everything in inference mode
                 with torch.inference_mode():
@@ -555,15 +622,18 @@ def main() -> None:  # noqa: C901
         with camera_feed_session.bind(env):
             run_loop()
 
+    # Give Kit one final update so pending UI/viewport work is flushed before the runtime closes.
+    if env.sim.has_gui:
+        from omni.kit.app import get_app
+
+        get_app().update()
+
     # close the simulator
     env.close()
+    _close_runtime()
     print("Environment closed")
 
 
 if __name__ == "__main__":
     # run the main function
     main()
-    # env.close() already closes the USD stage via sim.clear_instance().
-    # Pump the event loop so the viewport processes closure, then close the app.
-    simulation_app.update()
-    simulation_app.close()

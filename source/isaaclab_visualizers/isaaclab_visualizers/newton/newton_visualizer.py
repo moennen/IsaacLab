@@ -2125,6 +2125,11 @@ class NewtonRTXVisualizer(NewtonVisualizer):
         # ViewerRTX uses set_camera(pos, pitch, yaw) rather than direct camera attribute access.
         pitch, yaw = _eye_lookat_to_pitch_yaw(cam_pos, cam_target)
         self._viewer.set_camera(PygletVec3(*cam_pos), pitch, yaw)
+        # Keep Newton's orbit/dolly pivot aligned with Isaac Lab's configured look-at target.
+        # ``ViewerRTX.set_camera`` updates position/orientation but intentionally leaves the
+        # camera pivot unchanged.  With the default pivot this makes the mouse-wheel dolly move
+        # toward an unrelated point, eventually appearing to stop before reaching the robot.
+        self._viewer.camera.set_pivot(PygletVec3(*cam_target))
         self._last_camera_pose = (cam_pos, cam_target)
 
     def _apply_camera_focal_length(self) -> None:

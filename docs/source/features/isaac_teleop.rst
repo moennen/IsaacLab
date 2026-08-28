@@ -133,6 +133,34 @@ and Isaac Lab. It composes three collaborators:
    handles -- the session starts as soon as the CloudXR runtime is available.
 
 
+Kitless Newton Gamepad Teleoperation
+------------------------------------
+
+The native ``gamepad`` device normally reads Omniverse input events, which requires the Kit
+application window.  When a Newton visualizer is selected, ``teleop_se3_agent.py`` instead uses
+the Linux joystick interface (``/dev/input/js*``), allowing gamepad teleoperation with the
+Kitless Newton OpenGL or Newton OVRTX visualizer.
+
+For Newton OVRTX, run:
+
+.. code-block:: bash
+
+   uv run --extra teleop --extra ovrtx isaaclab teleop run \
+       --task Isaac-Reach-Franka \
+       --visualizer newton_rtx \
+       --teleop_device gamepad \
+       --gamepad-device /dev/input/js0 \
+       --num_envs 1 \
+       physics=newton_mjwarp presets=diffik
+
+If ``--gamepad-device`` is omitted, the first ``/dev/input/js*`` node is used.  The Linux
+joystick device must be readable by the current user.  The default mapping is left stick for
+X/Y translation, right-stick vertical for Z translation, right-stick horizontal for yaw, and
+the D-pad for roll/pitch.  Button 0 toggles the gripper.
+
+This path is separate from the Kit ``Se3Gamepad`` implementation; existing Kit workflows are
+unchanged.
+
 .. _isaac-teleop-tracking-debug-visualization:
 
 Visualize XR Tracking

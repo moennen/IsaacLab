@@ -26,6 +26,17 @@ how to import a new asset into Isaac Lab.
     write_articulation_cfg
     robots
 
+Aligning a USD Background
+-------------------------
+
+This guide explains how to interactively align a referenced USD background asset with a
+task scene without duplicating or modifying the source asset.
+
+.. toctree::
+    :maxdepth: 1
+
+    align_usd_background
+
 Creating a Fixed Asset
 ----------------------
 
