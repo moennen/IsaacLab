@@ -140,6 +140,7 @@ def _set_fabric_transforms(
     fabric_transforms: wp.fabricarray(dtype=wp.mat44d),
     newton_indices: wp.fabricarray(dtype=wp.uint32),
     newton_body_q: wp.array(ndim=1, dtype=wp.transformf),
+    body_scales: wp.array(dtype=wp.vec3f),
 ):
     """Write Newton body transforms to Fabric world matrices.
 
@@ -151,33 +152,60 @@ def _set_fabric_transforms(
     idx = int(newton_indices[i])
     transform = newton_body_q[idx]
 
-    # Newton body poses contain only translation and rotation. Preserve any
-    # authored USD world scale when publishing the pose to Fabric for rendering.
-    current = wp.transpose(wp.mat44f(fabric_transforms[i]))
-    scale_x = wp.length(wp.vec3(current[0, 0], current[1, 0], current[2, 0]))
-    scale_y = wp.length(wp.vec3(current[0, 1], current[1, 1], current[2, 1]))
-    scale_z = wp.length(wp.vec3(current[0, 2], current[1, 2], current[2, 2]))
-    # A mirrored transform has negative determinant. Preserve that handedness;
-    # the original negative axis is not recoverable from a pose-only transform,
-    # so assign the sign to the final scale component deterministically.
-    determinant = (
-        current[0, 0] * (current[1, 1] * current[2, 2] - current[1, 2] * current[2, 1])
-        - current[0, 1] * (current[1, 0] * current[2, 2] - current[1, 2] * current[2, 0])
-        + current[0, 2] * (current[1, 0] * current[2, 1] - current[1, 1] * current[2, 0])
-    )
-    if determinant < 0.0:
-        scale_z = -scale_z
+    # Newton body poses contain only translation and rotation. Preserve the
+    # authored USD scale captured before the first overwrite; reading it back
+    # from our own fp32-derived Fabric output every frame caused scale drift.
+    scale = body_scales[idx]
     matrix = wp.transform_to_matrix(transform)
-    matrix[0, 0] *= scale_x
-    matrix[1, 0] *= scale_x
-    matrix[2, 0] *= scale_x
-    matrix[0, 1] *= scale_y
-    matrix[1, 1] *= scale_y
-    matrix[2, 1] *= scale_y
-    matrix[0, 2] *= scale_z
-    matrix[1, 2] *= scale_z
-    matrix[2, 2] *= scale_z
+    matrix[0, 0] *= scale[0]
+    matrix[1, 0] *= scale[0]
+    matrix[2, 0] *= scale[0]
+    matrix[0, 1] *= scale[1]
+    matrix[1, 1] *= scale[1]
+    matrix[2, 1] *= scale[1]
+    matrix[0, 2] *= scale[2]
+    matrix[1, 2] *= scale[2]
+    matrix[2, 2] *= scale[2]
     fabric_transforms[i] = wp.transpose(wp.mat44d(matrix))
+
+
+@wp.kernel(enable_backward=False)
+def _capture_fabric_body_scales(
+    fabric_transforms: wp.fabricarray(dtype=wp.mat44d),
+    newton_indices: wp.fabricarray(dtype=wp.uint32),
+    newton_body_q: wp.array(ndim=1, dtype=wp.transformf),
+    body_scales: wp.array(dtype=wp.vec3f),
+):
+    """Capture signed authored scale once, before Newton overwrites Fabric poses."""
+    i = int(wp.tid())
+    idx = int(newton_indices[i])
+    if wp.length(body_scales[idx]) != 0.0:
+        return
+    current = wp.transpose(wp.mat44f(fabric_transforms[i]))
+    rotation = wp.transform_to_matrix(newton_body_q[idx])
+    scale = wp.vec3(
+        wp.dot(
+            wp.vec3(current[0, 0], current[1, 0], current[2, 0]),
+            wp.vec3(rotation[0, 0], rotation[1, 0], rotation[2, 0]),
+        ),
+        wp.dot(
+            wp.vec3(current[0, 1], current[1, 1], current[2, 1]),
+            wp.vec3(rotation[0, 1], rotation[1, 1], rotation[2, 1]),
+        ),
+        wp.dot(
+            wp.vec3(current[0, 2], current[1, 2], current[2, 2]),
+            wp.vec3(rotation[0, 2], rotation[1, 2], rotation[2, 2]),
+        ),
+    )
+    # Fabric can expose an unpopulated matrix during startup. Preserve an
+    # identity scale in that case rather than collapsing the body.
+    if scale[0] == 0.0:
+        scale[0] = 1.0
+    if scale[1] == 0.0:
+        scale[1] = 1.0
+    if scale[2] == 0.0:
+        scale[2] = 1.0
+    body_scales[idx] = scale
 
 
 @wp.kernel(enable_backward=False)
@@ -476,6 +504,7 @@ class NewtonManager(PhysicsManager):
     _newton_stage_path = None
     _usdrt_stage = None
     _newton_index_attr = "newton:index"
+    _fabric_body_scales: wp.array | None = None
     _clone_physics_only = False
     _transforms_dirty: bool = False
     _transforms_may_change_on_graph_replay: bool = False
@@ -740,10 +769,20 @@ class NewtonManager(PhysicsManager):
 
                 fabric_transforms = wp.fabricarray(selection, "omni:fabric:worldMatrix")
                 newton_indices = wp.fabricarray(selection, cls._newton_index_attr)
+                if cls._fabric_body_scales is None:
+                    cls._fabric_body_scales = wp.zeros(
+                        cls._model.body_count, dtype=wp.vec3f, device=PhysicsManager._device
+                    )
+                    wp.launch(
+                        _capture_fabric_body_scales,
+                        dim=newton_indices.shape[0],
+                        inputs=[fabric_transforms, newton_indices, cls._state_0.body_q, cls._fabric_body_scales],
+                        device=PhysicsManager._device,
+                    )
                 wp.launch(
                     _set_fabric_transforms,
                     dim=newton_indices.shape[0],
-                    inputs=[fabric_transforms, newton_indices, cls._state_0.body_q],
+                    inputs=[fabric_transforms, newton_indices, cls._state_0.body_q, cls._fabric_body_scales],
                     device=PhysicsManager._device,
                 )
                 wp.synchronize_device(PhysicsManager._device)
@@ -1139,6 +1178,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._sensor_bvh_shape_flags = ShapeFlags.VISIBLE
         NewtonManager._newton_stage_path = None
         NewtonManager._usdrt_stage = None
+        NewtonManager._fabric_body_scales = None
         NewtonManager._transforms_dirty = False
         NewtonManager._transforms_may_change_on_graph_replay = False
         NewtonManager._particles_dirty = False
@@ -1222,12 +1262,11 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def _prepare_builder_for_finalize(cls, builder: ModelBuilder) -> None:
-        """Subclass hook to normalize *builder* before model finalization.
-
-        Override in solver subclasses that need to adapt imported or replicated
-        builder data before :meth:`ModelBuilder.finalize` allocates model arrays.
-        The default implementation is a no-op.
-        """
+        """Normalize builder data before :meth:`ModelBuilder.finalize`."""
+        cfg = PhysicsManager._cfg
+        if isinstance(cfg, NewtonCfg) and getattr(cfg.default_shape_cfg, "force_sdf", False):
+            builder.default_shape_cfg.configure_sdf(force_sdf=True)
+            builder.shape_force_sdf[:] = [True] * len(builder.shape_force_sdf)
 
     @classmethod
     def cl_register_site(cls, body_pattern: str | None, xform: wp.transform, *, per_world: bool = False) -> str:

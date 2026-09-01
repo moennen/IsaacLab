@@ -119,6 +119,9 @@ class NewtonShapeCfg:
     override it. Mirrors Newton's ``ShapeConfig.mu`` default.
     """
 
+    force_sdf: bool = False
+    """Force SDF generation for imported mesh shapes."""
+
 
 @configclass
 class NewtonCfg(PhysicsCfg):

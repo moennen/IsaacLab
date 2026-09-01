@@ -70,6 +70,40 @@ def _newton_scalar_base_name(name: str) -> str:
     return name
 
 
+def _gaussian_twin_env_flag(name: str) -> bool:
+    """Return whether a Gaussian-twin viewer environment option is enabled."""
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _gaussian_twin_show_tetmesh() -> bool:
+    """Return the task's TetMesh visibility option, including its legacy alias."""
+    return _gaussian_twin_env_flag("ISAACLAB_GAUSSIAN_TWIN_SHOW_TETMESH") or _gaussian_twin_env_flag(
+        "ISAACLAB_SHOW_GAUSSIAN_TWIN_TETMESH"
+    )
+
+
+def _gaussian_twin_updates_enabled() -> bool | None:
+    """Return the task setting, or ``None`` when contrib is not installed."""
+    try:
+        from isaaclab_contrib.deformable.gaussian_twin import gaussian_twin_updates_enabled
+    except ModuleNotFoundError:
+        # isaaclab_contrib is optional for the visualizer package. A generic
+        # Gaussian scene must retain Newton's normal rendering path.
+        return None
+
+    return gaussian_twin_updates_enabled()
+
+
+def _set_gaussian_twin_updates_enabled(enabled: bool) -> None:
+    """Set Gaussian-twin skinning/streaming from the active RTX viewer."""
+    try:
+        from isaaclab_contrib.deformable.gaussian_twin import set_gaussian_twin_updates_enabled
+    except ModuleNotFoundError:
+        return
+
+    set_gaussian_twin_updates_enabled(enabled)
+
+
 _BACKEND_DISPLAY_NAMES = {
     "physx": "PhysX",
     "ovphysx": "OVPhysX",
@@ -510,6 +544,36 @@ class _NewtonViewerUIMixin:
                 " training\nhigher values -> less responsive visualizer but faster training"
             )
 
+        # Gaussian-twin controls are meaningful only for the RTX backend. The
+        # corresponding deformable object reads the update flag every frame, so
+        # disabling it here stops both skinning kernels and dynamic OVRTX
+        # attribute streaming without pausing the physics simulation.
+        has_gaussian_shapes = isinstance(self, NewtonViewerRTX) and any(
+            type(shape).__name__ == "Gaussian" for shape in getattr(self.model, "shape_source", ()) if shape is not None
+        )
+        if not has_gaussian_shapes:
+            return
+
+        updates_enabled = _gaussian_twin_updates_enabled()
+        if updates_enabled is None:
+            return
+
+        imgui.separator()
+        imgui.text("Gaussian Twin")
+        changed, updates_enabled = imgui.checkbox("Update Gaussian Splats", updates_enabled)
+        if changed:
+            _set_gaussian_twin_updates_enabled(updates_enabled)
+            self.show_gaussians = updates_enabled
+            # With splats disabled the live simulation TetMesh is the useful
+            # fallback. Preserve a user-enabled TetMesh when splats return.
+            if not updates_enabled:
+                self.show_triangles = True
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Disable Gaussian skinning and dynamic RTX streaming; deformable physics keeps running.")
+
+        _c, self.show_triangles = imgui.checkbox("Show Gaussian Twin TetMesh", self.show_triangles)
+        _c, self.show_particles = imgui.checkbox("Show Gaussian Twin Particles", self.show_particles)
+
     def _draw_streaming_view_controls(self) -> None:
         """Render streaming image panel selector in the HUD sidebar.
 
@@ -642,6 +706,7 @@ class NewtonViewerRTX(_NewtonViewerUIMixin, ViewerRTX):
         self._metadata = metadata or {}
         self._update_frequency = update_frequency
         self._color_edit3_prefers_sequence: bool | None = None
+        self._rtx_frame_copy: wp.array | None = None
 
         from isaaclab.utils.backend_utils import FactoryBase
 
@@ -654,6 +719,27 @@ class NewtonViewerRTX(_NewtonViewerUIMixin, ViewerRTX):
         # exist.  Register the training controls now (they are buffered by ViewerRTX until
         # the GUI is available); the panel patch is applied in _init_window() below.
         self.register_ui_callback(self._render_training_controls, position="side")
+
+    def _blit_to_window(self, pixels: wp.array | wp.Texture2D) -> None:
+        """Present an OVRTX frame on the visualizer's CUDA/GL device.
+
+        OVRTX currently maps render products on its selected CUDA device
+        (normally ``cuda:0``), which need not be the Isaac Lab simulation
+        device.  Warp GL textures are tied to the latter device, so copying
+        the mapped frame directly raises on multi-GPU runs.  Stage a peer copy
+        when needed before delegating the OpenGL upload to Newton.
+        """
+        if isinstance(pixels, wp.array) and pixels.device != self.device:
+            if (
+                self._rtx_frame_copy is None
+                or self._rtx_frame_copy.shape != pixels.shape
+                or self._rtx_frame_copy.dtype != pixels.dtype
+                or self._rtx_frame_copy.device != self.device
+            ):
+                self._rtx_frame_copy = wp.empty_like(pixels, device=self.device)
+            wp.copy(self._rtx_frame_copy, pixels)
+            pixels = self._rtx_frame_copy
+        super()._blit_to_window(pixels)
 
     def get_frame(self) -> np.ndarray:
         """Return the latest OVRTX LDR framebuffer as contiguous RGB pixels."""
@@ -2105,7 +2191,28 @@ class NewtonRTXVisualizer(NewtonVisualizer):
         self._disable_viewer_on_step_exception = True
 
     def _create_viewer(self, runtime_headless: bool, metadata: dict) -> NewtonViewerRTX:
-        return NewtonViewerRTX(
+        # Gaussian fields are represented by Newton ``Gaussian`` source
+        # geometries.  Keep the normal RTX path untouched for every other
+        # task: bundled Newton 1.5 remains a supported renderer for rigid,
+        # cloth, and triangle-mesh scenes.
+        has_gaussian_shapes = any(
+            type(shape).__name__ == "Gaussian"
+            for shape in getattr(self._model, "shape_source", ())
+            if shape is not None
+        )
+
+        # A dynamic Gaussian twin needs Newton's GPU-backed OVRTX attribute
+        # streaming. Newton 1.5 accepts the shape but renders only its static
+        # import, making the soft object appear absent with no error.
+        gaussian_updates_enabled = _gaussian_twin_updates_enabled() if has_gaussian_shapes else None
+        if has_gaussian_shapes and gaussian_updates_enabled is True:
+            if not hasattr(ViewerRTX, "_update_ovrtx_gaussians"):
+                raise RuntimeError(
+                    "newton_rtx Gaussian twins require a Newton build with dynamic Gaussian streaming. "
+                    "Install the Newton 1.6 development worktree, then run Isaac Lab with `uv run --no-sync`: "
+                    "`uv pip install --no-config --python .venv/bin/python -e /path/to/newton --no-deps`"
+                )
+        viewer = NewtonViewerRTX(
             width=self.cfg.window_width,
             height=self.cfg.window_height,
             headless=runtime_headless,
@@ -2114,6 +2221,35 @@ class NewtonRTXVisualizer(NewtonVisualizer):
             update_frequency=self.cfg.update_frequency,
             environment=self.cfg.rtx_environment,
         )
+        if has_gaussian_shapes and gaussian_updates_enabled is not None:
+            # Gaussian twin assets contain a deformable TetMesh for simulation
+            # and a Gaussian field for display. Match Newton's reference
+            # example: hide only that intermediate triangle surface unless
+            # explicitly requested. Do not alter the default triangle setting
+            # for unrelated Newton RTX scenes.
+            viewer.show_gaussians = gaussian_updates_enabled
+            viewer.show_triangles = _gaussian_twin_show_tetmesh() or not gaussian_updates_enabled
+            viewer.show_particles = _gaussian_twin_env_flag("ISAACLAB_GAUSSIAN_TWIN_SHOW_PARTICLES")
+        return viewer
+
+    def _apply_model_visualization_options(self) -> None:
+        """Apply generic settings, then the Gaussian-twin task overrides."""
+        super()._apply_model_visualization_options()
+        if self._viewer is None:
+            return
+        has_gaussian_shapes = any(
+            type(shape).__name__ == "Gaussian"
+            for shape in getattr(self._model, "shape_source", ())
+            if shape is not None
+        )
+        if not has_gaussian_shapes:
+            return
+        updates_enabled = _gaussian_twin_updates_enabled()
+        if updates_enabled is None:
+            return
+        self._viewer.show_gaussians = updates_enabled
+        self._viewer.show_triangles = _gaussian_twin_show_tetmesh() or not updates_enabled
+        self._viewer.show_particles = _gaussian_twin_env_flag("ISAACLAB_GAUSSIAN_TWIN_SHOW_PARTICLES")
 
     def _apply_camera_pose(
         self,

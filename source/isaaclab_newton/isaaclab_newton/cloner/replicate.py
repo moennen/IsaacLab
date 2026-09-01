@@ -154,6 +154,11 @@ def _build_newton_builder_from_mapping(
         for source in sources:
             for child in Usd.PrimRange(stage.GetPrimAtPath(source)):
                 child_path = str(child.GetPath())
+                # A Gaussian field can be the render-only twin of a registered
+                # TetMesh.  Keep it in the Newton model so the deformable asset
+                # can update its transforms from the live particle positions.
+                if child.GetTypeName() == "ParticleField3DGaussianSplat":
+                    continue
                 if any(pattern.fullmatch(child_path) for pattern in deformable_patterns):
                     deformable_ignore_paths.append(child_path)
 

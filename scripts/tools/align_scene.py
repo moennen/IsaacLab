@@ -121,14 +121,36 @@ def _add_asset_reference(prim, source_path: Path, root_paths) -> None:
         prim.GetReferences().AddReference(str(source_path), root_path)
 
 
-def _save_alignment(output_path: Path, source_path: Path, root_paths, prim_path: str, live_ops) -> None:
+def _save_alignment(
+    output_path: Path,
+    source_path: Path,
+    root_paths,
+    prim_path: str,
+    live_ops,
+    *,
+    up_axis,
+    meters_per_unit: float,
+) -> None:
     """Save a minimal USDA reference wrapper containing only alignment data."""
-    from pxr import Sdf, Usd
+    from pxr import Sdf, Usd, UsdGeom
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    layer = Sdf.Layer.CreateNew(str(output_path))
+    # ``CreateNew`` rejects a layer that Kit already has open, which makes a
+    # second click on Save USDA fail. Reuse and clear that layer instead.
+    layer = Sdf.Layer.FindOrOpen(str(output_path))
+    if layer is None:
+        layer = Sdf.Layer.CreateNew(str(output_path))
+    else:
+        layer.Clear()
     stage = Usd.Stage.Open(layer)
+    # This file is also opened directly by Newton/OVRTX, outside the live Kit
+    # stage where it was authored.  Persist the live stage metadata so those
+    # consumers do not fall back to USD's Y-up, centimetre defaults and apply
+    # a spurious coordinate-system conversion to the Gaussian field.
+    UsdGeom.SetStageUpAxis(stage, up_axis)
+    UsdGeom.SetStageMetersPerUnit(stage, meters_per_unit)
     prim = stage.DefinePrim(prim_path, "Xform")
+    stage.SetDefaultPrim(prim)
     source_asset = source_path.resolve()
     destination_dir = output_path.resolve().parent
     relative_source = Path(os.path.relpath(source_asset, destination_dir))
@@ -145,13 +167,31 @@ def _save_alignment(output_path: Path, source_path: Path, root_paths, prim_path:
 def _build_ui(prim, ops, source_path: Path, root_paths, output_path: Path):
     """Create the Kit alignment control window."""
     import omni.ui as ui
+    from pxr import UsdGeom
+
+    source_stage = prim.GetStage()
+    up_axis = UsdGeom.GetStageUpAxis(source_stage)
+    meters_per_unit = UsdGeom.GetStageMetersPerUnit(source_stage)
 
     def save(*_args):
-        _save_alignment(output_path, source_path, root_paths, prim.GetPath().pathString, ops)
+        _save_alignment(
+            output_path,
+            source_path,
+            root_paths,
+            prim.GetPath().pathString,
+            ops,
+            up_axis=up_axis,
+            meters_per_unit=meters_per_unit,
+        )
         status.text = f"Saved {output_path}"
 
     # ``omni.ui.Window`` is not itself a context manager in Isaac Sim 6; its frame is.
     window = ui.Window("Scene Alignment", width=420, height=260)
+    # Kit can restore a previously hidden window from its workspace layout.
+    # Explicitly show and focus this tool window so the Save action is not
+    # lost behind the viewport on subsequent aligner launches.
+    window.visible = True
+    window.focus()
     import omni.usd
 
     omni.usd.get_context().get_selection().set_selected_prim_paths([prim.GetPath().pathString], False)
@@ -182,9 +222,24 @@ def main() -> int:
         parser.error("--scale values must be finite and positive.")
     args_cli.output_usd = _normalize_output_path(args_cli.output_usd)
 
+    # This is an interactive Kit tool, not a task visualizer. A Newton task
+    # otherwise causes AppLauncher to infer a headless/kitless session before
+    # the environment is resolved, leaving ``omni.ui`` unavailable when the
+    # alignment window is constructed. Select Kit explicitly and request its
+    # rendering experience for the USD viewport.
+    if getattr(args_cli, "headless", False):
+        parser.error("align_scene.py is interactive and cannot run with --headless.")
+    args_cli.visualizer = ["kit"]
+    args_cli.visualizer_explicit = True
+    args_cli.enable_cameras = True
     app_launcher = AppLauncher(vars(args_cli))
     simulation_app = app_launcher.app
 
+    # The tool authors exactly one raw background reference below.  Do not let
+    # a shell-exported task background wrapper enter this stage as well: it
+    # would compose a previous alignment at the same prim and make the Kit
+    # preview differ from the layer subsequently written by this tool.
+    os.environ["ISAACLAB_DISABLE_ALIGNED_BACKGROUND"] = "1"
     env_cfg, _ = resolve_task_config(args_cli.task, None, overrides=hydra_args)
     if not isinstance(env_cfg, ManagerBasedRLEnvCfg):
         raise TypeError(f"Task '{args_cli.task}' did not resolve to ManagerBasedRLEnvCfg.")
@@ -213,6 +268,7 @@ def main() -> int:
         root_paths,
         args_cli.output_usd,
     )
+    print("Scene Alignment window opened. Use its 'Save USDA' button after adjusting the selected background Xform.")
 
     try:
         # Pump Kit directly while the alignment window is open.  Calling ``env.sim.render()``

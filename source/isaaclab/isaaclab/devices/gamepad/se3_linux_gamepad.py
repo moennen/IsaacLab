@@ -59,7 +59,7 @@ class Se3LinuxGamepad(DeviceBase):
         # use [LX, LY, RX, RY].
         self._right_x_axis = 3 if self._axis_count >= 5 else 2
         self._right_y_axis = 4 if self._axis_count >= 5 else 3
-        self._axes = np.zeros(8, dtype=np.float32)
+        self._axes = np.zeros(self._axis_count, dtype=np.float32)
         self._close_gripper = False
         self._callbacks: dict[Any, Callable[[], None]] = {}
         self._name = self._read_name()
@@ -153,6 +153,8 @@ class Se3LinuxGamepad(DeviceBase):
 
     def _axis(self, index: int) -> float:
         """Apply the dead zone while preserving the remaining stick range."""
+        if index >= len(self._axes):
+            return 0.0
         value = float(self._axes[index])
         if abs(value) <= self.dead_zone:
             return 0.0

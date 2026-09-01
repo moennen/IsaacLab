@@ -6,7 +6,9 @@
 __all__ = [
     "DeformableObject",
     "DeformableObjectData",
+    "GaussianTwinDeformableObject",
 ]
 
 from .deformable_object import DeformableObject
 from .deformable_object_data import DeformableObjectData
+from .gaussian_twin import GaussianTwinDeformableObject

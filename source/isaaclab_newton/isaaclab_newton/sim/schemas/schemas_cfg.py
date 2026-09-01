@@ -44,7 +44,13 @@ class NewtonRigidBodyPropertiesCfg(RigidBodyBaseCfg):
 
     _usd_namespace: ClassVar[str | None] = "newton"
     _usd_applied_schema: ClassVar[str | None] = None
-    _usd_field_exceptions: ClassVar[dict] = {}
+    # Preserve the common disable-gravity routing when a Newton solver-specific
+    # rigid-body config is used.  Without this, setting disable_gravity on a
+    # MujocoRigidBodyPropertiesCfg is silently dropped because the subclass
+    # metadata replaces the base routing table.
+    _usd_field_exceptions: ClassVar[dict] = {
+        "PhysxRigidBodyAPI": ("physxRigidBody", ["disable_gravity"]),
+    }
 
 
 @configclass
@@ -80,7 +86,9 @@ class MujocoRigidBodyPropertiesCfg(NewtonRigidBodyPropertiesCfg):
 
     _usd_namespace: ClassVar[str | None] = "mjc"
     _usd_applied_schema: ClassVar[str | None] = None
-    _usd_field_exceptions: ClassVar[dict] = {}
+    _usd_field_exceptions: ClassVar[dict] = {
+        "PhysxRigidBodyAPI": ("physxRigidBody", ["disable_gravity"]),
+    }
 
     gravcomp: float | None = None
     """Gravity compensation scale for the body [dimensionless].

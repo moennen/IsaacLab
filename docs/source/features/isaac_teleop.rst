@@ -161,6 +161,56 @@ the D-pad for roll/pitch.  Button 0 toggles the gripper.
 This path is separate from the Kit ``Se3Gamepad`` implementation; existing Kit workflows are
 unchanged.
 
+
+Gaussian Twin Teleoperation
+---------------------------
+
+``IsaacContrib-Stack-Gaussian-Twin-Franka-IK-Rel-Newton`` teleoperates a Franka robot against
+a deformable TetMesh whose Gaussian-splat field is skinned to the live simulation.  Point
+``ISAACLAB_GAUSSIAN_TWIN_ASSET`` at one packaged USD asset to start quickly; alternatively,
+set ``ISAACLAB_GAUSSIAN_TWIN_DIR`` to a directory of ``baked.*_package.usda`` assets.  The
+task preloads one package by default, which is the interactive RTX configuration. Set
+``ISAACLAB_GAUSSIAN_TWIN_NUM_SLOTS`` to preload more packages and select among them on reset.
+
+.. code-block:: bash
+
+   export ISAACLAB_GAUSSIAN_TWIN_ASSET=/absolute/path/to/baked.toy_package.usda
+   uv run --extra teleop --extra ovrtx isaaclab teleop run \
+       --task IsaacContrib-Stack-Gaussian-Twin-Franka-IK-Rel-Newton \
+       --visualizer newton_rtx \
+       --teleop_device gamepad \
+       --gamepad-device /dev/input/js0 \
+       --num_envs 1
+
+The RTX path requires a Newton build with dynamic-Gaussian streaming support.
+Use the Newton version documented for this Isaac Lab release; older builds can
+load the field but cannot stream the deforming splat attributes.
+
+The package must contain one ``TetMesh``, one ``ParticleField3DGaussianSplat``, and the
+``newton:deformableSkin`` binding attributes.  The TetMesh owns collision and dynamics; the
+Gaussian field is display-only. The ``newton_rtx`` sidebar's **Gaussian Twin** section provides
+live checkboxes to update/hide splats, show the simulation TetMesh, and show VBD particles.
+``ISAACLAB_GAUSSIAN_TWIN_SHOW_TETMESH=1``, ``ISAACLAB_GAUSSIAN_TWIN_SHOW_PARTICLES=1``, and
+``ISAACLAB_GAUSSIAN_TWIN_DISABLE_GAUSSIAN_UPDATE=1`` set only their initial states; the viewer
+controls thereafter apply directly to the running task. The original
+``ISAACLAB_SHOW_GAUSSIAN_TWIN_TETMESH=1`` remains an alias. By default, centers, orientations, and principal scales are
+skinned from the TetMesh.  Set ``ISAACLAB_GAUSSIAN_TWIN_SPLAT_DEFORMATION`` to ``position`` or
+``position-rotation`` to stream fewer attributes when the faster, lower-fidelity representation
+is sufficient.  Material stiffness and damping are derived from each TetMesh's physical size and
+resolution. Advanced runs can override the defaults with ``ISAACLAB_GAUSSIAN_TWIN_DENSITY``,
+``ISAACLAB_GAUSSIAN_TWIN_GRAVITY_STIFFNESS``, ``ISAACLAB_GAUSSIAN_TWIN_DAMPING_RATIO``,
+``ISAACLAB_GAUSSIAN_TWIN_POISSONS_RATIO``, or ``ISAACLAB_GAUSSIAN_TWIN_YOUNGS_MODULUS``.
+The expensive aligned Gaussian background is disabled for this task; set
+``ISAACLAB_ENABLE_ALIGNED_BACKGROUND=1`` only for a composed recording.
+
+For a responsive demonstration, set ``ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION=1``. This mirrors
+the Newton example's ``--fast-simulation`` profile: two 1/120 s solver substeps, 30 VBD
+iterations, and a 7.5 Hz-equivalent gripper drive. It reduces physics work substantially while
+retaining the packaged toy grasp, at the cost of less accurate elastic waves and contacts.
+For a steadier intermediate setting, use ``ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION=1`` instead:
+four 1/120 s substeps, 45 VBD iterations, and a 12.5 Hz-equivalent gripper drive. The balanced
+and fast settings are mutually exclusive.
+
 .. _isaac-teleop-tracking-debug-visualization:
 
 Visualize XR Tracking

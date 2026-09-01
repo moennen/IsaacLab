@@ -25,6 +25,7 @@ import warp as wp
 wp.config.enable_backward = False
 
 import argparse
+import os
 import sys
 from collections.abc import Callable
 
@@ -48,6 +49,16 @@ parser.add_argument(
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
+parser.add_argument(
+    "--disable-background",
+    action="store_true",
+    help="Disable the task's aligned Gaussian background while keeping scene assets and physics enabled.",
+)
+parser.add_argument(
+    "--disable-simulation",
+    action="store_true",
+    help="Initialize and render the scene without stepping physics or creating a teleoperation device.",
+)
 parser.add_argument(
     "--gamepad_device",
     "--gamepad-device",
@@ -105,7 +116,6 @@ def _kitless_visualizer_requested(args: argparse.Namespace) -> bool:
     return bool(set(getattr(args, "visualizer", None) or ()) & {"newton_gl", "newton_rtx"})
 
 
-kitless_visualizer_requested = False
 kitless_runtime = None
 
 # Call an external callback if requested.
@@ -114,10 +124,14 @@ if args_cli.external_callback:
     external_callback_function = string_to_callable(args_cli.external_callback, separator=".")
     remaining_args_env_registration = external_callback_function()
 
-if remaining_args_env_registration is not None:
+if remaining_args_env_registration is None:
+    # Hydra-style task overrides are bare ``path=value`` tokens. Any leftover
+    # option flag is necessarily a typo in this CLI rather than an override.
+    unrecognized_args = [argument for argument in hydra_args if argument.startswith("-")]
+else:
     unrecognized_args = list_intersection(hydra_args, remaining_args_env_registration)
-    if unrecognized_args:
-        parser.error(f"unrecognized arguments: {' '.join(unrecognized_args)}")
+if unrecognized_args:
+    parser.error(f"unrecognized arguments: {' '.join(unrecognized_args)}")
 
 sys.argv = [sys.argv[0]] + hydra_args
 
@@ -127,7 +141,7 @@ sys.argv = [sys.argv[0]] + hydra_args
 
 def _close_runtime() -> None:
     """Close whichever runtime was selected, including the Kitless context."""
-    global kitless_runtime, kitless_visualizer_requested
+    global kitless_runtime
     if kitless_runtime is not None:
         kitless_runtime.__exit__(None, None, None)
         kitless_runtime = None
@@ -135,8 +149,13 @@ def _close_runtime() -> None:
 
 def _runtime_is_running(env) -> bool:
     """Return whether the active Kit or Newton visualizer still owns a running window."""
-    if not env.sim.has_active_visualizers():
-        return True
+    # Kit's native GUI is not an Isaac Lab visualizer. Ask it directly so a
+    # normal teleop session exits when its window closes; headless and kitless
+    # sessions retain SimulationContext's visualizer-aware behavior.
+    if env.sim.has_gui:
+        from omni.kit.app import get_app
+
+        return get_app().is_running()
     return env.sim.is_headless_or_exist_active_visualizer()
 
 
@@ -298,7 +317,10 @@ def main() -> None:  # noqa: C901
     Returns:
         None
     """
-    # parse configuration
+    # Parse configuration. This environment flag is consumed by task configs while they are
+    # being constructed, before the simulator and scene are created.
+    if args_cli.disable_background:
+        os.environ["ISAACLAB_DISABLE_ALIGNED_BACKGROUND"] = "1"
     env_cfg, _ = resolve_task_config(args_cli.task, None, overrides=hydra_args)
     env_cfg.sim.device = args_cli.device
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -316,6 +338,12 @@ def main() -> None:  # noqa: C901
         # add termination condition for reaching the goal otherwise the environment won't reset
         env_cfg.terminations.object_reached_goal = DoneTerm(func=mdp.object_reached_goal)
 
+    # ``launch_simulation`` creates AppLauncher only after inspecting this
+    # namespace. Preserve the teleop default of external camera rendering so
+    # AppLauncher selects its RTX-capable camera experience; the user can opt
+    # out with --disable_external_cameras.
+    args_cli.enable_cameras = not args_cli.disable_external_cameras
+
     # Resolve the runtime once through the shared launcher. This keeps the Kit/kitless decision,
     # backend validation, and lifecycle ownership in one place.
     global kitless_runtime
@@ -327,8 +355,8 @@ def main() -> None:  # noqa: C901
         kitless_runtime.__exit__(*exc_info)
         kitless_runtime = None
         raise
-    # launch_simulation owns runtime selection; this flag only selects the matching built-in
-    # device implementation after the runtime has been initialized.
+    # launch_simulation owns runtime selection; this local value only selects
+    # the matching built-in device implementation after initialization.
     kitless_visualizer_requested = _kitless_visualizer_requested(args_cli)
 
     # When --teleop_device is explicitly provided, use the legacy teleop_devices path
@@ -387,6 +415,18 @@ def main() -> None:  # noqa: C901
     except Exception as e:
         logger.error(f"Failed to create environment: {e}")
         _close_runtime()
+        return
+
+    if args_cli.disable_simulation:
+        print("Simulation-disabled diagnostic mode: physics is not stepped.")
+        try:
+            env.reset()
+            while _runtime_is_running(env):
+                env.sim.render()
+        finally:
+            env.close()
+            _close_runtime()
+        print("Environment closed")
         return
 
     # Flags for controlling teleoperation flow
