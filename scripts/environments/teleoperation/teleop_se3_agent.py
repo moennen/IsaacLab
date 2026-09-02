@@ -60,6 +60,16 @@ parser.add_argument(
     help="Initialize and render the scene without stepping physics or creating a teleoperation device.",
 )
 parser.add_argument(
+    "--dexsuite-simulation",
+    choices=["stable-kinematic", "fast-kinematic"],
+    default=None,
+    help=(
+        "Use the corresponding DexSuite kinematic Featherstone+VBD profile for the Gaussian-twin task. "
+        "stable-kinematic uses 8 substeps x 12 VBD iterations; fast-kinematic uses 4 x 7. "
+        "Ignored by tasks that do not support ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION."
+    ),
+)
+parser.add_argument(
     "--gamepad_device",
     "--gamepad-device",
     type=str,
@@ -321,6 +331,8 @@ def main() -> None:  # noqa: C901
     # being constructed, before the simulator and scene are created.
     if args_cli.disable_background:
         os.environ["ISAACLAB_DISABLE_ALIGNED_BACKGROUND"] = "1"
+    if args_cli.dexsuite_simulation is not None:
+        os.environ["ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION"] = args_cli.dexsuite_simulation
     env_cfg, _ = resolve_task_config(args_cli.task, None, overrides=hydra_args)
     env_cfg.sim.device = args_cli.device
     env_cfg.scene.num_envs = args_cli.num_envs

@@ -110,6 +110,23 @@ class CouplerProxyMappingCfg:
     mass_scale: float = 1.0
     """Scale applied to proxy body mass/inertia and particle mass in the destination view."""
 
+    proxy_relaxation: float = 1.0
+    """Feedback-force relaxation applied after each destination solve.
+
+    ``1.0`` immediately feeds the new proxy force back to the source solver.
+    Smaller values smooth that feedback over several simulation steps, which
+    can be substantially more stable for stiff, ground-anchored robots.
+    """
+
+    proxy_relaxation_mode: Literal["fixed", "aitken"] = "fixed"
+    """Whether feedback relaxation is fixed or updated with Aitken acceleration."""
+
+    proxy_relaxation_min: float = 0.1
+    """Minimum Aitken feedback relaxation. Used only with ``"aitken"`` mode."""
+
+    proxy_relaxation_max: float = 1.0
+    """Maximum Aitken feedback relaxation. Used only with ``"aitken"`` mode."""
+
     collide_interval: int | None = None
     """Proxy-local collision refresh interval.
 

@@ -168,9 +168,10 @@ Gaussian Twin Teleoperation
 ``IsaacContrib-Stack-Gaussian-Twin-Franka-IK-Rel-Newton`` teleoperates a Franka robot against
 a deformable TetMesh whose Gaussian-splat field is skinned to the live simulation.  Point
 ``ISAACLAB_GAUSSIAN_TWIN_ASSET`` at one packaged USD asset to start quickly; alternatively,
-set ``ISAACLAB_GAUSSIAN_TWIN_DIR`` to a directory of ``baked.*_package.usda`` assets.  The
-task preloads one package by default, which is the interactive RTX configuration. Set
-``ISAACLAB_GAUSSIAN_TWIN_NUM_SLOTS`` to preload more packages and select among them on reset.
+set ``ISAACLAB_GAUSSIAN_TWIN_DIR`` to a directory of ``baked.*_package.usda`` or
+``baked.*_skinned_vbd_tet.usda`` assets. The task preloads one package by default, which is the
+interactive RTX configuration. Set ``ISAACLAB_GAUSSIAN_TWIN_NUM_SLOTS`` to preload more
+packages and select among them on reset.
 
 .. code-block:: bash
 
@@ -200,6 +201,8 @@ is sufficient.  Material stiffness and damping are derived from each TetMesh's p
 resolution. Advanced runs can override the defaults with ``ISAACLAB_GAUSSIAN_TWIN_DENSITY``,
 ``ISAACLAB_GAUSSIAN_TWIN_GRAVITY_STIFFNESS``, ``ISAACLAB_GAUSSIAN_TWIN_DAMPING_RATIO``,
 ``ISAACLAB_GAUSSIAN_TWIN_POISSONS_RATIO``, or ``ISAACLAB_GAUSSIAN_TWIN_YOUNGS_MODULUS``.
+Those material overrides apply to the native Gaussian-twin profiles; DexSuite mode deliberately
+uses its fixed policy-training material preset instead.
 The expensive aligned Gaussian background is disabled for this task; set
 ``ISAACLAB_ENABLE_ALIGNED_BACKGROUND=1`` only for a composed recording.
 
@@ -210,6 +213,21 @@ retaining the packaged toy grasp, at the cost of less accurate elastic waves and
 For a steadier intermediate setting, use ``ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION=1`` instead:
 four 1/120 s substeps, 45 VBD iterations, and a 12.5 Hz-equivalent gripper drive. The balanced
 and fast settings are mutually exclusive.
+
+To reproduce the stable VBD topology used by the DexSuite Kuka/Allegro policy task, pass
+``--dexsuite-simulation stable-kinematic`` to the teleoperation command. This selects kinematic
+Featherstone + externally integrated VBD, particle-only rigid/soft contacts, DexSuite's 4 mm
+particle shell and contact gains, with eight 1/120 s substeps and 12 VBD iterations per tick.
+Use ``--dexsuite-simulation fast-kinematic`` for the corresponding four-substep, seven-iteration
+preset. These modes are mutually exclusive with the Gaussian twin fast and balanced presets and
+are intentionally one-way: the deformable body does not exert reaction forces on the Franka.
+
+The native proxy-coupled demonstration defaults to the ``demo`` coupling profile: one proxy
+iteration, mass scale ``1000``, and feedback relaxation ``0.1``. Set
+``ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE`` to ``balanced`` or ``accurate`` to select a more
+responsive two-way solve, or override individual values with
+``ISAACLAB_GAUSSIAN_TWIN_PROXY_ITERATIONS``, ``ISAACLAB_GAUSSIAN_TWIN_PROXY_MASS_SCALE``, and
+``ISAACLAB_GAUSSIAN_TWIN_PROXY_RELAXATION``. All three overrides must be positive.
 
 .. _isaac-teleop-tracking-debug-visualization:
 

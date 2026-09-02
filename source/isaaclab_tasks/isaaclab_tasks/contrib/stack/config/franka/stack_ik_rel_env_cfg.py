@@ -4,15 +4,18 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import logging
+import math
 import os
 from pathlib import Path
 
 from isaaclab_newton.physics import (
+    FeatherstoneSolverCfg,
     HydroelasticSDFCfg,
     MJWarpSolverCfg,
     NewtonCfg,
     NewtonCollisionPipelineCfg,
     NewtonShapeCfg,
+    NewtonSoftContactCfg,
     VBDSolverCfg,
 )
 from isaaclab_newton.sim.schemas import NewtonDeformableBodyPropertiesCfg
@@ -35,7 +38,8 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab.sim.spawners.materials import UsdPhysicsRigidBodyMaterialCfg
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_contrib.custom_coupling import CoupledMJWarpVBDSolverCfg
+from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
+from isaaclab_contrib.custom_coupling import CoupledFeatherstoneVBDSolverCfg
 from isaaclab_contrib.deformable.gaussian_twin import GaussianTwinDeformableObject
 
 from isaaclab_tasks.contrib.stack.stack_env_cfg import PhysicsCfg, mdp
@@ -54,6 +58,63 @@ _BALANCED_GAUSSIAN_TWIN_DRIVE_FREQUENCY_RATIO = 12.5 / 25.0
 _FAST_GAUSSIAN_TWIN_SUBSTEPS = 2
 _FAST_GAUSSIAN_TWIN_VBD_ITERATIONS = 30
 _FAST_GAUSSIAN_TWIN_DRIVE_FREQUENCY_RATIO = 7.5 / 25.0
+
+# Match the policy-training VBD presets from
+# Isaac-Dexsuite-Deformable-Kuka-Allegro-Lift-v0.  These intentionally use a
+# kinematic robot and particle-only rigid/soft contacts: their purpose is a
+# stable, low-cost learning baseline rather than two-way force fidelity.
+_DEXSUITE_SIMULATION_PROFILES = {
+    "stable-kinematic": (8, 12, 0.75),
+    "fast-kinematic": (4, 7, 1.0),
+}
+_DEXSUITE_TET_K_DAMP = 1.0e-5
+_DEXSUITE_SOFT_CONTACT_KE = 8.0e3
+_DEXSUITE_SHAPE_CONTACT_KE = 3.0e4
+# Kept separate from tet elasticity damping even though the published
+# DexSuite training preset uses the same numeric value for both quantities.
+# Contact damping is a rigid/soft material parameter [N*s/m], not a tet
+# material parameter.
+_DEXSUITE_CONTACT_KD = 1.0e-5
+
+# Virtual-proxy coupling trade-offs.  A large proxy inertia is appropriate for
+# the stiff, ground-anchored Franka: it preconditions the coupled solve without
+# moving its converged fixed point.  The demonstration profile deliberately
+# applies its feedback slowly, prioritizing stable, inexpensive motion over a
+# frame-exact robot reaction.
+_GAUSSIAN_TWIN_PROXY_PROFILES = {
+    "demo": (1, 1.0e3, 0.1),
+    "balanced": (2, 1.0e3, 0.35),
+    "accurate": (4, 1.0e3, 1.0),
+}
+
+
+def _optional_positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer environment override, treating an empty value as unset."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive integer, got '{value}'.") from error
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer, got '{value}'.")
+    return parsed
+
+
+def _optional_nonnegative_float_env(name: str, default: float, *, positive: bool = False) -> float:
+    """Read a finite nonnegative (or positive) floating-point environment override."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a finite number, got '{value}'.") from error
+    if not math.isfinite(parsed) or (parsed <= 0.0 if positive else parsed < 0.0):
+        comparator = "positive" if positive else "nonnegative"
+        raise ValueError(f"{name} must be a finite {comparator} number, got '{value}'.")
+    return parsed
 
 
 def _gaussian_twin_slot_position(slot_index: int, num_slots: int) -> tuple[float, float, float]:
@@ -246,7 +307,7 @@ class FrankaCubeStackNewtonEnvCfg(FrankaCubeStackEnvCfg):
 class GaussianTwinCfg(PresetCfg):
     """USD-backed TetMesh and Gaussian-splat twin used by the Newton example."""
 
-    newton_mjwarp_vbd: DeformableObjectCfg = DeformableObjectCfg(
+    newton_mjwarp_vbd_proxy: DeformableObjectCfg = DeformableObjectCfg(
         prim_path="{ENV_REGEX_NS}/GaussianTwin",
         class_type=GaussianTwinDeformableObject,
         init_state=DeformableObjectCfg.InitialStateCfg(pos=(0.5, 0.0, 0.05)),
@@ -265,39 +326,72 @@ class GaussianTwinCfg(PresetCfg):
             ),
         ),
     )
-    default = newton_mjwarp_vbd
+    default = newton_mjwarp_vbd_proxy
 
 
 @configclass
 class GaussianTwinPhysicsCfg(PhysicsCfg):
-    """MJWarp/VBD coupling required for rigid Franka contact with the TetMesh."""
+    """Newton proxy coupling required for rigid Franka contact with the TetMesh."""
 
-    newton_mjwarp_vbd = NewtonCfg(
-        solver_cfg=CoupledMJWarpVBDSolverCfg(
-            rigid_solver_cfg=MJWarpSolverCfg(
-                solver="newton",
-                integrator="implicitfast",
-                use_mujoco_contacts=True,
-                njmax=600,
-                nconmax=400,
-                ls_iterations=20,
-                iterations=100,
-                ccd_iterations=35,
-            ),
-            soft_solver_cfg=VBDSolverCfg(
-                iterations=60,
-                # Full-surface contacts can produce several records per TetMesh
-                # vertex while a finger closes.  The old 2048-record limit was
-                # exceeded by the packaged toys and silently dropped reaction
-                # rows, which made a grasp alternate between tunnelling and a
-                # large corrective impulse.
-                rigid_body_particle_contact_buffer_size=8192,
-                integrate_with_external_rigid_solver=True,
-            ),
+    newton_mjwarp_vbd_proxy = NewtonCfg(
+        solver_cfg=CouplerProxyCfg(
+            entries=[
+                CouplerEntryCfg(
+                    name="rigid",
+                    solver_cfg=MJWarpSolverCfg(
+                        solver="newton",
+                        integrator="implicitfast",
+                        # MuJoCo remains responsible for rigid--rigid contacts
+                        # (robot/table/ground).  The proxy pipeline below owns
+                        # rigid--soft contact with the TetMesh.
+                        use_mujoco_contacts=True,
+                        njmax=600,
+                        nconmax=400,
+                        ls_iterations=20,
+                        iterations=100,
+                        ccd_iterations=35,
+                    ),
+                    bodies=[r"/World/envs/env_[^/]+/Robot"],
+                ),
+                CouplerEntryCfg(
+                    name="soft",
+                    solver_cfg=VBDSolverCfg(
+                        iterations=60,
+                        rigid_compliant_alm=True,
+                        # Full-surface contacts can produce several records per
+                        # TetMesh vertex while a finger closes.  Size the list
+                        # for the packaged toys so contact rows are not dropped.
+                        rigid_body_particle_contact_buffer_size=8192,
+                    ),
+                    all_particles=True,
+                    include_static_shapes=True,
+                ),
+            ],
+            proxies=[
+                CouplerProxyMappingCfg(
+                    source="rigid",
+                    destination="soft",
+                    # Only the gripper needs to be represented in the VBD
+                    # view.  The proxy solver streams its pose from the full
+                    # MJWarp Franka before each coupled solve.
+                    bodies=[
+                        # The stack task uses the legacy Franka USD (without
+                        # ``Geometry``), while the Menagerie task configs use
+                        # a ``Geometry`` scope.  The importer preserves both
+                        # forms in body labels, so accept either layout.
+                        r"/World/envs/env_[^/]+/Robot(?:/Geometry)?/.*panda_hand",
+                        r"/World/envs/env_[^/]+/Robot(?:/Geometry)?/.*panda_(left|right)finger",
+                    ],
+                    collide_interval=1,
+                    # Particle-only contacts let narrow fingers pass through a
+                    # coarse TetMesh between vertices.
+                    collision_pipeline=NewtonCollisionPipelineCfg(
+                        enable_rigid_soft_full_surface_contact=True,
+                    ),
+                )
+            ],
+            iterations=1,
         ),
-        # Particle-only contacts let narrow fingers pass through a coarse
-        # TetMesh between vertices.
-        collision_cfg=NewtonCollisionPipelineCfg(enable_rigid_soft_full_surface_contact=True),
         # Full-surface contact samples every participating mesh/convex SDF.
         # Provision one for importer-added Franka collision shapes too; the
         # task otherwise fails during CollisionPipeline construction as soon
@@ -307,7 +401,37 @@ class GaussianTwinPhysicsCfg(PhysicsCfg):
         # fixed value for the six random assets so the smallest elements are resolved too.
         num_substeps=32,
     )
-    default = newton_mjwarp_vbd
+    newton_dexsuite_kinematic = NewtonCfg(
+        solver_cfg=CoupledFeatherstoneVBDSolverCfg(
+            rigid_solver_cfg=FeatherstoneSolverCfg(update_mass_matrix_interval=8),
+            soft_solver_cfg=VBDSolverCfg(
+                iterations=12,
+                integrate_with_external_rigid_solver=True,
+                particle_enable_self_contact=False,
+                particle_collision_detection_interval=-1,
+            ),
+            kinematic_velocity_limit_scale=0.75,
+            shape_material_ke=_DEXSUITE_SHAPE_CONTACT_KE,
+            shape_material_kd=_DEXSUITE_CONTACT_KD,
+            shape_material_mu=4.0,
+        ),
+        # DexSuite trains with vertex-sphere contacts.  In particular, do not
+        # request SDF/full-surface contact in this mode: it is a qualitatively
+        # different and much more expensive contact problem.
+        collision_cfg=NewtonCollisionPipelineCfg(),
+        soft_contact_cfg=NewtonSoftContactCfg(
+            soft_contact_ke=_DEXSUITE_SOFT_CONTACT_KE,
+            soft_contact_kd=_DEXSUITE_CONTACT_KD,
+            soft_contact_mu=4.0,
+        ),
+        default_shape_cfg=NewtonShapeCfg(
+            ke=_DEXSUITE_SHAPE_CONTACT_KE,
+            kd=_DEXSUITE_CONTACT_KD,
+            mu=4.0,
+        ),
+        num_substeps=8,
+    )
+    default = newton_mjwarp_vbd_proxy
 
 
 @configclass
@@ -339,10 +463,16 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             "yes",
             "on",
         }
-        if balanced_simulation and fast_simulation:
+        dexsuite_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION", "").strip().lower()
+        if dexsuite_simulation and dexsuite_simulation not in _DEXSUITE_SIMULATION_PROFILES:
+            choices = ", ".join(_DEXSUITE_SIMULATION_PROFILES)
             raise ValueError(
-                "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION and "
-                "ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION cannot both be enabled."
+                f"ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION must be one of {choices}, got '{dexsuite_simulation}'."
+            )
+        if sum((balanced_simulation, fast_simulation, bool(dexsuite_simulation))) > 1:
+            raise ValueError(
+                "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION, ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION, and "
+                "ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION are mutually exclusive."
             )
         configured_num_objects = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_NUM_OBJECTS")
         if configured_num_objects is not None:
@@ -370,12 +500,18 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             if not asset_dir_value:
                 raise ValueError(
                     "No Gaussian twin asset configured. Set ISAACLAB_GAUSSIAN_TWIN_ASSET to one package or "
-                    "ISAACLAB_GAUSSIAN_TWIN_DIR to a directory containing baked.*_package.usda files."
+                    "ISAACLAB_GAUSSIAN_TWIN_DIR to a directory containing packaged Gaussian-twin USDA files."
                 )
             asset_dir = Path(asset_dir_value).expanduser()
             if not asset_dir.is_dir():
                 raise ValueError(f"Gaussian twin asset directory does not exist: '{asset_dir}'.")
-            asset_paths = sorted(asset_dir.glob("baked.*_package.usda"))
+            # The original Gaussian-twin packager emits ``*_package.usda``;
+            # the DexSuite 4 mm / 512-node pipeline emits the equally valid
+            # ``*_skinned_vbd_tet.usda`` form.  Both contain the same TetMesh
+            # and baked Gaussian skinning contract consumed below.
+            asset_paths = sorted(
+                {*asset_dir.glob("baked.*_package.usda"), *asset_dir.glob("baked.*_skinned_vbd_tet.usda")}
+            )
         if len(asset_paths) < self.num_slots:
             raise ValueError(
                 f"Expected at least {self.num_slots} Gaussian twin packages, found {len(asset_paths)}. "
@@ -390,7 +526,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 "ISAACLAB_GAUSSIAN_TWIN_SPLAT_DEFORMATION must be one of "
                 f"{', '.join(sorted(valid_splat_deformations))}, got '{splat_deformation}'."
             )
-        base_cfg = GaussianTwinCfg().newton_mjwarp_vbd
+        base_cfg = GaussianTwinCfg().newton_mjwarp_vbd_proxy
         for slot_index, asset_path in enumerate(asset_paths[: self.num_slots]):
             slot_cfg = base_cfg.replace(
                 prim_path=f"{{ENV_REGEX_NS}}/GaussianTwin_{slot_index}",
@@ -410,14 +546,61 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             ik_method="svd",
             ik_params={"min_singular_value": 1e-4},
         )
-        self.sim.physics = GaussianTwinPhysicsCfg().newton_mjwarp_vbd
+        if dexsuite_simulation:
+            substeps, iterations, velocity_limit_scale = _DEXSUITE_SIMULATION_PROFILES[dexsuite_simulation]
+            self.sim.physics = GaussianTwinPhysicsCfg().newton_dexsuite_kinematic
+            solver_cfg = self.sim.physics.solver_cfg
+            self.sim.physics.num_substeps = substeps
+            solver_cfg.rigid_solver_cfg.update_mass_matrix_interval = substeps
+            solver_cfg.soft_solver_cfg.iterations = iterations
+            solver_cfg.kinematic_velocity_limit_scale = velocity_limit_scale
+            _LOGGER.info(
+                "Enabled Gaussian twin DexSuite %s simulation: kinematic Featherstone + VBD, "
+                "%d substeps, %d VBD iterations, %.2f velocity-limit scale.",
+                dexsuite_simulation,
+                substeps,
+                iterations,
+                velocity_limit_scale,
+            )
+        else:
+            self.sim.physics = GaussianTwinPhysicsCfg().newton_mjwarp_vbd_proxy
+            coupling_profile = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE", "demo").strip().lower()
+            try:
+                proxy_iterations, proxy_mass_scale, proxy_relaxation = _GAUSSIAN_TWIN_PROXY_PROFILES[coupling_profile]
+            except KeyError as error:
+                choices = ", ".join(_GAUSSIAN_TWIN_PROXY_PROFILES)
+                raise ValueError(
+                    f"ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE must be one of {choices}, got '{coupling_profile}'."
+                ) from error
+            solver_cfg = self.sim.physics.solver_cfg
+            proxy_cfg = solver_cfg.proxies[0]
+            solver_cfg.iterations = _optional_positive_int_env(
+                "ISAACLAB_GAUSSIAN_TWIN_PROXY_ITERATIONS", proxy_iterations
+            )
+            proxy_cfg.mass_scale = _optional_nonnegative_float_env(
+                "ISAACLAB_GAUSSIAN_TWIN_PROXY_MASS_SCALE", proxy_mass_scale, positive=True
+            )
+            proxy_cfg.proxy_relaxation = _optional_nonnegative_float_env(
+                "ISAACLAB_GAUSSIAN_TWIN_PROXY_RELAXATION", proxy_relaxation, positive=True
+            )
+            _LOGGER.info(
+                "Enabled Gaussian twin %s proxy coupling: %d iteration(s), %.0f mass scale, %.2f feedback relaxation.",
+                coupling_profile,
+                solver_cfg.iterations,
+                proxy_cfg.mass_scale,
+                proxy_cfg.proxy_relaxation,
+            )
         if self.num_objects > 1:
             # VBD disables particle--particle contact by default.  This leaves
             # independently imported TetMeshes ghosting through one another.
             # These are contact-detection radii in metres, sized for the
             # packaged toys' ~4 mm particles; the larger margin avoids misses
             # at the task's 1/120 s tick.
-            soft_solver = self.sim.physics.solver_cfg.soft_solver_cfg
+            soft_solver = (
+                self.sim.physics.solver_cfg.soft_solver_cfg
+                if dexsuite_simulation
+                else self.sim.physics.solver_cfg.entries[1].solver_cfg
+            )
             soft_solver.particle_enable_self_contact = True
             soft_solver.particle_self_contact_radius = 0.008
             soft_solver.particle_self_contact_margin = 0.012
@@ -441,7 +624,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             # solve cost and lowering gripper bandwidth to match the coarser
             # position-drive resolution.
             self.sim.physics.num_substeps = substeps
-            self.sim.physics.solver_cfg.soft_solver_cfg.iterations = iterations
+            self.sim.physics.solver_cfg.entries[1].solver_cfg.iterations = iterations
             hand = self.scene.robot.actuators["panda_hand"]
             hand.stiffness *= drive_frequency_ratio**2
             hand.damping *= drive_frequency_ratio

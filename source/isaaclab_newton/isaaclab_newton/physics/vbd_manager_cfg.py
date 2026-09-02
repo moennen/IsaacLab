@@ -27,8 +27,18 @@ class VBDSolverCfg(NewtonSolverCfg):
     iterations: int = 10
     """Number of VBD iterations per substep."""
 
+    friction_epsilon: float = 1.0e-2
+    """Velocity regularization used by VBD friction contacts [m/s]."""
+
     integrate_with_external_rigid_solver: bool = False
     """Whether an external solver integrates rigid bodies."""
+
+    rigid_compliant_alm: bool | None = None
+    """Use VBD's compliant augmented-Lagrangian rigid constraint formulation.
+
+    ``None`` retains Newton's compatibility default.  Set this to ``True`` for
+    a VBD entry receiving rigid virtual proxies from a coupled solver.
+    """
 
     particle_enable_self_contact: bool = False
     """Whether to enable particle self-contact."""

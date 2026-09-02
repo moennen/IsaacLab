@@ -25,6 +25,7 @@ from isaaclab_newton.physics import NewtonManager as SimulationManager
 from .deformable_object import DeformableObject
 
 SKIN_NAMESPACE = "newton:deformableSkin"
+_DEXSUITE_SIMULATION_MODES = {"stable-kinematic", "fast-kinematic"}
 
 
 def _env_flag(name: str) -> bool:
@@ -64,6 +65,17 @@ def _optional_positive_env(name: str, default: float) -> float:
     if value <= 0.0:
         raise ValueError(f"{name} must be positive, got {value}.")
     return value
+
+
+def _dexsuite_simulation_mode() -> str | None:
+    """Return the selected DexSuite-compatible material profile, if any."""
+    mode = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION", "").strip().lower()
+    if not mode:
+        return None
+    if mode not in _DEXSUITE_SIMULATION_MODES:
+        choices = ", ".join(sorted(_DEXSUITE_SIMULATION_MODES))
+        raise ValueError(f"ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION must be one of {choices}, got '{mode}'.")
+    return mode
 
 
 def _fit_asset_to_simulation_transform(
@@ -260,9 +272,7 @@ def _skin_gaussians(
     c0 = wp.normalize(c0)
     c1 = wp.normalize(c1 - c0 * wp.dot(c0, c1))
     rotation = wp.quat_from_matrix(wp.matrix_from_cols(c0, c1, wp.cross(c0, c1)))
-    transforms[gaussian] = wp.transform(
-        center + displacement, wp.normalize(rotation * wp.transform_get_rotation(rest))
-    )
+    transforms[gaussian] = wp.transform(center + displacement, wp.normalize(rotation * wp.transform_get_rotation(rest)))
     if deform_scales != 0:
         # A Gaussian covariance represents principal radii but not shear. Keep
         # the local axial stretches from the blended deformation gradient; the
@@ -273,9 +283,7 @@ def _skin_gaussians(
             wp.length(wp.vec3(gradient[0, 2], gradient[1, 2], gradient[2, 2])),
         )
         rest_scale = rest_scales[gaussian]
-        scales[gaussian] = wp.vec3(
-            rest_scale[0] * stretch[0], rest_scale[1] * stretch[1], rest_scale[2] * stretch[2]
-        )
+        scales[gaussian] = wp.vec3(rest_scale[0] * stretch[0], rest_scale[1] * stretch[1], rest_scale[2] * stretch[2])
 
 
 @wp.kernel
@@ -351,7 +359,9 @@ class GaussianTwinDeformableObject(DeformableObject):
         self._splat_deformation = str(getattr(cfg, "splat_deformation", "position-rotation-scale"))
         if self._splat_deformation not in self._MODE_ATTRIBUTES:
             choices = ", ".join(self._MODE_ATTRIBUTES)
-            raise ValueError(f"Unknown Gaussian splat deformation '{self._splat_deformation}'; expected one of: {choices}.")
+            raise ValueError(
+                f"Unknown Gaussian splat deformation '{self._splat_deformation}'; expected one of: {choices}."
+            )
 
     def _initialize_impl(self):
         super()._initialize_impl()
@@ -390,6 +400,17 @@ class GaussianTwinDeformableObject(DeformableObject):
     def _register_deformable(self):
         """Register a packaged TetMesh with scale-aware VBD material parameters."""
         entry = super()._register_deformable()
+        # The DexSuite training presets use fixed, deliberately soft material
+        # and a 4 mm collision shell.  This is a complete physics profile,
+        # not merely a cheaper solver budget, so it must override the package
+        # scale-aware material derived for the Gaussian-twin demonstration.
+        if _dexsuite_simulation_mode() is not None:
+            entry.density = 300.0
+            entry.k_mu = 1.0e5
+            entry.k_lambda = 1.0e5
+            entry.k_damp = 1.0e-5
+            entry.particle_radius = 0.004
+            return entry
         from pxr import Usd
 
         stage = Usd.Stage.Open(self.cfg.spawn.usd_path)
@@ -493,9 +514,7 @@ class GaussianTwinDeformableObject(DeformableObject):
             raise RuntimeError("Newton state is unavailable while initializing the Gaussian twin.")
         _bake_aligned_background_gaussian_scale(model)
         if indices.min() < 0 or indices.max() >= self._particles_per_body:
-            raise ValueError(
-                "Gaussian skinning influences must index vertices of this asset's simulation TetMesh."
-            )
+            raise ValueError("Gaussian skinning influences must index vertices of this asset's simulation TetMesh.")
         if tet_indices.min() < 0 or tet_indices.max() >= self._particles_per_body:
             raise ValueError("TetMesh connectivity must index vertices of this deformable object.")
         labels = getattr(model, "shape_label", [])
