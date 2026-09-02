@@ -70,6 +70,14 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--rigid-simulation",
+    action="store_true",
+    help=(
+        "Use standard MJWarp rigid-body dynamics for Gaussian-twin packages. "
+        "The TetMesh boundary becomes a convex rigid collision proxy and splats follow it rigidly."
+    ),
+)
+parser.add_argument(
     "--gamepad_device",
     "--gamepad-device",
     type=str,
@@ -333,6 +341,8 @@ def main() -> None:  # noqa: C901
         os.environ["ISAACLAB_DISABLE_ALIGNED_BACKGROUND"] = "1"
     if args_cli.dexsuite_simulation is not None:
         os.environ["ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION"] = args_cli.dexsuite_simulation
+    if args_cli.rigid_simulation:
+        os.environ["ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION"] = "1"
     env_cfg, _ = resolve_task_config(args_cli.task, None, overrides=hydra_args)
     env_cfg.sim.device = args_cli.device
     env_cfg.scene.num_envs = args_cli.num_envs

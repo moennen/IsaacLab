@@ -222,6 +222,17 @@ Use ``--dexsuite-simulation fast-kinematic`` for the corresponding four-substep,
 preset. These modes are mutually exclusive with the Gaussian twin fast and balanced presets and
 are intentionally one-way: the deformable body does not exert reaction forces on the Franka.
 
+For a rigid-baseline benchmark, pass ``--rigid-simulation``. This uses the task's standard MJWarp
+rigid-body solver, deactivates the package TetMesh's deformable import, and uses its boundary as a
+convex rigid collision proxy. The Gaussian field is attached to that body and therefore follows its
+pose rigidly, without VBD or Gaussian skinning updates. It is mutually exclusive with all deformable
+simulation presets. Set ``ISAACLAB_GAUSSIAN_TWIN_RIGID_MASS`` to choose the per-package mass in kg
+(default: ``0.05``). Rigid mode spawns the first ``ISAACLAB_GAUSSIAN_TWIN_NUM_OBJECTS`` packages
+deterministically; unlike deformable mode, it does not reset-randomize preloaded slots.
+The **Show Gaussian Twin TetMesh** viewer checkbox renders the exact tetrahedral boundary in rigid
+mode through the same dynamic-mesh path used for VBD TetMeshes. It is independent of the Gaussian
+visibility checkbox.
+
 The native proxy-coupled demonstration defaults to the ``demo`` coupling profile: one proxy
 iteration, mass scale ``1000``, and feedback relaxation ``0.1``. Set
 ``ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE`` to ``balanced`` or ``accurate`` to select a more

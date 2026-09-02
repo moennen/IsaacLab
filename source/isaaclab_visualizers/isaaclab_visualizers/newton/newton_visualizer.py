@@ -104,6 +104,75 @@ def _set_gaussian_twin_updates_enabled(enabled: bool) -> None:
     set_gaussian_twin_updates_enabled(enabled)
 
 
+def _rotate_points_by_quaternion(points: np.ndarray, quaternion: np.ndarray) -> np.ndarray:
+    """Rotate ``points`` by a scalar-last quaternion without a GPU round trip."""
+    xyz = quaternion[:3]
+    cross_1 = np.cross(xyz, points)
+    return points + 2.0 * (quaternion[3] * cross_1 + np.cross(xyz, cross_1))
+
+
+def _log_rigid_gaussian_twin_tetmeshes(viewer, state) -> None:
+    """Submit rigid Gaussian-twin boundaries through RTX's direct-mesh path.
+
+    ViewerRTX can dynamically hide a direct mesh (the path used for Newton's
+    VBD triangles), but an initially hidden shape instance remains hidden by
+    its USD batch hierarchy.  Rigid boundary diagnostics therefore use direct
+    meshes.  This debug-only path copies the comparatively small TetMesh
+    boundary to the host once per displayed frame and correctly follows each
+    rigid body's pose.
+    """
+    model = getattr(viewer, "model", None)
+    if model is None or not hasattr(model, "shape_label"):
+        return
+
+    shape_indices = [
+        index for index, label in enumerate(model.shape_label) if str(label).endswith("/RigidTetMeshVisual")
+    ]
+    if not shape_indices:
+        return
+
+    visible = bool(viewer.show_triangles) and not viewer._layer_force_hidden()
+    # Build the direct mesh once so OVRTX has a topology to reveal later, but
+    # do no CPU/GPU synchronization in normal render frames while this debug
+    # display is disabled.
+    if not visible and viewer._phase != viewer._PHASE_BUILD:
+        return
+
+    body_q = state.body_q.numpy()
+    shape_transforms = model.shape_transform.numpy()
+    shape_bodies = model.shape_body.numpy()
+    shape_worlds = model.shape_world.numpy()
+    world_offsets = viewer.world_offsets.numpy() if viewer.world_offsets is not None else None
+
+    for shape_index in shape_indices:
+        mesh = model.shape_source[shape_index]
+        if mesh is None:
+            continue
+        points = np.asarray(mesh.vertices, dtype=np.float32)
+        indices = np.asarray(mesh.indices, dtype=np.int32)
+        if points.size == 0 or indices.size == 0:
+            continue
+
+        shape_xform = shape_transforms[shape_index]
+        points = _rotate_points_by_quaternion(points, shape_xform[3:]) + shape_xform[:3]
+        body_index = int(shape_bodies[shape_index])
+        if body_index >= 0:
+            body_xform = body_q[body_index]
+            points = _rotate_points_by_quaternion(points, body_xform[3:]) + body_xform[:3]
+        world_index = int(shape_worlds[shape_index])
+        if world_offsets is not None and world_index >= 0:
+            points += world_offsets[world_index]
+
+        viewer.log_mesh(
+            f"/debug/gaussian_twin_rigid_tetmesh_{shape_index}",
+            wp.array(points, dtype=wp.vec3, device=viewer.device),
+            wp.array(indices, dtype=wp.int32, device=viewer.device),
+            hidden=not visible,
+            backface_culling=False,
+            color=(0.25, 0.7, 1.0),
+        )
+
+
 _BACKEND_DISPLAY_NAMES = {
     "physx": "PhysX",
     "ovphysx": "OVPhysX",
@@ -740,6 +809,11 @@ class NewtonViewerRTX(_NewtonViewerUIMixin, ViewerRTX):
             wp.copy(self._rtx_frame_copy, pixels)
             pixels = self._rtx_frame_copy
         super()._blit_to_window(pixels)
+
+    def log_state(self, state) -> None:
+        """Render rigid Gaussian-twin TetMesh diagnostics before RTX submission."""
+        super().log_state(state)
+        _log_rigid_gaussian_twin_tetmeshes(self, state)
 
     def get_frame(self) -> np.ndarray:
         """Return the latest OVRTX LDR framebuffer as contiguous RGB pixels."""

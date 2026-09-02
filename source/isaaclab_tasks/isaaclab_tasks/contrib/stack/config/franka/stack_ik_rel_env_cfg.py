@@ -22,7 +22,7 @@ from isaaclab_newton.sim.schemas import NewtonDeformableBodyPropertiesCfg
 from isaaclab_newton.sim.spawners.materials import NewtonDeformableBodyMaterialCfg, NewtonMaterialCfg
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.assets.deformable_object import DeformableObjectCfg
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.devices.device_base import DevicesCfg
@@ -31,6 +31,7 @@ from isaaclab.devices.spacemouse import Se3SpaceMouseCfg
 from isaaclab.envs.mdp.actions.actions_cfg import (
     DifferentialInverseKinematicsActionCfg,
 )
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sim.schemas.schemas_cfg import MeshCollisionBaseCfg
@@ -40,7 +41,7 @@ from isaaclab.utils.configclass import configclass
 
 from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 from isaaclab_contrib.custom_coupling import CoupledFeatherstoneVBDSolverCfg
-from isaaclab_contrib.deformable.gaussian_twin import GaussianTwinDeformableObject
+from isaaclab_contrib.deformable.gaussian_twin import GaussianTwinDeformableObject, GaussianTwinRigidUsdFileCfg
 
 from isaaclab_tasks.contrib.stack.stack_env_cfg import PhysicsCfg, mdp
 from isaaclab_tasks.utils import PresetCfg
@@ -330,6 +331,21 @@ class GaussianTwinCfg(PresetCfg):
 
 
 @configclass
+class GaussianTwinRigidCfg(PresetCfg):
+    """Rigid-body benchmark form of a packaged Gaussian twin."""
+
+    newton_mjwarp: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/GaussianTwin",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.5, 0.0, 0.05)),
+        spawn=GaussianTwinRigidUsdFileCfg(
+            usd_path=os.environ.get("ISAACLAB_GAUSSIAN_TWIN_ASSET", ""),
+            make_uninstanceable=True,
+        ),
+    )
+    default = newton_mjwarp
+
+
+@configclass
 class GaussianTwinPhysicsCfg(PhysicsCfg):
     """Newton proxy coupling required for rigid Franka contact with the TetMesh."""
 
@@ -464,15 +480,23 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             "on",
         }
         dexsuite_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION", "").strip().lower()
+        rigid_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         if dexsuite_simulation and dexsuite_simulation not in _DEXSUITE_SIMULATION_PROFILES:
             choices = ", ".join(_DEXSUITE_SIMULATION_PROFILES)
             raise ValueError(
                 f"ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION must be one of {choices}, got '{dexsuite_simulation}'."
             )
-        if sum((balanced_simulation, fast_simulation, bool(dexsuite_simulation))) > 1:
+        if sum((balanced_simulation, fast_simulation, bool(dexsuite_simulation), rigid_simulation)) > 1:
             raise ValueError(
-                "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION, ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION, and "
-                "ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION are mutually exclusive."
+                "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION, "
+                "ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION, "
+                "ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION, and "
+                "ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION are mutually exclusive."
             )
         configured_num_objects = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_NUM_OBJECTS")
         if configured_num_objects is not None:
@@ -512,13 +536,15 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             asset_paths = sorted(
                 {*asset_dir.glob("baked.*_package.usda"), *asset_dir.glob("baked.*_skinned_vbd_tet.usda")}
             )
-        if len(asset_paths) < self.num_slots:
+        required_assets = self.num_objects if rigid_simulation else self.num_slots
+        if len(asset_paths) < required_assets:
             raise ValueError(
-                f"Expected at least {self.num_slots} Gaussian twin packages, found {len(asset_paths)}. "
+                f"Expected at least {required_assets} Gaussian twin packages, found {len(asset_paths)}. "
                 "Set ISAACLAB_GAUSSIAN_TWIN_ASSET to one package or ISAACLAB_GAUSSIAN_TWIN_DIR to a package directory."
             )
-        if not 1 <= self.num_objects <= self.num_slots:
-            raise ValueError(f"num_objects must be in [1, {self.num_slots}], got {self.num_objects}.")
+        max_objects = len(asset_paths) if rigid_simulation else self.num_slots
+        if not 1 <= self.num_objects <= max_objects:
+            raise ValueError(f"num_objects must be in [1, {max_objects}], got {self.num_objects}.")
         splat_deformation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_SPLAT_DEFORMATION", "position-rotation-scale")
         valid_splat_deformations = {"position", "position-rotation", "position-rotation-scale"}
         if splat_deformation not in valid_splat_deformations:
@@ -526,17 +552,31 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 "ISAACLAB_GAUSSIAN_TWIN_SPLAT_DEFORMATION must be one of "
                 f"{', '.join(sorted(valid_splat_deformations))}, got '{splat_deformation}'."
             )
-        base_cfg = GaussianTwinCfg().newton_mjwarp_vbd_proxy
-        for slot_index, asset_path in enumerate(asset_paths[: self.num_slots]):
+        if rigid_simulation:
+            rigid_mass = _optional_nonnegative_float_env("ISAACLAB_GAUSSIAN_TWIN_RIGID_MASS", 0.05, positive=True)
+            base_cfg = GaussianTwinRigidCfg().newton_mjwarp
+            # There is no particle state to reset-select in rigid mode. Spawn
+            # the requested number of packages deterministically instead.
+            selected_paths = asset_paths[: self.num_objects]
+            position_count = self.num_objects
+        else:
+            rigid_mass = None
+            base_cfg = GaussianTwinCfg().newton_mjwarp_vbd_proxy
+            selected_paths = asset_paths[: self.num_slots]
+            position_count = self.num_slots
+        for slot_index, asset_path in enumerate(selected_paths):
             slot_cfg = base_cfg.replace(
                 prim_path=f"{{ENV_REGEX_NS}}/GaussianTwin_{slot_index}",
                 spawn=base_cfg.spawn.replace(usd_path=str(asset_path)),
             )
-            slot_cfg.init_state.pos = _gaussian_twin_slot_position(slot_index, self.num_slots)
-            slot_cfg.slot_index = slot_index
-            slot_cfg.num_objects = self.num_objects
-            slot_cfg.num_slots = self.num_slots
-            slot_cfg.splat_deformation = splat_deformation
+            slot_cfg.init_state.pos = _gaussian_twin_slot_position(slot_index, position_count)
+            if rigid_simulation:
+                slot_cfg.spawn.rigid_mass = rigid_mass
+            else:
+                slot_cfg.slot_index = slot_index
+                slot_cfg.num_objects = self.num_objects
+                slot_cfg.num_slots = self.num_slots
+                slot_cfg.splat_deformation = splat_deformation
             setattr(self.scene, f"gaussian_twin_{slot_index}", slot_cfg)
         # Newton can report a rank-deficient first-step Jacobian for the legacy stack robot.
         # Use the rank-aware SVD IK solver instead of DLS' explicit matrix inverse.
@@ -546,7 +586,34 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             ik_method="svd",
             ik_params={"min_singular_value": 1e-4},
         )
-        if dexsuite_simulation:
+        if rigid_simulation:
+            # ``super().__post_init__`` already installed the task's standard
+            # MJWarp rigid-body configuration. Keep it intact for a direct
+            # apples-to-apples benchmark against the VBD/proxy variants.
+            # Unlike deformable objects, rigid objects have no particle-reset
+            # implementation. Restore only their root poses and velocities on
+            # reset; resetting the whole scene here would run after the robot
+            # joint-randomization event and undo that event's result.
+            for slot_index in range(self.num_objects):
+                setattr(
+                    self.events,
+                    f"reset_rigid_gaussian_twin_{slot_index}",
+                    EventTerm(
+                        func=mdp.reset_root_state_uniform,
+                        mode="reset",
+                        params={
+                            "pose_range": {},
+                            "velocity_range": {},
+                            "asset_cfg": SceneEntityCfg(f"gaussian_twin_{slot_index}"),
+                        },
+                    ),
+                )
+            _LOGGER.info(
+                "Enabled Gaussian twin rigid benchmark: standard MJWarp with %d fixed package(s), %.3f kg each.",
+                self.num_objects,
+                rigid_mass,
+            )
+        elif dexsuite_simulation:
             substeps, iterations, velocity_limit_scale = _DEXSUITE_SIMULATION_PROFILES[dexsuite_simulation]
             self.sim.physics = GaussianTwinPhysicsCfg().newton_dexsuite_kinematic
             solver_cfg = self.sim.physics.solver_cfg
@@ -590,7 +657,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 proxy_cfg.mass_scale,
                 proxy_cfg.proxy_relaxation,
             )
-        if self.num_objects > 1:
+        if self.num_objects > 1 and not rigid_simulation:
             # VBD disables particle--particle contact by default.  This leaves
             # independently imported TetMeshes ghosting through one another.
             # These are contact-detection radii in metres, sized for the

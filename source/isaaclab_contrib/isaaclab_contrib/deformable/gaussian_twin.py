@@ -16,16 +16,126 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import warp as wp
 from isaaclab_newton.physics import NewtonManager as SimulationManager
 
+from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+from isaaclab.sim.utils import clone, get_current_stage
+from isaaclab.utils.configclass import configclass
+
 from .deformable_object import DeformableObject
+
+if TYPE_CHECKING:
+    from pxr import Usd
 
 SKIN_NAMESPACE = "newton:deformableSkin"
 _DEXSUITE_SIMULATION_MODES = {"stable-kinematic", "fast-kinematic"}
+
+
+def _tetmesh_surface_triangles(tet_indices: np.ndarray) -> np.ndarray:
+    """Return the boundary triangles of a tetrahedral mesh.
+
+    The rigid benchmark uses this low-resolution boundary as a convex collision
+    proxy. Interior tetrahedron faces must be removed; otherwise they make the
+    convexifier needlessly expensive and can produce non-manifold input.
+    """
+    tetrahedra = np.asarray(tet_indices, dtype=np.int32).reshape(-1, 4)
+    faces: dict[tuple[int, int, int], tuple[int, int, int] | None] = {}
+    for a, b, c, d in tetrahedra:
+        for face in ((a, c, b), (a, b, d), (a, d, c), (b, c, d)):
+            oriented = tuple(int(index) for index in face)
+            key = tuple(sorted(oriented))
+            faces[key] = None if key in faces else oriented
+    surface = [face for face in faces.values() if face is not None]
+    if not surface:
+        raise ValueError("Gaussian twin TetMesh has no boundary triangles for rigid collision.")
+    return np.asarray(surface, dtype=np.int32)
+
+
+@clone
+def spawn_gaussian_twin_rigid(
+    prim_path: str,
+    cfg: UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Spawn a Gaussian-twin package as one MJWarp rigid body.
+
+    A bare ``UsdGeom.TetMesh`` is imported by Newton as a soft body even
+    without deformable schemas. This spawner replaces it with a static copy of
+    its boundary as a convex collision mesh, then attaches the package's
+    Gaussian field to the enclosing rigid body. The Gaussian renderer thereby
+    follows rigid-body motion without dynamic skinning updates.
+    """
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    root_prim = spawn_from_usd(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
+    stage = get_current_stage()
+    # The authored VisualMesh is useful to inspect package contents but would
+    # otherwise occlude the Gaussian field in the rigid benchmark.
+    for prim in Usd.PrimRange(root_prim):
+        if prim.IsA(UsdGeom.Mesh):
+            UsdGeom.Imageable(prim).MakeInvisible()
+    tet_prim = next((prim for prim in Usd.PrimRange(root_prim) if prim.IsA(UsdGeom.TetMesh)), None)
+    if tet_prim is None:
+        raise ValueError(f"Gaussian twin asset at '{prim_path}' has no TetMesh prim for rigid collision.")
+
+    tet_mesh = UsdGeom.TetMesh(tet_prim)
+    points = np.asarray(tet_mesh.GetPointsAttr().Get(), dtype=np.float32)
+    tet_indices = np.asarray(tet_mesh.GetTetVertexIndicesAttr().Get(), dtype=np.int32)
+    if points.ndim != 2 or points.shape[1] != 3 or tet_indices.size == 0:
+        raise ValueError(f"Gaussian twin TetMesh '{tet_prim.GetPath()}' has invalid rigid-collision geometry.")
+    surface = _tetmesh_surface_triangles(tet_indices)
+
+    def _author_surface_mesh(path: str) -> UsdGeom.Mesh:
+        """Author the extracted surface with a consistent triangle topology."""
+        mesh = UsdGeom.Mesh.Define(stage, path)
+        mesh.CreatePointsAttr().Set(points)
+        mesh.CreateFaceVertexCountsAttr().Set([3] * len(surface))
+        mesh.CreateFaceVertexIndicesAttr().Set(surface.reshape(-1))
+        mesh.CreateSubdivisionSchemeAttr().Set("none")
+        return mesh
+
+    # Keep physics and diagnostics as two distinct shapes. A convex collision
+    # shape is not a dependable visual representation: Newton may replace it
+    # by generated hulls. The visual copy preserves the original TetMesh
+    # boundary and is selected by the viewer TetMesh checkbox.
+    collision_path = f"{prim_path}/RigidCollisionMesh"
+    collision_mesh = _author_surface_mesh(collision_path)
+    UsdGeom.Imageable(collision_mesh).MakeInvisible()
+    collision_prim = collision_mesh.GetPrim()
+    UsdPhysics.CollisionAPI.Apply(collision_prim)
+    UsdPhysics.MeshCollisionAPI.Apply(collision_prim).CreateApproximationAttr().Set("convexHull")
+
+    visual_mesh = _author_surface_mesh(f"{prim_path}/RigidTetMeshVisual")
+    visual_mesh.CreateDisplayColorAttr().Set([(0.25, 0.7, 1.0)])
+    UsdGeom.Imageable(visual_mesh).MakeInvisible()
+
+    mass = float(getattr(cfg, "rigid_mass", 0.05))
+    if not np.isfinite(mass) or mass <= 0.0:
+        raise ValueError(f"Gaussian twin rigid mass must be finite and positive, got {mass}.")
+    UsdPhysics.RigidBodyAPI.Apply(root_prim)
+    UsdPhysics.MassAPI.Apply(root_prim).CreateMassAttr().Set(mass)
+
+    # Do this after extracting its boundary so Newton cannot interpret the
+    # original TetMesh as a legacy volume deformable.
+    tet_prim.SetActive(False)
+    return root_prim
+
+
+@configclass
+class GaussianTwinRigidUsdFileCfg(UsdFileCfg):
+    """USD package configuration for the Gaussian-twin rigid benchmark."""
+
+    func = "{DIR}.gaussian_twin:spawn_gaussian_twin_rigid"
+
+    rigid_mass: float = 0.05
+    """Rigid-body mass of one Gaussian-twin package [kg]."""
 
 
 def _env_flag(name: str) -> bool:
