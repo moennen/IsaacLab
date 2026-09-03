@@ -173,6 +173,62 @@ def _log_rigid_gaussian_twin_tetmeshes(viewer, state) -> None:
         )
 
 
+def _log_simplicits_gaussian_twin_cubature_points(viewer, state) -> None:
+    """Render Simplicits quadrature points with the Gaussian-twin TetMesh diagnostic.
+
+    Simplicits has no TetMesh. Its collision and elasticity integration use
+    the RKPM quadrature points stored in the Newton particle slice instead.
+    Showing that slice when ``Show Gaussian Twin TetMesh`` is enabled makes
+    the debug control useful for all three task backends: VBD's TetMesh,
+    rigid's boundary mesh, and Simplicits' cubature cloud.
+    """
+    model = getattr(viewer, "model", None)
+    start = getattr(model, "simplicits_particle_start", None) if model is not None else None
+    end = getattr(model, "simplicits_particle_end", None) if model is not None else None
+    if start is None or end is None or int(end) <= int(start):
+        return
+
+    # The Gaussian-twin Simplicits task owns the complete Newton particle
+    # array. Avoid an indexed gather (and its per-frame allocation) while
+    # retaining an explicit guard should another task later share the model.
+    if int(start) != 0 or int(end) != int(getattr(model, "particle_count", 0)):
+        if not getattr(viewer, "_simplicits_cubature_warning_emitted", False):
+            logger.warning(
+                "Skipping Simplicits cubature debug points: the Gaussian twin does not own the complete particle array."
+            )
+            viewer._simplicits_cubature_warning_emitted = True
+        return
+
+    count = int(end) - int(start)
+    visible = bool(viewer.show_triangles) and not viewer._layer_force_hidden()
+    was_visible = getattr(viewer, "_simplicits_cubature_visible", False)
+    # Do not re-submit the cubature cloud while its diagnostic checkbox is
+    # off.  A one-time hidden submission remains necessary when a visible
+    # cloud is switched off so OVRTX removes its prior frame's points.
+    if not visible and not was_visible and viewer._phase != viewer._PHASE_BUILD:
+        return
+    viewer._simplicits_cubature_visible = visible
+
+    color = getattr(viewer, "_simplicits_cubature_color", None)
+    if color is None or len(color) != count or color.device != viewer.device:
+        color = wp.full(shape=count, value=wp.vec3(1.0, 0.25, 0.05), dtype=wp.vec3, device=viewer.device)
+        viewer._simplicits_cubature_color = color
+    radii = getattr(viewer, "_simplicits_cubature_radii", None)
+    if radii is None or len(radii) != count or radii.device != viewer.device:
+        # Make the sparse RKPM samples legible without representing their
+        # physical contact radius as a solid volume.
+        radii = wp.full(shape=count, value=0.006, dtype=float, device=viewer.device)
+        viewer._simplicits_cubature_radii = radii
+
+    viewer.log_points(
+        "/debug/gaussian_twin_simplicits_cubature",
+        state.particle_q,
+        radii=radii,
+        colors=color,
+        hidden=not visible,
+    )
+
+
 _BACKEND_DISPLAY_NAMES = {
     "physx": "PhysX",
     "ovphysx": "OVPhysX",
@@ -811,9 +867,10 @@ class NewtonViewerRTX(_NewtonViewerUIMixin, ViewerRTX):
         super()._blit_to_window(pixels)
 
     def log_state(self, state) -> None:
-        """Render rigid Gaussian-twin TetMesh diagnostics before RTX submission."""
+        """Render Gaussian-twin mesh and RKPM-cubature diagnostics before RTX submission."""
         super().log_state(state)
         _log_rigid_gaussian_twin_tetmeshes(self, state)
+        _log_simplicits_gaussian_twin_cubature_points(self, state)
 
     def get_frame(self) -> np.ndarray:
         """Return the latest OVRTX LDR framebuffer as contiguous RGB pixels."""

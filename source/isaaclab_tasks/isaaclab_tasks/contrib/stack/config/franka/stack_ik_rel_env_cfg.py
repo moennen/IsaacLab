@@ -40,8 +40,9 @@ from isaaclab.sim.spawners.materials import UsdPhysicsRigidBodyMaterialCfg
 from isaaclab.utils.configclass import configclass
 
 from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
-from isaaclab_contrib.custom_coupling import CoupledFeatherstoneVBDSolverCfg
+from isaaclab_contrib.custom_coupling import CoupledFeatherstoneVBDSolverCfg, CoupledMJWarpSimplicitsSolverCfg
 from isaaclab_contrib.deformable.gaussian_twin import GaussianTwinDeformableObject, GaussianTwinRigidUsdFileCfg
+from isaaclab_contrib.deformable.gaussian_twin_simplicits import GaussianTwinSimplicitsCfg as GaussianTwinSimplicitsAssetCfg
 
 from isaaclab_tasks.contrib.stack.stack_env_cfg import PhysicsCfg, mdp
 from isaaclab_tasks.utils import PresetCfg
@@ -346,6 +347,21 @@ class GaussianTwinRigidCfg(PresetCfg):
 
 
 @configclass
+class GaussianTwinSimplicitsPresetCfg(PresetCfg):
+    """RKPM-packaged Gaussian twin driven by Kaolin Simplicits."""
+
+    newton_mjwarp_simplicits: AssetBaseCfg = GaussianTwinSimplicitsAssetCfg(
+        prim_path="{ENV_REGEX_NS}/GaussianTwin",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.5, 0.0, 0.05)),
+        spawn=UsdFileCfg(
+            usd_path=os.environ.get("ISAACLAB_GAUSSIAN_TWIN_ASSET", ""),
+            make_uninstanceable=True,
+        ),
+    )
+    default = newton_mjwarp_simplicits
+
+
+@configclass
 class GaussianTwinPhysicsCfg(PhysicsCfg):
     """Newton proxy coupling required for rigid Franka contact with the TetMesh."""
 
@@ -447,6 +463,42 @@ class GaussianTwinPhysicsCfg(PhysicsCfg):
         ),
         num_substeps=8,
     )
+    newton_mjwarp_simplicits = NewtonCfg(
+        solver_cfg=CoupledMJWarpSimplicitsSolverCfg(
+            rigid_solver_cfg=MJWarpSolverCfg(
+                solver="newton",
+                integrator="implicitfast",
+                use_mujoco_contacts=True,
+                njmax=600,
+                nconmax=400,
+                ls_iterations=20,
+                iterations=100,
+                ccd_iterations=20,
+            ),
+            # Filled from the selected package slots during task construction.
+            asset_paths=[],
+            slot_positions=[],
+            num_newton_steps=2,
+            cg_iterations=32,
+            # RKPM quadrature points are much sparser than the VBD TetMesh
+            # vertices.  A 4 mm radius leaves gaps wide enough for a Franka
+            # finger to pass entirely between samples, so use 12 mm for this
+            # deliberately coarse 2,048-point diagnostic profile.
+            collision_particle_radius=0.012,
+            soft_contact_ke=_DEXSUITE_SOFT_CONTACT_KE,
+            soft_contact_mu=1.0,
+            soft_contact_coefficient=0.05,
+            max_quadrature_points=2048,
+        ),
+        # Keep the standard particle-to-rigid contact path.  The custom
+        # Simplicits assembler imports its rigid meshes before Isaac Lab's
+        # normal force-SDF preparation hook, so full-surface SDF contacts are
+        # intentionally deferred until that lifecycle is made explicit here.
+        collision_cfg=NewtonCollisionPipelineCfg(),
+        default_shape_cfg=NewtonShapeCfg(ke=_DEXSUITE_SHAPE_CONTACT_KE, kd=_DEXSUITE_CONTACT_KD, mu=1.0),
+        num_substeps=2,
+        use_cuda_graph=False,
+    )
     default = newton_mjwarp_vbd_proxy
 
 
@@ -480,6 +532,12 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             "on",
         }
         dexsuite_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION", "").strip().lower()
+        simplicits_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         rigid_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION", "").lower() in {
             "1",
             "true",
@@ -491,11 +549,12 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             raise ValueError(
                 f"ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION must be one of {choices}, got '{dexsuite_simulation}'."
             )
-        if sum((balanced_simulation, fast_simulation, bool(dexsuite_simulation), rigid_simulation)) > 1:
+        if sum((balanced_simulation, fast_simulation, bool(dexsuite_simulation), simplicits_simulation, rigid_simulation)) > 1:
             raise ValueError(
                 "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION, "
                 "ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION, "
                 "ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION, and "
+                "ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION, and "
                 "ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION are mutually exclusive."
             )
         configured_num_objects = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_NUM_OBJECTS")
@@ -518,6 +577,28 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             asset_paths = [Path(asset_path).expanduser()]
             if not asset_paths[0].is_file():
                 raise ValueError(f"Gaussian twin asset does not exist: '{asset_paths[0]}'.")
+            if simplicits_simulation and not asset_paths[0].name.endswith("_simplicits_rkpm.usda"):
+                # A single-asset override commonly remains exported from a
+                # prior VBD/rigid run.  The RKPM package is its sibling and
+                # is the only form that carries Kaolin's skinned-physics
+                # attributes. Resolve that paired package transparently so
+                # ``--simplicits-simulation`` is safe to add to an existing
+                # teleop command.
+                name = asset_paths[0].name
+                for source_suffix in ("_package.usda", "_skinned_vbd_tet.usda"):
+                    if name.endswith(source_suffix):
+                        candidate = asset_paths[0].with_name(
+                            f"{name[: -len(source_suffix)]}_simplicits_rkpm.usda"
+                        )
+                        if candidate.is_file():
+                            asset_paths = [candidate]
+                        break
+                if not asset_paths[0].name.endswith("_simplicits_rkpm.usda"):
+                    raise ValueError(
+                        f"Simplicits mode requires an RKPM package, but '{asset_path}' is a VBD/rigid package. "
+                        "Set ISAACLAB_GAUSSIAN_TWIN_ASSET to baked.*_simplicits_rkpm.usda, or package it with "
+                        "scripts/tools/package_kaolin_simplicits_gaussian_asset.py."
+                    )
             self.num_slots = 1
         else:
             asset_dir_value = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DIR")
@@ -533,14 +614,26 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             # the DexSuite 4 mm / 512-node pipeline emits the equally valid
             # ``*_skinned_vbd_tet.usda`` form.  Both contain the same TetMesh
             # and baked Gaussian skinning contract consumed below.
-            asset_paths = sorted(
-                {*asset_dir.glob("baked.*_package.usda"), *asset_dir.glob("baked.*_skinned_vbd_tet.usda")}
-            )
+            if simplicits_simulation:
+                asset_paths = sorted(asset_dir.glob("baked.*_simplicits_rkpm.usda"))
+            else:
+                asset_paths = sorted(
+                    {*asset_dir.glob("baked.*_package.usda"), *asset_dir.glob("baked.*_skinned_vbd_tet.usda")}
+                )
         required_assets = self.num_objects if rigid_simulation else self.num_slots
         if len(asset_paths) < required_assets:
+            package_hint = (
+                "Simplicits mode requires assets named baked.*_simplicits_rkpm.usda produced by "
+                "scripts/tools/package_kaolin_simplicits_gaussian_asset.py."
+                if simplicits_simulation
+                else (
+                    "Set ISAACLAB_GAUSSIAN_TWIN_ASSET to one package or "
+                    "ISAACLAB_GAUSSIAN_TWIN_DIR to a package directory."
+                )
+            )
             raise ValueError(
                 f"Expected at least {required_assets} Gaussian twin packages, found {len(asset_paths)}. "
-                "Set ISAACLAB_GAUSSIAN_TWIN_ASSET to one package or ISAACLAB_GAUSSIAN_TWIN_DIR to a package directory."
+                f"{package_hint}"
             )
         max_objects = len(asset_paths) if rigid_simulation else self.num_slots
         if not 1 <= self.num_objects <= max_objects:
@@ -561,9 +654,21 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             position_count = self.num_objects
         else:
             rigid_mass = None
-            base_cfg = GaussianTwinCfg().newton_mjwarp_vbd_proxy
+            base_cfg = (
+                GaussianTwinSimplicitsPresetCfg().newton_mjwarp_simplicits
+                if simplicits_simulation
+                else GaussianTwinCfg().newton_mjwarp_vbd_proxy
+            )
             selected_paths = asset_paths[: self.num_slots]
             position_count = self.num_slots
+        if simplicits_simulation:
+            requested_splat_deformation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_SPLAT_DEFORMATION", "").strip()
+            if requested_splat_deformation and requested_splat_deformation != "position":
+                raise ValueError(
+                    "Simplicits Gaussian streaming currently supports position-only deformation; "
+                    "set ISAACLAB_GAUSSIAN_TWIN_SPLAT_DEFORMATION=position or leave it unset."
+                )
+            splat_deformation = "position"
         for slot_index, asset_path in enumerate(selected_paths):
             slot_cfg = base_cfg.replace(
                 prim_path=f"{{ENV_REGEX_NS}}/GaussianTwin_{slot_index}",
@@ -613,6 +718,20 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 self.num_objects,
                 rigid_mass,
             )
+        elif simplicits_simulation:
+            self.sim.physics = GaussianTwinPhysicsCfg().newton_mjwarp_simplicits
+            solver_cfg = self.sim.physics.solver_cfg
+            solver_cfg.asset_paths = [str(path) for path in selected_paths]
+            solver_cfg.slot_positions = [
+                _gaussian_twin_slot_position(slot_index, position_count) for slot_index in range(position_count)
+            ]
+            solver_cfg.enable_inter_object_collisions = self.num_objects > 1
+            _LOGGER.info(
+                "Enabled Gaussian twin Simplicits benchmark: MJWarp + RKPM Simplicits, %d slot(s), %d Newton x %d CG iterations.",
+                self.num_slots,
+                solver_cfg.num_newton_steps,
+                solver_cfg.cg_iterations,
+            )
         elif dexsuite_simulation:
             substeps, iterations, velocity_limit_scale = _DEXSUITE_SIMULATION_PROFILES[dexsuite_simulation]
             self.sim.physics = GaussianTwinPhysicsCfg().newton_dexsuite_kinematic
@@ -657,7 +776,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 proxy_cfg.mass_scale,
                 proxy_cfg.proxy_relaxation,
             )
-        if self.num_objects > 1 and not rigid_simulation:
+        if self.num_objects > 1 and not rigid_simulation and not simplicits_simulation:
             # VBD disables particle--particle contact by default.  This leaves
             # independently imported TetMeshes ghosting through one another.
             # These are contact-detection radii in metres, sized for the

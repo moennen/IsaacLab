@@ -6,6 +6,7 @@
 __all__ = [
     "CoupledFeatherstoneVBDSolverCfg",
     "CoupledMJWarpVBDSolverCfg",
+    "CoupledMJWarpSimplicitsSolverCfg",
 ]
 
-from .newton_manager_cfg import CoupledFeatherstoneVBDSolverCfg, CoupledMJWarpVBDSolverCfg
+from .newton_manager_cfg import CoupledFeatherstoneVBDSolverCfg, CoupledMJWarpSimplicitsSolverCfg, CoupledMJWarpVBDSolverCfg

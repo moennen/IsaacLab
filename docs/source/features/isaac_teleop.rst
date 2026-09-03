@@ -233,6 +233,40 @@ The **Show Gaussian Twin TetMesh** viewer checkbox renders the exact tetrahedral
 mode through the same dynamic-mesh path used for VBD TetMeshes. It is independent of the Gaussian
 visibility checkbox.
 
+For an experimental reduced-order baseline, first package the Gaussian assets with Kaolin's RKPM
+Simplicits constructor. The command below writes ``baked.*_simplicits_rkpm.usda`` beside each
+source package. It is an offline operation and can use a different CUDA device from teleoperation.
+
+.. code-block:: bash
+
+   cd /path/to/IsaacLab
+   IGNORE_TORCH_VER=1 uv pip install --no-build-isolation --no-config \
+       --python .venv/bin/python -e /path/to/kaolin --no-deps
+   uv pip install --python .venv/bin/python wget pygltflib plyfile
+   uv run --no-sync isaaclab -p scripts/tools/package_kaolin_simplicits_gaussian_asset.py \
+       --input-dir /path/to/gaussian_splat_toys --device cuda:1
+
+Then use the generated directory with ``--simplicits-simulation``:
+
+.. code-block:: bash
+
+   unset ISAACLAB_GAUSSIAN_TWIN_ASSET
+   export ISAACLAB_GAUSSIAN_TWIN_DIR=/path/to/gaussian_splat_toys
+   export ISAACLAB_GAUSSIAN_TWIN_NUM_SLOTS=1
+   export ISAACLAB_GAUSSIAN_TWIN_NUM_OBJECTS=1
+   uv run --no-sync isaaclab teleop run \
+       --task IsaacContrib-Stack-Gaussian-Twin-Franka-IK-Rel-Newton \
+       --simplicits-simulation --visualizer newton_rtx \
+       --teleop_device gamepad --gamepad-device /dev/input/js0 \
+       --num_envs 1 --device cuda:1
+
+This profile advances the Franka with MJWarp and each selected RKPM object with Kaolin's
+experimental Simplicits solver. It is deliberately one-way, matching the inexpensive contact
+topology used by the VBD benchmark; it is intended for visual/throughput comparison rather than
+sim-to-real force validation. It currently uses two physics substeps, two reduced Newton iterations,
+32 CG iterations, and at most 2048 quadrature points per object. ``--simplicits-simulation`` is
+mutually exclusive with the VBD, DexSuite, and rigid profiles.
+
 The native proxy-coupled demonstration defaults to the ``demo`` coupling profile: one proxy
 iteration, mass scale ``1000``, and feedback relaxation ``0.1``. Set
 ``ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE`` to ``balanced`` or ``accurate`` to select a more
