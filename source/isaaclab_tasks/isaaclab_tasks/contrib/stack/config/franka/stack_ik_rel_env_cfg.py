@@ -92,6 +92,7 @@ _GAUSSIAN_TWIN_PROXY_PROFILES = {
 
 _GAUSSIAN_TWIN_CONTACT_STIFFNESS = 3.0e4
 _GAUSSIAN_TWIN_CONTACT_DAMPING = 10.0
+_GAUSSIAN_TWIN_SOFT_CONTACT_FRICTION = 10.0
 _GAUSSIAN_TWIN_GRIPPER_EFFORT_LIMIT = 10.0
 
 
@@ -451,6 +452,7 @@ class GaussianTwinPhysicsCfg(PhysicsCfg):
             ],
             iterations=1,
         ),
+        soft_contact_cfg=NewtonSoftContactCfg(soft_contact_mu=_GAUSSIAN_TWIN_SOFT_CONTACT_FRICTION),
         num_substeps=4,
     )
     newton_dexsuite_kinematic = NewtonCfg(
@@ -561,6 +563,10 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             ) from error
         solver_cfg = self.sim.physics.solver_cfg
         proxy_cfg = solver_cfg.proxies[0]
+        self.sim.physics.soft_contact_cfg.soft_contact_mu = _optional_nonnegative_float_env(
+            "ISAACLAB_GAUSSIAN_TWIN_CONTACT_FRICTION",
+            _GAUSSIAN_TWIN_SOFT_CONTACT_FRICTION,
+        )
         full_surface_contact = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_FULL_SURFACE_CONTACT")
         proxy_cfg.collision_pipeline.enable_rigid_soft_full_surface_contact = full_surface_contact
         self.sim.physics.default_shape_cfg.force_sdf = full_surface_contact

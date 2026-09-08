@@ -21,6 +21,7 @@ _GAUSSIAN_TWIN_ENV_VARS = (
     "ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION",
     "ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION",
     "ISAACLAB_GAUSSIAN_TWIN_FULL_SURFACE_CONTACT",
+    "ISAACLAB_GAUSSIAN_TWIN_CONTACT_FRICTION",
     "ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE",
     "ISAACLAB_GAUSSIAN_TWIN_PROXY_ITERATIONS",
     "ISAACLAB_GAUSSIAN_TWIN_PROXY_MASS_SCALE",
@@ -52,6 +53,7 @@ def test_native_profile_uses_interactive_solver_and_soft_contact(monkeypatch, tm
     assert soft_solver.iterations == 10
     assert proxy.collision_pipeline.enable_rigid_soft_full_surface_contact is False
     assert physics.default_shape_cfg.force_sdf is False
+    assert physics.soft_contact_cfg.soft_contact_mu == pytest.approx(10.0)
     assert cfg.scene.robot.actuators["panda_hand"].joint_effort_limit == pytest.approx(10.0)
 
     newton_material = cfg.scene.robot.spawn.physics_material[1]
@@ -66,6 +68,12 @@ def test_full_surface_contact_is_explicit_opt_in(monkeypatch, tmp_path):
 
     assert proxy.collision_pipeline.enable_rigid_soft_full_surface_contact is True
     assert cfg.sim.physics.default_shape_cfg.force_sdf is True
+
+
+def test_native_contact_friction_can_be_overridden(monkeypatch, tmp_path):
+    cfg = _make_cfg(monkeypatch, tmp_path, ISAACLAB_GAUSSIAN_TWIN_CONTACT_FRICTION="4.0")
+
+    assert cfg.sim.physics.soft_contact_cfg.soft_contact_mu == pytest.approx(4.0)
 
 
 @pytest.mark.parametrize(

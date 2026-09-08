@@ -215,9 +215,11 @@ four 1/120 s substeps, 15 VBD iterations, and a 12.5 Hz-equivalent gripper drive
 and fast settings are mutually exclusive.
 
 The native default uses four substeps and 10 VBD iterations. It gives the VBD proxy a dedicated
-``30000 N/m`` contact stiffness, ``10 N*s/m`` damping, and a ``10 N`` per-finger effort limit;
+``30000 N/m`` contact stiffness, ``10 N*s/m`` damping, a soft-contact friction coefficient of
+``10``, and a ``10 N`` per-finger effort limit;
 the rigid stack task's much stiffer hydroelastic material is not appropriate for lightweight
-TetMesh vertices. Native mode uses particle contacts by default. Set
+TetMesh vertices. Override friction with ``ISAACLAB_GAUSSIAN_TWIN_CONTACT_FRICTION`` when an asset
+needs different surface behavior. Native mode uses particle contacts by default. Set
 ``ISAACLAB_GAUSSIAN_TWIN_FULL_SURFACE_CONTACT=1`` only when a coarse surface lets a finger pass
 between vertices; this enables edge/face contacts and SDF generation and is substantially more
 expensive. Packaged simulation meshes should avoid sliver tetrahedra and non-manifold boundary
