@@ -58,6 +58,9 @@ _LOGGER = logging.getLogger(__name__)
 _BALANCED_GAUSSIAN_TWIN_SUBSTEPS = 4
 _BALANCED_GAUSSIAN_TWIN_VBD_ITERATIONS = 15
 _BALANCED_GAUSSIAN_TWIN_DRIVE_FREQUENCY_RATIO = 12.5 / 25.0
+_GRASP_FAST_GAUSSIAN_TWIN_SUBSTEPS = 4
+_GRASP_FAST_GAUSSIAN_TWIN_VBD_ITERATIONS = 8
+_GRASP_FAST_GAUSSIAN_TWIN_MJWARP_ITERATIONS = 50
 _FAST_GAUSSIAN_TWIN_SUBSTEPS = 2
 _FAST_GAUSSIAN_TWIN_VBD_ITERATIONS = 10
 _FAST_GAUSSIAN_TWIN_DRIVE_FREQUENCY_RATIO = 7.5 / 25.0
@@ -101,9 +104,10 @@ def _boolean_env(name: str) -> bool:
     return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
 
-def _gaussian_twin_simulation_modes() -> tuple[bool, bool, str, bool, bool]:
+def _gaussian_twin_simulation_modes() -> tuple[bool, bool, bool, str, bool, bool]:
     """Read and validate the mutually exclusive Gaussian-twin simulation modes."""
     balanced = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION")
+    grasp_fast = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_GRASP_FAST_SIMULATION")
     fast = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION")
     dexsuite = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION", "").strip().lower()
     simplicits = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION")
@@ -111,15 +115,16 @@ def _gaussian_twin_simulation_modes() -> tuple[bool, bool, str, bool, bool]:
     if dexsuite and dexsuite not in _DEXSUITE_SIMULATION_PROFILES:
         choices = ", ".join(_DEXSUITE_SIMULATION_PROFILES)
         raise ValueError(f"ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION must be one of {choices}, got '{dexsuite}'.")
-    if sum((balanced, fast, bool(dexsuite), simplicits, rigid)) > 1:
+    if sum((balanced, grasp_fast, fast, bool(dexsuite), simplicits, rigid)) > 1:
         raise ValueError(
             "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION, "
+            "ISAACLAB_GAUSSIAN_TWIN_GRASP_FAST_SIMULATION, "
             "ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION, "
             "ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION, and "
             "ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION, and "
             "ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION are mutually exclusive."
         )
-    return balanced, fast, dexsuite, simplicits, rigid
+    return balanced, grasp_fast, fast, dexsuite, simplicits, rigid
 
 
 def _optional_positive_int_env(name: str, default: int) -> int:
@@ -589,6 +594,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
         super().__post_init__()
         (
             balanced_simulation,
+            grasp_fast_simulation,
             fast_simulation,
             dexsuite_simulation,
             simplicits_simulation,
@@ -801,23 +807,31 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             soft_solver.particle_self_contact_margin = 0.012
             soft_solver.particle_vertex_contact_buffer_size = 64
             soft_solver.particle_edge_contact_buffer_size = 128
-        if balanced_simulation or fast_simulation:
+        if balanced_simulation or grasp_fast_simulation or fast_simulation:
             if balanced_simulation:
                 substeps = _BALANCED_GAUSSIAN_TWIN_SUBSTEPS
                 iterations = _BALANCED_GAUSSIAN_TWIN_VBD_ITERATIONS
                 drive_frequency_ratio = _BALANCED_GAUSSIAN_TWIN_DRIVE_FREQUENCY_RATIO
                 drive_frequency = 12.5
                 profile_name = "balanced"
-            else:
+            elif fast_simulation:
                 substeps = _FAST_GAUSSIAN_TWIN_SUBSTEPS
                 iterations = _FAST_GAUSSIAN_TWIN_VBD_ITERATIONS
                 drive_frequency_ratio = _FAST_GAUSSIAN_TWIN_DRIVE_FREQUENCY_RATIO
                 drive_frequency = 7.5
                 profile_name = "fast"
-            # Both reference profiles retain the material and contact gains
-            # that make the toy graspable, while reducing temporal/nonlinear
-            # solve cost and lowering gripper bandwidth to match the coarser
-            # position-drive resolution.
+            else:
+                substeps = _GRASP_FAST_GAUSSIAN_TWIN_SUBSTEPS
+                iterations = _GRASP_FAST_GAUSSIAN_TWIN_VBD_ITERATIONS
+                drive_frequency_ratio = 1.0
+                drive_frequency = 25.0
+                profile_name = "grasp-fast"
+                self.sim.physics.solver_cfg.entries[
+                    0
+                ].solver_cfg.iterations = _GRASP_FAST_GAUSSIAN_TWIN_MJWARP_ITERATIONS
+            # All interactive profiles retain the material and contact gains.
+            # Grasp-fast preserves contact timing and hand bandwidth; the
+            # older fast profile trades both for more throughput.
             self.sim.physics.num_substeps = substeps
             self.sim.physics.solver_cfg.entries[1].solver_cfg.iterations = iterations
             hand = self.scene.robot.actuators["panda_hand"]

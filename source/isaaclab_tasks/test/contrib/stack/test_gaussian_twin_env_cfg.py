@@ -16,6 +16,7 @@ _GAUSSIAN_TWIN_ENV_VARS = (
     "ISAACLAB_GAUSSIAN_TWIN_ASSET",
     "ISAACLAB_GAUSSIAN_TWIN_DIR",
     "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION",
+    "ISAACLAB_GAUSSIAN_TWIN_GRASP_FAST_SIMULATION",
     "ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION",
     "ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION",
     "ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION",
@@ -77,19 +78,26 @@ def test_native_contact_friction_can_be_overridden(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("environment", "expected_substeps", "expected_iterations"),
+    ("environment", "expected_substeps", "expected_vbd_iterations", "expected_mjwarp_iterations"),
     [
-        ("ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION", 2, 10),
-        ("ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION", 4, 15),
+        ("ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION", 2, 10, 100),
+        ("ISAACLAB_GAUSSIAN_TWIN_GRASP_FAST_SIMULATION", 4, 8, 50),
+        ("ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION", 4, 15, 100),
     ],
 )
 def test_interactive_profiles_limit_vbd_work(
-    monkeypatch, tmp_path, environment, expected_substeps, expected_iterations
+    monkeypatch,
+    tmp_path,
+    environment,
+    expected_substeps,
+    expected_vbd_iterations,
+    expected_mjwarp_iterations,
 ):
     cfg = _make_cfg(monkeypatch, tmp_path, **{environment: "1"})
 
     assert cfg.sim.physics.num_substeps == expected_substeps
-    assert cfg.sim.physics.solver_cfg.entries[1].solver_cfg.iterations == expected_iterations
+    assert cfg.sim.physics.solver_cfg.entries[1].solver_cfg.iterations == expected_vbd_iterations
+    assert cfg.sim.physics.solver_cfg.entries[0].solver_cfg.iterations == expected_mjwarp_iterations
 
 
 def test_rigid_benchmark_keeps_parent_robot_material(monkeypatch, tmp_path):
