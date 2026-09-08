@@ -42,7 +42,9 @@ from isaaclab.utils.configclass import configclass
 from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 from isaaclab_contrib.custom_coupling import CoupledFeatherstoneVBDSolverCfg, CoupledMJWarpSimplicitsSolverCfg
 from isaaclab_contrib.deformable.gaussian_twin import GaussianTwinDeformableObject, GaussianTwinRigidUsdFileCfg
-from isaaclab_contrib.deformable.gaussian_twin_simplicits import GaussianTwinSimplicitsCfg as GaussianTwinSimplicitsAssetCfg
+from isaaclab_contrib.deformable.gaussian_twin_simplicits import (
+    GaussianTwinSimplicitsCfg as GaussianTwinSimplicitsAssetCfg,
+)
 
 from isaaclab_tasks.contrib.stack.stack_env_cfg import PhysicsCfg, mdp
 from isaaclab_tasks.utils import PresetCfg
@@ -51,14 +53,13 @@ from . import stack_joint_pos_env_cfg
 
 _LOGGER = logging.getLogger(__name__)
 
-# Match newton.examples.mujoco_vbd_gaussian_twin simulation presets. Isaac Lab
-# advances one 1/120 s physics tick at a time, whereas the example renders at
-# 60 Hz, so its per-frame substep counts are halved here.
+# Interactive native-coupling profiles. Isaac Lab advances one 1/120 s physics
+# tick at a time and repeats it four times per teleoperation action.
 _BALANCED_GAUSSIAN_TWIN_SUBSTEPS = 4
-_BALANCED_GAUSSIAN_TWIN_VBD_ITERATIONS = 45
+_BALANCED_GAUSSIAN_TWIN_VBD_ITERATIONS = 15
 _BALANCED_GAUSSIAN_TWIN_DRIVE_FREQUENCY_RATIO = 12.5 / 25.0
 _FAST_GAUSSIAN_TWIN_SUBSTEPS = 2
-_FAST_GAUSSIAN_TWIN_VBD_ITERATIONS = 30
+_FAST_GAUSSIAN_TWIN_VBD_ITERATIONS = 10
 _FAST_GAUSSIAN_TWIN_DRIVE_FREQUENCY_RATIO = 7.5 / 25.0
 
 # Match the policy-training VBD presets from
@@ -88,6 +89,36 @@ _GAUSSIAN_TWIN_PROXY_PROFILES = {
     "balanced": (2, 1.0e3, 0.35),
     "accurate": (4, 1.0e3, 1.0),
 }
+
+_GAUSSIAN_TWIN_CONTACT_STIFFNESS = 3.0e4
+_GAUSSIAN_TWIN_CONTACT_DAMPING = 10.0
+_GAUSSIAN_TWIN_GRIPPER_EFFORT_LIMIT = 10.0
+
+
+def _boolean_env(name: str) -> bool:
+    """Return whether an environment flag has a conventional truthy value."""
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _gaussian_twin_simulation_modes() -> tuple[bool, bool, str, bool, bool]:
+    """Read and validate the mutually exclusive Gaussian-twin simulation modes."""
+    balanced = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION")
+    fast = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION")
+    dexsuite = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION", "").strip().lower()
+    simplicits = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION")
+    rigid = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION")
+    if dexsuite and dexsuite not in _DEXSUITE_SIMULATION_PROFILES:
+        choices = ", ".join(_DEXSUITE_SIMULATION_PROFILES)
+        raise ValueError(f"ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION must be one of {choices}, got '{dexsuite}'.")
+    if sum((balanced, fast, bool(dexsuite), simplicits, rigid)) > 1:
+        raise ValueError(
+            "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION, "
+            "ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION, "
+            "ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION, and "
+            "ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION, and "
+            "ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION are mutually exclusive."
+        )
+    return balanced, fast, dexsuite, simplicits, rigid
 
 
 def _optional_positive_int_env(name: str, default: int) -> int:
@@ -388,7 +419,7 @@ class GaussianTwinPhysicsCfg(PhysicsCfg):
                 CouplerEntryCfg(
                     name="soft",
                     solver_cfg=VBDSolverCfg(
-                        iterations=60,
+                        iterations=10,
                         rigid_compliant_alm=True,
                         # Full-surface contacts can produce several records per
                         # TetMesh vertex while a finger closes.  Size the list
@@ -415,23 +446,12 @@ class GaussianTwinPhysicsCfg(PhysicsCfg):
                         r"/World/envs/env_[^/]+/Robot(?:/Geometry)?/.*panda_(left|right)finger",
                     ],
                     collide_interval=1,
-                    # Particle-only contacts let narrow fingers pass through a
-                    # coarse TetMesh between vertices.
-                    collision_pipeline=NewtonCollisionPipelineCfg(
-                        enable_rigid_soft_full_surface_contact=True,
-                    ),
+                    collision_pipeline=NewtonCollisionPipelineCfg(),
                 )
             ],
             iterations=1,
         ),
-        # Full-surface contact samples every participating mesh/convex SDF.
-        # Provision one for importer-added Franka collision shapes too; the
-        # task otherwise fails during CollisionPipeline construction as soon
-        # as it encounters an unprovisioned link mesh.
-        default_shape_cfg=NewtonShapeCfg(force_sdf=True),
-        # The Newton example derives this from the tet-mesh wave speed.  Use a conservative
-        # fixed value for the six random assets so the smallest elements are resolved too.
-        num_substeps=32,
+        num_substeps=4,
     )
     newton_dexsuite_kinematic = NewtonCfg(
         solver_cfg=CoupledFeatherstoneVBDSolverCfg(
@@ -517,46 +537,57 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
     num_slots: int = 1
     """Number of toy packages preloaded from the asset directory."""
 
+    def _configure_native_simulation(self) -> None:
+        """Configure the interactive MJWarp/VBD proxy path."""
+        self.sim.physics = GaussianTwinPhysicsCfg().newton_mjwarp_vbd_proxy
+        # The parent rigid-stack task authors 1e6 N/m hydroelastic contact
+        # for cube manipulation. Reusing it for VBD makes a contact with the
+        # lightest packaged TetMesh vertices extremely ill-conditioned.
+        self.scene.robot.spawn.physics_material = [
+            UsdPhysicsRigidBodyMaterialCfg(static_friction=2.0, dynamic_friction=2.0),
+            NewtonMaterialCfg(
+                contact_stiffness=_GAUSSIAN_TWIN_CONTACT_STIFFNESS,
+                contact_damping=_GAUSSIAN_TWIN_CONTACT_DAMPING,
+            ),
+        ]
+        self.scene.robot.actuators["panda_hand"].joint_effort_limit = _GAUSSIAN_TWIN_GRIPPER_EFFORT_LIMIT
+        coupling_profile = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE", "demo").strip().lower()
+        try:
+            proxy_iterations, proxy_mass_scale, proxy_relaxation = _GAUSSIAN_TWIN_PROXY_PROFILES[coupling_profile]
+        except KeyError as error:
+            choices = ", ".join(_GAUSSIAN_TWIN_PROXY_PROFILES)
+            raise ValueError(
+                f"ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE must be one of {choices}, got '{coupling_profile}'."
+            ) from error
+        solver_cfg = self.sim.physics.solver_cfg
+        proxy_cfg = solver_cfg.proxies[0]
+        full_surface_contact = _boolean_env("ISAACLAB_GAUSSIAN_TWIN_FULL_SURFACE_CONTACT")
+        proxy_cfg.collision_pipeline.enable_rigid_soft_full_surface_contact = full_surface_contact
+        self.sim.physics.default_shape_cfg.force_sdf = full_surface_contact
+        solver_cfg.iterations = _optional_positive_int_env("ISAACLAB_GAUSSIAN_TWIN_PROXY_ITERATIONS", proxy_iterations)
+        proxy_cfg.mass_scale = _optional_nonnegative_float_env(
+            "ISAACLAB_GAUSSIAN_TWIN_PROXY_MASS_SCALE", proxy_mass_scale, positive=True
+        )
+        proxy_cfg.proxy_relaxation = _optional_nonnegative_float_env(
+            "ISAACLAB_GAUSSIAN_TWIN_PROXY_RELAXATION", proxy_relaxation, positive=True
+        )
+        _LOGGER.info(
+            "Enabled Gaussian twin %s proxy coupling: %d iteration(s), %.0f mass scale, %.2f feedback relaxation.",
+            coupling_profile,
+            solver_cfg.iterations,
+            proxy_cfg.mass_scale,
+            proxy_cfg.proxy_relaxation,
+        )
+
     def __post_init__(self):
         super().__post_init__()
-        balanced_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION", "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        fast_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION", "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        dexsuite_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION", "").strip().lower()
-        simplicits_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION", "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        rigid_simulation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION", "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if dexsuite_simulation and dexsuite_simulation not in _DEXSUITE_SIMULATION_PROFILES:
-            choices = ", ".join(_DEXSUITE_SIMULATION_PROFILES)
-            raise ValueError(
-                f"ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION must be one of {choices}, got '{dexsuite_simulation}'."
-            )
-        if sum((balanced_simulation, fast_simulation, bool(dexsuite_simulation), simplicits_simulation, rigid_simulation)) > 1:
-            raise ValueError(
-                "ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION, "
-                "ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION, "
-                "ISAACLAB_GAUSSIAN_TWIN_DEXSUITE_SIMULATION, and "
-                "ISAACLAB_GAUSSIAN_TWIN_SIMPLICITS_SIMULATION, and "
-                "ISAACLAB_GAUSSIAN_TWIN_RIGID_SIMULATION are mutually exclusive."
-            )
+        (
+            balanced_simulation,
+            fast_simulation,
+            dexsuite_simulation,
+            simplicits_simulation,
+            rigid_simulation,
+        ) = _gaussian_twin_simulation_modes()
         configured_num_objects = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_NUM_OBJECTS")
         if configured_num_objects is not None:
             self.num_objects = int(configured_num_objects)
@@ -587,9 +618,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 name = asset_paths[0].name
                 for source_suffix in ("_package.usda", "_skinned_vbd_tet.usda"):
                     if name.endswith(source_suffix):
-                        candidate = asset_paths[0].with_name(
-                            f"{name[: -len(source_suffix)]}_simplicits_rkpm.usda"
-                        )
+                        candidate = asset_paths[0].with_name(f"{name[: -len(source_suffix)]}_simplicits_rkpm.usda")
                         if candidate.is_file():
                             asset_paths = [candidate]
                         break
@@ -632,8 +661,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 )
             )
             raise ValueError(
-                f"Expected at least {required_assets} Gaussian twin packages, found {len(asset_paths)}. "
-                f"{package_hint}"
+                f"Expected at least {required_assets} Gaussian twin packages, found {len(asset_paths)}. {package_hint}"
             )
         max_objects = len(asset_paths) if rigid_simulation else self.num_slots
         if not 1 <= self.num_objects <= max_objects:
@@ -727,7 +755,8 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             ]
             solver_cfg.enable_inter_object_collisions = self.num_objects > 1
             _LOGGER.info(
-                "Enabled Gaussian twin Simplicits benchmark: MJWarp + RKPM Simplicits, %d slot(s), %d Newton x %d CG iterations.",
+                "Enabled Gaussian twin Simplicits benchmark: MJWarp + RKPM Simplicits, "
+                "%d slot(s), %d Newton x %d CG iterations.",
                 self.num_slots,
                 solver_cfg.num_newton_steps,
                 solver_cfg.cg_iterations,
@@ -749,33 +778,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 velocity_limit_scale,
             )
         else:
-            self.sim.physics = GaussianTwinPhysicsCfg().newton_mjwarp_vbd_proxy
-            coupling_profile = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE", "demo").strip().lower()
-            try:
-                proxy_iterations, proxy_mass_scale, proxy_relaxation = _GAUSSIAN_TWIN_PROXY_PROFILES[coupling_profile]
-            except KeyError as error:
-                choices = ", ".join(_GAUSSIAN_TWIN_PROXY_PROFILES)
-                raise ValueError(
-                    f"ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE must be one of {choices}, got '{coupling_profile}'."
-                ) from error
-            solver_cfg = self.sim.physics.solver_cfg
-            proxy_cfg = solver_cfg.proxies[0]
-            solver_cfg.iterations = _optional_positive_int_env(
-                "ISAACLAB_GAUSSIAN_TWIN_PROXY_ITERATIONS", proxy_iterations
-            )
-            proxy_cfg.mass_scale = _optional_nonnegative_float_env(
-                "ISAACLAB_GAUSSIAN_TWIN_PROXY_MASS_SCALE", proxy_mass_scale, positive=True
-            )
-            proxy_cfg.proxy_relaxation = _optional_nonnegative_float_env(
-                "ISAACLAB_GAUSSIAN_TWIN_PROXY_RELAXATION", proxy_relaxation, positive=True
-            )
-            _LOGGER.info(
-                "Enabled Gaussian twin %s proxy coupling: %d iteration(s), %.0f mass scale, %.2f feedback relaxation.",
-                coupling_profile,
-                solver_cfg.iterations,
-                proxy_cfg.mass_scale,
-                proxy_cfg.proxy_relaxation,
-            )
+            self._configure_native_simulation()
         if self.num_objects > 1 and not rigid_simulation and not simplicits_simulation:
             # VBD disables particle--particle contact by default.  This leaves
             # independently imported TetMeshes ghosting through one another.

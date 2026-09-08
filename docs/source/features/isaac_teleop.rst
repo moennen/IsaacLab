@@ -207,12 +207,22 @@ The expensive aligned Gaussian background is disabled for this task; set
 ``ISAACLAB_ENABLE_ALIGNED_BACKGROUND=1`` only for a composed recording.
 
 For a responsive demonstration, set ``ISAACLAB_GAUSSIAN_TWIN_FAST_SIMULATION=1``. This mirrors
-the Newton example's ``--fast-simulation`` profile: two 1/120 s solver substeps, 30 VBD
+the low-cost native coupling profile: two 1/120 s solver substeps, 10 VBD
 iterations, and a 7.5 Hz-equivalent gripper drive. It reduces physics work substantially while
 retaining the packaged toy grasp, at the cost of less accurate elastic waves and contacts.
 For a steadier intermediate setting, use ``ISAACLAB_GAUSSIAN_TWIN_BALANCED_SIMULATION=1`` instead:
-four 1/120 s substeps, 45 VBD iterations, and a 12.5 Hz-equivalent gripper drive. The balanced
+four 1/120 s substeps, 15 VBD iterations, and a 12.5 Hz-equivalent gripper drive. The balanced
 and fast settings are mutually exclusive.
+
+The native default uses four substeps and 10 VBD iterations. It gives the VBD proxy a dedicated
+``30000 N/m`` contact stiffness, ``10 N*s/m`` damping, and a ``10 N`` per-finger effort limit;
+the rigid stack task's much stiffer hydroelastic material is not appropriate for lightweight
+TetMesh vertices. Native mode uses particle contacts by default. Set
+``ISAACLAB_GAUSSIAN_TWIN_FULL_SURFACE_CONTACT=1`` only when a coarse surface lets a finger pass
+between vertices; this enables edge/face contacts and SDF generation and is substantially more
+expensive. Packaged simulation meshes should avoid sliver tetrahedra and non-manifold boundary
+edges because uniform density does not prevent those elements from producing extremely small
+vertex masses.
 
 To reproduce the stable VBD topology used by the DexSuite Kuka/Allegro policy task, pass
 ``--dexsuite-simulation stable-kinematic`` to the teleoperation command. This selects kinematic
@@ -272,7 +282,10 @@ iteration, mass scale ``1000``, and feedback relaxation ``0.1``. Set
 ``ISAACLAB_GAUSSIAN_TWIN_COUPLING_PROFILE`` to ``balanced`` or ``accurate`` to select a more
 responsive two-way solve, or override individual values with
 ``ISAACLAB_GAUSSIAN_TWIN_PROXY_ITERATIONS``, ``ISAACLAB_GAUSSIAN_TWIN_PROXY_MASS_SCALE``, and
-``ISAACLAB_GAUSSIAN_TWIN_PROXY_RELAXATION``. All three overrides must be positive.
+``ISAACLAB_GAUSSIAN_TWIN_PROXY_RELAXATION``. All three overrides must be positive. Proxy mass scale
+preconditions the robot-reaction solve; it does not increase the TetMesh vertex masses or repair
+ill-conditioned contact, so raising it beyond the already-large default is not the primary
+stability remedy.
 
 .. _isaac-teleop-tracking-debug-visualization:
 
