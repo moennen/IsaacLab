@@ -89,6 +89,10 @@ benchmark_*.json
 # Ruff cache
 **/.ruff_cache/
 
+# Reproducible interactive-task runtime (source/isaaclab_tasks/isaaclab_tasks/contrib/gaussian_tasks/setup.sh).
+/.tools/task-runtime/
+/.venv-tasks/
+
 # Isaac Lab CI environments in native mode
 **/_isaaclab_install_ci_*
 

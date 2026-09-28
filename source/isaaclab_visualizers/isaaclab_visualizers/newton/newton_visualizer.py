@@ -111,6 +111,119 @@ def _rotate_points_by_quaternion(points: np.ndarray, quaternion: np.ndarray) -> 
     return points + 2.0 * (quaternion[3] * cross_1 + np.cross(xyz, cross_1))
 
 
+def _tetmesh_boundary_triangles(tet_indices: np.ndarray) -> np.ndarray:
+    """Extract consistently oriented boundary triangles from tetrahedron indices."""
+    tetrahedra = np.asarray(tet_indices, dtype=np.int32).reshape(-1, 4)
+    faces: dict[tuple[int, int, int], tuple[int, int, int] | None] = {}
+    for a, b, c, d in tetrahedra:
+        for face in ((a, c, b), (a, b, d), (a, d, c), (b, c, d)):
+            oriented = tuple(int(index) for index in face)
+            key = tuple(sorted(oriented))
+            faces[key] = None if key in faces else oriented
+    return np.asarray([face for face in faces.values() if face is not None], dtype=np.int32)
+
+
+def _gaussian_twin_vbd_entries():
+    """Return the registered volume-deformable Gaussian-twin slots, if any."""
+    entries = getattr(NewtonManager, "_deformable_registry", ())
+    return tuple(
+        entry
+        for entry in entries
+        if getattr(entry, "deformable_type", None) == "volume"
+        and "/GaussianTwin_" in str(getattr(entry, "prim_path", ""))
+    )
+
+
+def _log_vbd_gaussian_twin_tetmeshes(viewer, state) -> bool:
+    """Render only active VBD Gaussian-twin boundaries through direct RTX meshes.
+
+    The generic Newton triangle renderer submits the complete model-wide
+    ``particle_q``/``tri_indices`` buffer. Gaussian-twin tasks preallocate one
+    TetMesh per selectable slot, and park inactive slots 100 m below the
+    scene. Submitting those unrelated ranges together produces corrupt debug
+    geometry in OVRTX. Render each registered TetMesh surface independently
+    instead, so inactive slots are never submitted as visible geometry.
+    """
+    entries = _gaussian_twin_vbd_entries()
+    if not entries:
+        return False
+
+    visible = bool(viewer.show_triangles) and not viewer._layer_force_hidden()
+    previous_paths = getattr(viewer, "_gaussian_twin_vbd_tetmesh_paths", set())
+    if not visible and viewer._phase != viewer._PHASE_BUILD:
+        # A hidden update is required once to remove any mesh visible in the
+        # preceding frame, but avoid copying the simulation state otherwise.
+        buffers = getattr(viewer, "_gaussian_twin_vbd_tetmesh_buffers", {})
+        if previous_paths:
+            for path in previous_paths:
+                points, indices = buffers[path]
+                viewer.log_mesh(path, points, indices, hidden=True)
+            viewer._gaussian_twin_vbd_tetmesh_paths = set()
+        return True
+
+    particle_q = state.particle_q.numpy()
+    current_visible_paths: set[str] = set()
+    surface_cache = getattr(viewer, "_gaussian_twin_vbd_surface_cache", None)
+    if surface_cache is None:
+        surface_cache = {}
+        viewer._gaussian_twin_vbd_surface_cache = surface_cache
+    buffers = getattr(viewer, "_gaussian_twin_vbd_tetmesh_buffers", None)
+    if buffers is None:
+        buffers = {}
+        viewer._gaussian_twin_vbd_tetmesh_buffers = buffers
+
+    for entry_index, entry in enumerate(entries):
+        particle_count = int(getattr(entry, "particles_per_body", 0))
+        if particle_count <= 0:
+            continue
+        cache_key = id(entry)
+        indices = surface_cache.get(cache_key)
+        if indices is None:
+            indices = _tetmesh_boundary_triangles(np.asarray(entry.indices, dtype=np.int32))
+            surface_cache[cache_key] = indices.reshape(-1)
+        if indices.size == 0:
+            continue
+
+        for env_index, offset in enumerate(getattr(entry, "particle_offsets", ())):
+            points = np.asarray(particle_q[int(offset) : int(offset) + particle_count], dtype=np.float32)
+            if len(points) != particle_count:
+                continue
+            path = f"/debug/gaussian_twin_vbd_tetmesh_{entry_index}_{env_index}"
+            points_wp = wp.array(points, dtype=wp.vec3, device=viewer.device)
+            indices_wp = wp.array(indices, dtype=wp.int32, device=viewer.device)
+            buffers[path] = (points_wp, indices_wp)
+            # Inactive slot particles are deliberately parked at z=-100 by
+            # GaussianTwinDeformableObject.reset(). Keep them out of the RTX
+            # scene rather than relying on the renderer to cull them.
+            active = bool(np.max(points[:, 2]) > -50.0)
+            if viewer._phase == viewer._PHASE_BUILD:
+                # Author every possible slot hidden so a later reset may make
+                # any selected slot visible without changing RTX topology.
+                viewer.log_mesh(
+                    path,
+                    points_wp,
+                    indices_wp,
+                    hidden=True,
+                    backface_culling=False,
+                    color=(0.25, 0.7, 1.0),
+                )
+            elif active:
+                viewer.log_mesh(
+                    path,
+                    points_wp,
+                    indices_wp,
+                    hidden=False,
+                    backface_culling=False,
+                    color=(0.25, 0.7, 1.0),
+                )
+                current_visible_paths.add(path)
+    for path in previous_paths - current_visible_paths:
+        points, indices = buffers[path]
+        viewer.log_mesh(path, points, indices, hidden=True)
+    viewer._gaussian_twin_vbd_tetmesh_paths = current_visible_paths
+    return True
+
+
 def _log_rigid_gaussian_twin_tetmeshes(viewer, state) -> None:
     """Submit rigid Gaussian-twin boundaries through RTX's direct-mesh path.
 
@@ -871,6 +984,12 @@ class NewtonViewerRTX(_NewtonViewerUIMixin, ViewerRTX):
         super().log_state(state)
         _log_rigid_gaussian_twin_tetmeshes(self, state)
         _log_simplicits_gaussian_twin_cubature_points(self, state)
+
+    def _log_triangles(self, state) -> None:
+        """Render Gaussian-twin VBD debug surfaces without model-wide triangles."""
+        if _log_vbd_gaussian_twin_tetmeshes(self, state):
+            return
+        super()._log_triangles(state)
 
     def get_frame(self) -> np.ndarray:
         """Return the latest OVRTX LDR framebuffer as contiguous RGB pixels."""
@@ -2352,6 +2471,11 @@ class NewtonRTXVisualizer(NewtonVisualizer):
             update_frequency=self.cfg.update_frequency,
             environment=self.cfg.rtx_environment,
         )
+        # Keep the physics ground plane for contacts while allowing composed
+        # Gaussian-capture renders to omit its grid visual.
+        hide_ground = _gaussian_twin_env_flag("ISAACLAB_NEWTON_HIDE_GROUND")
+        viewer.show_ground = not hide_ground
+        viewer.hide_ground_visual = hide_ground
         if has_gaussian_shapes and gaussian_updates_enabled is not None:
             # Gaussian twin assets contain a deformable TetMesh for simulation
             # and a Gaussian field for display. Match Newton's reference

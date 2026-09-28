@@ -12,11 +12,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import warp as wp
+from isaaclab_newton.physics import NewtonManager
+
 from isaaclab.assets.asset_base import AssetBase
 from isaaclab.assets.deformable_object.deformable_object_cfg import DeformableObjectCfg
-from isaaclab.sim import find_matching_prims, get_current_stage
+from isaaclab.sim import find_matching_prims
 from isaaclab.utils.configclass import configclass
-from isaaclab_newton.physics import NewtonManager
 
 from .gaussian_twin import gaussian_twin_updates_enabled
 

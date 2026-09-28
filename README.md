@@ -51,6 +51,9 @@ Isaac Lab offers a comprehensive set of tools and environments designed to facil
 
 ## Getting Started
 
+For this branch's Kitless Gaussian twin, tomato-picking, and berry-picking demos,
+see the [task CLI setup and Nucleus asset guide](source/isaaclab_tasks/isaaclab_tasks/contrib/gaussian_tasks/README.md).
+
 ### Documentation
 
 Our [documentation page](https://isaac-sim.github.io/IsaacLab) provides everything you need to get started, including

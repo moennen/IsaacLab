@@ -1,0 +1,1038 @@
+diff --git a/newton/_src/geometry/types.py b/newton/_src/geometry/types.py
+index e253c99f..da629d82 100644
+--- a/newton/_src/geometry/types.py
++++ b/newton/_src/geometry/types.py
+@@ -2548,6 +2548,7 @@ class Gaussian:
+         sh_degree: int | None = None,
+         min_response: float = 0.1,
+         sorting_mode: SortingMode = SortingMode.RAY_HIT_DISTANCE,
++        do_not_cast_shadows: bool | None = None,
+     ):
+         """Construct a Gaussian splat asset from arrays.
+ 
+@@ -2567,6 +2568,9 @@ class Gaussian:
+             sorting_mode: Sorting strategy for depth-ordering Gaussian
+                 intersections along each ray before alpha compositing
+                 (default: :attr:`SortingMode.RAY_HIT_DISTANCE`).
++            do_not_cast_shadows: Optional USD ``doNotCastShadows`` primvar.
++                ``None`` leaves the renderer default unchanged; ``False``
++                explicitly enables shadow casting.
+         """
+ 
+         self._positions = np.ascontiguousarray(np.asarray(positions, dtype=np.float32).reshape(-1, 3))
+@@ -2602,6 +2606,7 @@ class Gaussian:
+         self._min_response = float(min_response)
+ 
+         self._sorting_mode = sorting_mode
++        self._do_not_cast_shadows = do_not_cast_shadows
+ 
+         self._cached_hash = None
+         self._positions.setflags(write=False)
+@@ -2668,6 +2673,15 @@ class Gaussian:
+         """Sorting mode, Gaussian.SortingMode."""
+         return self._sorting_mode
+ 
++    @property
++    def do_not_cast_shadows(self) -> bool | None:
++        """Optional USD ``doNotCastShadows`` primvar for this Gaussian field.
++
++        ``False`` explicitly enables shadow casting. ``None`` preserves the
++        renderer's default behavior.
++        """
++        return self._do_not_cast_shadows
++
+     @property
+     def bvh(self) -> wp.Bvh | None:
+         """The finalized Warp BVH over the Gaussians, or ``None`` before :meth:`finalize`.
+diff --git a/newton/_src/usd/utils.py b/newton/_src/usd/utils.py
+index bc196dbb..c66aee3f 100644
+--- a/newton/_src/usd/utils.py
++++ b/newton/_src/usd/utils.py
+@@ -3539,6 +3539,11 @@ def get_gaussian(prim: Usd.Prim, min_response: float = 0.1) -> Gaussian:
+         else:
+             raise ValueError(f"Unsupported gaussian sorting mode: {usd_sorting_mode}")
+ 
++    shadow_attr = prim.GetAttribute("primvars:doNotCastShadows")
++    do_not_cast_shadows = shadow_attr.Get() if shadow_attr.IsValid() and shadow_attr.HasValue() else None
++    if do_not_cast_shadows is not None and not isinstance(do_not_cast_shadows, bool):
++        raise ValueError("Gaussian 'primvars:doNotCastShadows' must be a bool.")
++
+     return Gaussian(
+         positions=positions,
+         rotations=_get_float_array_attr("orientations"),
+@@ -3548,4 +3553,5 @@ def get_gaussian(prim: Usd.Prim, min_response: float = 0.1) -> Gaussian:
+         sh_degree=get_attribute(prim, "radiance:sphericalHarmonicsDegree"),
+         min_response=min_response,
+         sorting_mode=sorting_mode,
++        do_not_cast_shadows=do_not_cast_shadows,
+     )
+diff --git a/newton/_src/viewer/viewer.py b/newton/_src/viewer/viewer.py
+index 881a5c82..d3dca5f5 100644
+--- a/newton/_src/viewer/viewer.py
++++ b/newton/_src/viewer/viewer.py
+@@ -1169,11 +1169,13 @@ class ViewerBase(ABC):
+         offsets_np = None
+         layer_hidden = self._layer_force_hidden()
+ 
+-        for gname, gaussian, parent, shape_xform, world_idx, flags, is_static in self._gaussian_instances:
+-            visible = (
+-                self._should_show_shape(flags, is_static) and self._should_render_world(world_idx) and not layer_hidden
+-            )
+-            if not visible or not self.show_gaussians:
++        for gname, gaussian, parent, shape_xform, world_idx, _flags, _is_static in self._gaussian_instances:
++            # Gaussian fields are an independent visual representation.  Once
++            # explicitly enabled, do not filter them through regular mesh shape
++            # visibility flags: USD Gaussian prims may legitimately carry no
++            # ShapeFlags.VISIBLE bit while still being renderable assets.
++            visible = self.show_gaussians and self._should_render_world(world_idx) and not layer_hidden
++            if not visible:
+                 self.log_gaussian(gname, gaussian, hidden=True)
+                 continue
+             if parent >= 0:
+diff --git a/newton/_src/viewer/viewer_gl.py b/newton/_src/viewer/viewer_gl.py
+index c88b9276..5d0f22a9 100644
+--- a/newton/_src/viewer/viewer_gl.py
++++ b/newton/_src/viewer/viewer_gl.py
+@@ -1748,6 +1748,7 @@ class ViewerGL(ViewerBase):
+             cache = {
+                 "gaussian_cache_key": gaussian_cache_key,
+                 "local_pos": positions,
++                "sample_indices": idx,
+                 "vbo": vbo,
+                 "colors": colors,
+                 "colors_uploaded": False,
+@@ -1758,6 +1759,19 @@ class ViewerGL(ViewerBase):
+ 
+         n = len(cache["local_pos"])
+ 
++        # Newton simulation updates Gaussian centers in the live Warp transform
++        # buffer.  The OpenGL viewer keeps a CPU-side instance buffer, so refresh
++        # the sampled centers before uploading it.  This is intentionally limited
++        # to the Newton GL backend; Kit uses the Fabric GPU path directly.
++        dynamic_positions = gaussian.warp_data is not None
++        if dynamic_positions:
++            live_transforms = gaussian.warp_data.transforms.numpy()
++            sample_indices = cache["sample_indices"]
++            if sample_indices is not None:
++                cache["local_pos"] = np.ascontiguousarray(live_transforms[sample_indices, :3], dtype=np.float32)
++            else:
++                cache["local_pos"] = np.ascontiguousarray(live_transforms[:, :3], dtype=np.float32)
++
+         recreated = False
+         if name not in self.objects:
+             self.objects[name] = MeshInstancerGL(
+@@ -1792,7 +1806,7 @@ class ViewerGL(ViewerBase):
+                 float(xform.q[2]),
+                 float(xform.q[3]),
+             )
+-        if not recreated and cache["last_xform"] == xform_key:
++        if not recreated and not dynamic_positions and cache["last_xform"] == xform_key:
+             return
+         cache["last_xform"] = xform_key
+ 
+diff --git a/newton/_src/viewer/viewer_rtx.py b/newton/_src/viewer/viewer_rtx.py
+index 0b1f27de..07e072f1 100644
+--- a/newton/_src/viewer/viewer_rtx.py
++++ b/newton/_src/viewer/viewer_rtx.py
+@@ -16,6 +16,7 @@
+ from __future__ import annotations
+ 
+ import ctypes
++import importlib.util
+ import math
+ import os
+ import tempfile
+@@ -41,10 +42,11 @@ from .picking import Picking
+ from .utils import OPAQUE_OPACITY_THRESHOLD
+ from .viewer import _DEFAULT_LAYER_ID
+ from .viewer_gui import ViewerGui
+-from .viewer_usd import ViewerUSD, _compute_segment_xform
++from .viewer_usd import ViewerUSD, _compute_segment_xform, _gaussian_frame_data, _gaussian_frame_scales
+ from .wind import Wind
+ 
+ PROFILE_ENABLED = os.environ.get("NEWTON_PROFILE", "0") != "0"
++NVTX_ENABLED = PROFILE_ENABLED and importlib.util.find_spec("nvtx") is not None
+ 
+ 
+ @wp.kernel(enable_backward=False)
+@@ -60,6 +62,45 @@ def write_transforms(xform: wp.array[wp.transform], scale: wp.array[wp.vec3], of
+     m_out[offset + tid] = wp.transpose(wp.transform_compose(p64, q64, s64))
+ 
+ 
++@wp.kernel(enable_backward=False)
++def unpack_gaussian_positions(transforms: wp.array[wp.transformf], positions: wp.array[wp.vec3f]):
++    """Extract Gaussian centers into OVRTX's float3 array layout."""
++    tid = wp.tid()
++    position = wp.transform_get_translation(transforms[tid])
++    positions[tid] = wp.vec3f(position[0], position[1], position[2])
++
++
++@wp.kernel(enable_backward=False)
++def unpack_gaussian_transforms(
++    transforms: wp.array[wp.transformf], positions: wp.array[wp.vec3f], orientations: wp.array[wp.vec4f]
++):
++    """Split packed Warp transforms into OVRTX's float3/float4 array layout."""
++    tid = wp.tid()
++    transform = transforms[tid]
++    position = wp.transform_get_translation(transform)
++    orientation = wp.transform_get_rotation(transform)
++    positions[tid] = wp.vec3f(position[0], position[1], position[2])
++    orientations[tid] = wp.vec4f(orientation[0], orientation[1], orientation[2], orientation[3])
++
++
++@wp.kernel(enable_backward=False)
++def unpack_gaussian_transforms_and_scales(
++    transforms: wp.array[wp.transformf],
++    scales: wp.array[wp.vec3f],
++    positions: wp.array[wp.vec3f],
++    orientations: wp.array[wp.vec4f],
++    scales_out: wp.array[wp.vec3f],
++):
++    """Extract all dynamically deformed Gaussian attributes for OVRTX."""
++    tid = wp.tid()
++    transform = transforms[tid]
++    position = wp.transform_get_translation(transform)
++    orientation = wp.transform_get_rotation(transform)
++    positions[tid] = wp.vec3f(position[0], position[1], position[2])
++    orientations[tid] = wp.vec4f(orientation[0], orientation[1], orientation[2], orientation[3])
++    scales_out[tid] = scales[tid]
++
++
+ @wp.kernel(enable_backward=False)
+ def update_and_write_shape_transforms(
+     shape_xforms: wp.array[wp.transform],
+@@ -192,6 +233,20 @@ class ViewerRTX(ViewerUSD):
+         self._render_products = None
+         self._uses_fractional_opacity = False
+         self._transform_binding = None
++        self._transform_buffers = None
++        self._transform_buffer_index = 0
++        self._transform_write_operations = [None, None]
++        self._blit_frame_copy: wp.array | None = None
++        self._gaussian_bindings = {}
++        self._pending_gaussian_xforms = {}
++        self._pending_gaussian_visibility = {}
++        self._has_dynamic_gaussian_streaming = False
++        # ViewerUSD uses this during the one-time stage authoring phase to add
++        # a second, identical sample for the attributes we will subsequently
++        # stream.  OVRTX classifies ParticleFields as static or animated when
++        # it populates the stage; without that classification a later Fabric
++        # positions write takes its static-Gaussian rebuild path.
++        self._ovrtx_animated_gaussians = True
+         self._async = async_rendering
+ 
+         # The renderer output size is fixed even if window is resized
+@@ -699,11 +754,29 @@ void main() {
+         os.close(fd)
+         self.stage.GetRootLayer().Export(ovrtx_usd_path)
+ 
++        sync_load_env = "OVRTX_rtx_hydra_materialSyncLoads"
++        previous_sync_load_env = None
++        if self._has_dynamic_gaussian_streaming:
++            # Animated Gaussian fields enter the geometry-streaming update path.
++            # In this OVRTX release, the only control that makes the updated
++            # field resident before the next render is the global sync-load
++            # setting; without it, the field intermittently disappears. Scope
++            # the environment override to renderer construction/loading so a
++            # static Gaussian stage and later unrelated renderer creation do
++            # not inherit it through ``os.environ``.
++            previous_sync_load_env = os.environ.get(sync_load_env)
++            os.environ.setdefault(sync_load_env, "1")
++
+         try:
+             import ovrtx
+ 
+             config = ovrtx.RendererConfig()
+             config.log_level = "error"
++            # OVRTX owns an embedded Carbonite framework. Opt in before its
++            # first renderer is created to make that framework load Kit's
++            # Tracy profiler backend; an external Tracy client can then attach
++            # to this Newton process.
++            config.enable_profiling = os.environ.get("NEWTON_RTX_TRACY", "").lower() in {"1", "true", "yes"}
+             self._rtx = ovrtx.Renderer(config=config)
+             self._rtx.open_usd(ovrtx_usd_path)
+ 
+@@ -721,9 +794,24 @@ void main() {
+                     semantic=Semantic.XFORM_MAT4x4,
+                     prim_mode=PrimMode.MUST_EXIST,
+                 )
++                # Own the GPU memory used for transform updates. Mapping an
++                # OVRTX-owned buffer and unmapping it per frame releases that
++                # buffer through cudaFree in OVRTX 0.4, which synchronizes the
++                # complete device. Two owned buffers allow the renderer to
++                # consume one while Newton writes the other.
++                self._transform_buffers = tuple(
++                    wp.empty(len(self._all_instance_paths), dtype=wp.mat44d, device=self.device) for _ in range(2)
++                )
++                self._transform_buffer_index = 0
++                self._transform_write_operations = [None, None]
+         except Exception as e:
+             raise RuntimeError(f"Failed to create OVRTX renderer: {e}") from e
+         finally:
++            if self._has_dynamic_gaussian_streaming:
++                if previous_sync_load_env is None:
++                    os.environ.pop(sync_load_env, None)
++                else:
++                    os.environ[sync_load_env] = previous_sync_load_env
+             try:
+                 os.unlink(ovrtx_usd_path)
+             except OSError:
+@@ -1368,7 +1456,7 @@ void main() {
+         Args:
+             time: Current simulation time [s].
+         """
+-        with wp.ScopedTimer("ViewerRTX::begin_frame", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::begin_frame", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             super().begin_frame(time)
+             self._pending_xforms.clear()
+             self._pending_instance_visibility.clear()
+@@ -1378,6 +1466,9 @@ void main() {
+             self._pending_mesh_visibility.clear()
+             self._pending_line_batches.clear()
+             self._pending_point_batches.clear()
++            self._pending_gaussians.clear()
++            self._pending_gaussian_xforms.clear()
++            self._pending_gaussian_visibility.clear()
+             self._gizmo_log = {}
+ 
+             if self._window and not self._headless:
+@@ -1412,13 +1503,14 @@ void main() {
+         if self._phase == self._PHASE_BUILD:
+             self._init_ovrtx()
+ 
+-        with wp.ScopedTimer("ViewerRTX::end_frame", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::end_frame", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             self._update_ovrtx_camera()
+             self._update_ovrtx_transforms()
+             self._update_ovrtx_instance_visibility()
+             self._update_ovrtx_line_batches()
+             self._update_ovrtx_point_batches()
+             self._update_ovrtx_mesh_points()
++            self._update_ovrtx_gaussians()
+             self._render_and_display()
+ 
+     # ViewerUSD authors PreviewSurface materials while ViewerRTX is in the
+@@ -1524,6 +1616,52 @@ void main() {
+                 self._pending_mesh_topology[name] = (face_vertex_counts, indices_np)
+             self._pending_mesh_visibility[name] = not hidden and len(pts) > 0
+ 
++    @override
++    def log_gaussian(
++        self,
++        name: str,
++        gaussian: newton.Gaussian,
++        xform: wp.transformf | None = None,
++        hidden: bool = False,
++    ) -> None:
++        """Log a :class:`newton.Gaussian` splat asset for ray-traced rendering.
++
++        The build phase authors a ``ParticleField3DGaussianSplat`` prim through
++        :class:`ViewerUSD`, which OVRTX turns into a preprocessed Gaussian field.
++        Later frames stream the selected skinned attributes into that field
++        through GPU Fabric bindings, so a deforming splat asset stays glued to
++        the simulated body. Streaming is opt-in: an asset may set
++        ``_newton_dynamic_attributes`` to one of ``("positions",)``,
++        ``("positions", "orientations")``, or
++        ``("positions", "orientations", "scales")``. Opacities and radiance
++        remain static.
++
++        Args:
++            name: Unique path/name for the Gaussian field.
++            gaussian: The :class:`newton.Gaussian` asset to visualize.
++            xform: Optional world-space transform applied to all splat centers.
++            hidden: Whether the field should be hidden.
++        """
++        name = self._qualify(name)
++
++        if self._phase == self._PHASE_BUILD:
++            self._has_dynamic_gaussian_streaming |= bool(getattr(gaussian, "_newton_dynamic_attributes", ()))
++            super().log_gaussian(name, gaussian, xform, hidden)
++            self._gaussian_prim_paths[name] = self._get_path(name)
++        elif name in self._gaussian_prim_paths:
++            self._pending_gaussian_visibility[name] = not hidden
++            if not hidden:
++                dynamic_attributes = tuple(getattr(gaussian, "_newton_dynamic_attributes", ()))
++                # Keep the live Warp transform array intact.  _update_ovrtx_gaussians()
++                # packs it into GPU float3/float4 buffers and passes them through
++                # DLPack, avoiding a device-to-host copy of every splat per frame.
++                if dynamic_attributes:
++                    self._pending_gaussians[name] = gaussian
++                if xform is not None:
++                    self._pending_gaussian_xforms[name] = (
++                        np.asarray(wp.transform_to_matrix(xform), dtype=np.float64).reshape(4, 4).T
++                    )
++
+     @override
+     def log_instances(
+         self,
+@@ -1668,7 +1806,7 @@ void main() {
+     def _update_ovrtx_camera(self):
+         if self._rtx is None or not self._camera_dirty:
+             return
+-        with wp.ScopedTimer("ViewerRTX::update_camera", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::update_camera", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             from ovrtx import Semantic
+ 
+             mat = self._compute_camera_matrix()
+@@ -1685,53 +1823,76 @@ void main() {
+         has_flat_shape_arrays = self._flat_total_shapes > 0
+         if not self._transform_binding or (not has_flat_shape_arrays and not self._pending_xforms):
+             return
+-        with wp.ScopedTimer("ViewerRTX::update_transforms", active=PROFILE_ENABLED, use_nvtx=True):
+-            from ovrtx import Device
+-
+-            rtx_device = Device.CUDA if self.device.is_cuda else Device.CPU
+-            with self._transform_binding.map(device=rtx_device) as mapping:
+-                matrices = wp.from_dlpack(mapping.tensor, dtype=wp.mat44d)  # (N, 4, 4) float64
+-
+-                body_q = self._last_state.body_q if self._last_state is not None else None
+-                world_offsets = self.world_offsets
+-
+-                if has_flat_shape_arrays:
+-                    # Single kernel launch for all shape batches.
+-                    wp.launch(
+-                        update_and_write_shape_transforms,
+-                        dim=self._flat_total_shapes,
+-                        inputs=[
+-                            self._flat_shape_xforms,
+-                            self._flat_shape_parents,
+-                            body_q,
+-                            self._flat_shape_worlds,
+-                            world_offsets,
+-                            self.layer.xform,
+-                            self._flat_shape_scales,
+-                            self._flat_mat44_offset,
+-                            matrices,
+-                        ],
+-                        device=matrices.device,
+-                    )
++        with wp.ScopedTimer("ViewerRTX::update_transforms", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
++            from ovrtx import DataAccess
++
++            # Wait only before reusing this caller-owned buffer. OVRTX's async
++            # write retains the buffer until this operation completes.
++            buffer_index = self._transform_buffer_index
++            previous_operation = self._transform_write_operations[buffer_index]
++            if previous_operation is not None:
++                previous_operation.wait()
++            matrices = self._transform_buffers[buffer_index]
++
++            body_q = self._last_state.body_q if self._last_state is not None else None
++            world_offsets = self.world_offsets
++
++            if has_flat_shape_arrays:
++                # Single kernel launch for all shape batches.
++                wp.launch(
++                    update_and_write_shape_transforms,
++                    dim=self._flat_total_shapes,
++                    inputs=[
++                        self._flat_shape_xforms,
++                        self._flat_shape_parents,
++                        body_q,
++                        self._flat_shape_worlds,
++                        world_offsets,
++                        self.layer.xform,
++                        self._flat_shape_scales,
++                        self._flat_mat44_offset,
++                        matrices,
++                    ],
++                    device=matrices.device,
++                )
+ 
+-                # Handle any remaining pre-computed transforms (e.g. picking line).
+-                if self._pending_xforms:
+-                    offset = 0
+-                    for name, paths in self._instance_prim_paths.items():
+-                        count = len(paths)
+-                        if name in self._pending_xforms:
+-                            xf, sc = self._pending_xforms[name]
+-                            n = min(count, len(xf))
+-                            wp.launch(
+-                                write_transforms,
+-                                dim=n,
+-                                inputs=[xf, sc, offset, matrices],
+-                                device=matrices.device,
+-                            )
+-                        offset += count
++            # Handle any remaining pre-computed transforms (e.g. picking line).
++            if self._pending_xforms:
++                offset = 0
++                for name, paths in self._instance_prim_paths.items():
++                    count = len(paths)
++                    if name in self._pending_xforms:
++                        xf, sc = self._pending_xforms[name]
++                        n = min(count, len(xf))
++                        wp.launch(
++                            write_transforms,
++                            dim=n,
++                            inputs=[xf, sc, offset, matrices],
++                            device=matrices.device,
++                        )
++                    offset += count
++
++            if matrices.device.is_cuda:
++                self._transform_write_operations[buffer_index] = self._transform_binding.write_async(
++                    matrices,
++                    data_access=DataAccess.ASYNC,
++                    cuda_stream=wp.get_stream(matrices.device).cuda_stream,
++                )
++                self._transform_buffer_index = (buffer_index + 1) % len(self._transform_buffers)
++            else:
++                self._transform_binding.write(matrices)
+ 
+-                if matrices.device.is_cuda:
+-                    mapping.unmap(stream=matrices.device.stream.cuda_stream)
++    def _release_transform_binding(self):
++        """Release the transform binding after its asynchronous writes complete."""
++        for operation in self._transform_write_operations:
++            if operation is not None:
++                operation.wait()
++        if self._transform_binding is not None:
++            self._transform_binding.unbind()
++        self._transform_binding = None
++        self._transform_buffers = None
++        self._transform_buffer_index = 0
++        self._transform_write_operations = [None, None]
+ 
+     def _update_ovrtx_instance_visibility(self):
+         if self._rtx is None or not self._pending_instance_visibility:
+@@ -1767,7 +1928,9 @@ void main() {
+             return
+ 
+         if isinstance(values, wp.array):
+-            # XXX For now OVRTX only supports array writes on CPU
++            # This legacy helper owns no lifetime-managed GPU staging buffers.
++            # Dynamic high-volume paths (Gaussian fields) use persistent Fabric
++            # bindings with DLPack and DataAccess.ASYNC instead.
+             values = values.numpy()
+ 
+         self._rtx.write_array_attribute([prim_path], attribute_name, [np.ascontiguousarray(values)])
+@@ -1790,7 +1953,7 @@ void main() {
+             and not self._pending_mesh_visibility
+         ):
+             return
+-        with wp.ScopedTimer("ViewerRTX::update_mesh_points", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::update_mesh_points", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             for mesh_name, points_np in self._pending_mesh_points.items():
+                 prim_path = self._mesh_prim_paths.get(mesh_name)
+                 if prim_path is None:
+@@ -1828,11 +1991,203 @@ void main() {
+                     tensor=["inherited" if visible else "invisible"],
+                 )
+ 
++    def _release_gaussian_bindings(self):
++        """Wait for outstanding writes, then unbind Gaussian attributes."""
++        for bindings, _, _, write_operations in self._gaussian_bindings.values():
++            for operations in write_operations:
++                if operations is not None:
++                    for operation in operations:
++                        operation.wait()
++            for binding in bindings.values():
++                binding.unbind()
++        self._gaussian_bindings = {}
++
++    def _release_gaussian_binding(self, name: str):
++        """Release one Gaussian binding after its asynchronous writes complete."""
++        binding_data = self._gaussian_bindings.pop(name, None)
++        if binding_data is None:
++            return
++        bindings, _, _, write_operations = binding_data
++        for operations in write_operations:
++            if operations is not None:
++                for operation in operations:
++                    operation.wait()
++        for binding in bindings.values():
++            binding.unbind()
++
++    def _update_ovrtx_gaussians(self):
++        if self._rtx is None or (
++            not self._pending_gaussians and not self._pending_gaussian_xforms and not self._pending_gaussian_visibility
++        ):
++            return
++        with wp.ScopedTimer("ViewerRTX::update_gaussians", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
++            from ovrtx import BindingFlag, DataAccess, Semantic
++
++            for name, visible in self._pending_gaussian_visibility.items():
++                prim_path = self._gaussian_prim_paths.get(name)
++                if prim_path is not None:
++                    self._rtx.write_attribute(
++                        prim_paths=[prim_path],
++                        attribute_name="visibility",
++                        tensor=["inherited" if visible else "invisible"],
++                    )
++
++            for name, matrix in self._pending_gaussian_xforms.items():
++                prim_path = self._gaussian_prim_paths.get(name)
++                if prim_path is not None:
++                    self._rtx.write_attribute(
++                        prim_paths=[prim_path],
++                        attribute_name="omni:xform",
++                        # ``matrix`` is stored transposed for USD's row-vector
++                        # convention, making it a non-contiguous NumPy view.
++                        # OVRTX's DLPack import requires compact inner strides.
++                        tensor=np.ascontiguousarray(matrix[np.newaxis, ...]),
++                        semantic=Semantic.XFORM_MAT4x4,
++                    )
++
++            for name, gaussian in self._pending_gaussians.items():
++                prim_path = self._gaussian_prim_paths.get(name)
++                if prim_path is None:
++                    continue
++
++                dynamic_attributes = tuple(getattr(gaussian, "_newton_dynamic_attributes", ()))
++                supported_attributes = (
++                    (),
++                    ("positions",),
++                    ("positions", "orientations"),
++                    ("positions", "orientations", "scales"),
++                )
++                if dynamic_attributes not in supported_attributes:
++                    raise ValueError(
++                        f"Unsupported dynamic Gaussian attributes {dynamic_attributes!r}; "
++                        f"expected one of {supported_attributes!r}."
++                    )
++                binding_data = self._gaussian_bindings.get(name)
++                if binding_data is not None and tuple(binding_data[0]) != dynamic_attributes:
++                    # Attribute bindings have a fixed schema. Recreate them if a
++                    # caller swaps a Gaussian asset or changes its deformation mode.
++                    self._release_gaussian_binding(name)
++                    binding_data = None
++                if binding_data is None:
++                    # Gaussians have neither BVH refit nor motion-BVH support. The
++                    # initial USD authoring therefore marks selected attributes as
++                    # animated, and this persistent binding drives that animated
++                    # update path. A plain by-name array write does not establish
++                    # that dataflow and has left the field's acceleration structure
++                    # stale in OVRTX.
++                    shapes = {"positions": (3,), "orientations": (4,), "scales": (3,)}
++                    bindings = {
++                        attribute: self._rtx.bind_array_attribute(
++                            [prim_path],
++                            attribute,
++                            dtype="float32",
++                            shape=shapes[attribute],
++                            flags=BindingFlag.OPTIMIZE,
++                        )
++                        for attribute in dynamic_attributes
++                    }
++                    # OVRTX GPU writes are zero-copy. Buffers are allocated below
++                    # from the live Warp arrays, and double-buffered because the
++                    # renderer may still consume the previous frame.
++                    self._gaussian_bindings[name] = (bindings, None, 0, [None, None])
++                    binding_data = self._gaussian_bindings[name]
++
++                bindings, buffers, buffer_index, write_operations = binding_data
++                # The binding schema is persistent, but the caller may replace
++                # its Gaussian/warp data between frames. Always use the live
++                # arrays rather than the first frame's cached references.
++                data = getattr(gaussian, "warp_data", None)
++                transforms = getattr(data, "transforms", None)
++                scales = getattr(data, "scales", None)
++                # OVRTX accepts Warp arrays via DLPack and uses cuda_stream to order
++                # its GPU read after skinning. GPU inputs require ASYNC, so the
++                # matching buffer is not reused until Fabric has consumed it.
++                if transforms is not None and transforms.device.is_cuda:
++                    buffers_need_resize = buffers is None or any(
++                        values[attribute].shape[0] != len(transforms) or values[attribute].device != transforms.device
++                        for values in buffers
++                        for attribute in dynamic_attributes
++                    )
++                    if buffers_need_resize:
++                        for operations in write_operations:
++                            if operations is not None:
++                                for operation in operations:
++                                    operation.wait()
++                        buffers = tuple(
++                            {
++                                attribute: wp.empty(
++                                    len(transforms),
++                                    dtype=wp.vec4f if attribute == "orientations" else wp.vec3f,
++                                    device=transforms.device,
++                                )
++                                for attribute in dynamic_attributes
++                            }
++                            for _ in range(2)
++                        )
++                        buffer_index = 0
++                        write_operations = [None, None]
++                    previous_operations = write_operations[buffer_index]
++                    if previous_operations is not None:
++                        for operation in previous_operations:
++                            operation.wait()
++                    values = buffers[buffer_index]
++                    if dynamic_attributes == ("positions",):
++                        wp.launch(
++                            unpack_gaussian_positions,
++                            dim=len(transforms),
++                            inputs=[transforms, values["positions"]],
++                            device=transforms.device,
++                        )
++                    elif dynamic_attributes == ("positions", "orientations"):
++                        wp.launch(
++                            unpack_gaussian_transforms,
++                            dim=len(transforms),
++                            inputs=[transforms, values["positions"], values["orientations"]],
++                            device=transforms.device,
++                        )
++                    else:
++                        wp.launch(
++                            unpack_gaussian_transforms_and_scales,
++                            dim=len(transforms),
++                            inputs=[
++                                transforms,
++                                scales,
++                                values["positions"],
++                                values["orientations"],
++                                values["scales"],
++                            ],
++                            device=transforms.device,
++                        )
++                    cuda_stream = wp.get_stream(transforms.device).cuda_stream
++                    write_operations[buffer_index] = []
++                    for attribute, binding in bindings.items():
++                        write_operations[buffer_index].append(
++                            binding.write_async(
++                                [values[attribute]], data_access=DataAccess.ASYNC, cuda_stream=cuda_stream
++                            )
++                        )
++                    self._gaussian_bindings[name] = (
++                        bindings,
++                        buffers,
++                        (buffer_index + 1) % len(buffers),
++                        write_operations,
++                    )
++                else:
++                    # CPU assets are valid too, but cannot have been skinned by the
++                    # CUDA solver.  This fallback is intentionally separate from the
++                    # GPU deformable path above.
++                    positions, orientations = _gaussian_frame_data(gaussian)
++                    frame_data = {"positions": positions, "orientations": orientations}
++                    frame_data["scales"] = _gaussian_frame_scales(gaussian)
++                    for attribute, binding in bindings.items():
++                        binding.write([frame_data[attribute]])
++                    self._gaussian_bindings[name] = (bindings, None, 0, [None, None])
++
+     def _update_ovrtx_line_batches(self):
+         if self._rtx is None or not self._pending_line_batches:
+             return
+ 
+-        with wp.ScopedTimer("ViewerRTX::update_line_batches", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::update_line_batches", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             for name, (starts, ends, colors, width, hidden) in self._pending_line_batches.items():
+                 prim_path = self._line_batch_paths.get(name)
+                 proto_path = self._line_batch_proto_paths.get(name)
+@@ -1890,7 +2245,7 @@ void main() {
+         if self._rtx is None or not self._pending_point_batches:
+             return
+ 
+-        with wp.ScopedTimer("ViewerRTX::update_point_batches", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::update_point_batches", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             for name, (points, radii, colors, hidden) in self._pending_point_batches.items():
+                 prim_path = self._point_batch_paths.get(name)
+                 if prim_path is None:
+@@ -1944,19 +2299,19 @@ void main() {
+         if self._rtx is None or self._should_close:
+             return
+ 
+-        with wp.ScopedTimer("ViewerRTX::render_and_display", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::render_and_display", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             from ovrtx import Device
+ 
+             self._render_products = None
+ 
+             if self._async:
+                 # wait for async rendering to complete
+-                with wp.ScopedTimer("ViewerRTX::rtx_wait", active=PROFILE_ENABLED, use_nvtx=True):
++                with wp.ScopedTimer("ViewerRTX::rtx_wait", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+                     if self._render_result is not None:
+                         self._render_products = self._render_result.wait().fetch()
+             else:
+                 # render synchronously
+-                with wp.ScopedTimer("ViewerRTX::rtx_step", active=PROFILE_ENABLED, use_nvtx=True):
++                with wp.ScopedTimer("ViewerRTX::rtx_step", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+                     self._render_products = self._rtx.step(
+                         render_products={self._render_product_path},
+                         delta_time=1.0 / self.fps,
+@@ -1967,18 +2322,18 @@ void main() {
+                 for _pname, product in self._render_products.items():
+                     for frame in product.frames:
+                         if "LdrColor" in frame.render_vars:
+-                            with wp.ScopedTimer("ViewerRTX::fb_map", active=PROFILE_ENABLED, use_nvtx=True):
++                            with wp.ScopedTimer("ViewerRTX::fb_map", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+                                 with frame.render_vars["LdrColor"].map(device=Device.CUDA) as mapping:
+                                     pixels = wp.from_dlpack(mapping, dtype=wp.vec4ub)
+                                     with wp.ScopedTimer(
+-                                        "ViewerRTX::blit_to_window", active=PROFILE_ENABLED, use_nvtx=True
++                                        "ViewerRTX::blit_to_window", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED
+                                     ):
+                                         self._blit_to_window(pixels)
+                                     mapping.unmap(stream=pixels.device.stream.cuda_stream)
+ 
+             if self._async:
+                 # kick off next async rendering frame
+-                with wp.ScopedTimer("ViewerRTX::rtx_step_async", active=PROFILE_ENABLED, use_nvtx=True):
++                with wp.ScopedTimer("ViewerRTX::rtx_step_async", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+                     self._render_result = self._rtx.step_async(
+                         render_products={self._render_product_path},
+                         delta_time=1.0 / self.fps,
+@@ -1988,9 +2343,23 @@ void main() {
+         """Upload *pixels* to a GL texture and draw a fullscreen triangle (GPU sRGB + flip)."""
+         gl = self._pyglet_gl
+ 
+-        with wp.ScopedTimer("ViewerRTX::gl_tex_copy", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::gl_tex_copy", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             # copy OVRTX output to OpenGL texture
+             frame_tex = self._tex_resource.map()
++            if isinstance(pixels, wp.array) and pixels.device != frame_tex.device:
++                # OVRTX may map a render product on a different CUDA device
++                # from the OpenGL texture (for example OVRTX on cuda:0 and a
++                # simulation/viewer on cuda:1).  Texture2D.copy_from requires
++                # matching devices, so stage a peer copy first.
++                if (
++                    self._blit_frame_copy is None
++                    or self._blit_frame_copy.shape != pixels.shape
++                    or self._blit_frame_copy.dtype != pixels.dtype
++                    or self._blit_frame_copy.device != frame_tex.device
++                ):
++                    self._blit_frame_copy = wp.empty_like(pixels, device=frame_tex.device)
++                wp.copy(self._blit_frame_copy, pixels)
++                pixels = self._blit_frame_copy
+             frame_tex.copy_from(pixels)
+             self._tex_resource.unmap()
+ 
+@@ -2013,7 +2382,7 @@ void main() {
+             vp_x = 0
+             vp_y = (fb_h - vp_h) // 2
+ 
+-        with wp.ScopedTimer("ViewerRTX::gl_draw", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::gl_draw", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             # Clear the full window to black, then draw into the letterbox region
+             gl.glViewport(0, 0, fb_w, fb_h)
+             gl.glClearColor(0.0, 0.0, 0.0, 1.0)
+@@ -2031,10 +2400,10 @@ void main() {
+             gl.glViewport(0, 0, fb_w, fb_h)
+ 
+         if self.gui:
+-            with wp.ScopedTimer("ViewerRTX::gui_render", active=PROFILE_ENABLED, use_nvtx=True):
++            with wp.ScopedTimer("ViewerRTX::gui_render", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+                 self.gui.render_frame(update_fps=True)
+ 
+-        with wp.ScopedTimer("ViewerRTX::swap_buffers", active=PROFILE_ENABLED, use_nvtx=True):
++        with wp.ScopedTimer("ViewerRTX::swap_buffers", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
+             self._window.flip()
+ 
+     def _capture_screenshot_pixels(self) -> np.ndarray:
+@@ -2113,9 +2482,8 @@ void main() {
+         self._render_products = None
+ 
+         # Release OVRTX resources
+-        if self._transform_binding is not None:
+-            self._transform_binding.unbind()
+-            self._transform_binding = None
++        self._release_transform_binding()
++        self._release_gaussian_bindings()
+ 
+         # Release OVRTX renderer
+         if self._rtx is not None:
+@@ -2144,6 +2512,11 @@ void main() {
+         self._pending_mesh_visibility = {}
+         self._pending_line_batches = {}
+         self._pending_point_batches = {}
++        self._pending_gaussians = {}
++        self._pending_gaussian_xforms = {}
++        self._pending_gaussian_visibility = {}
++        self._gaussian_prim_paths = {}
++        self._has_dynamic_gaussian_streaming = False
+ 
+         self._flat_shape_xforms = None
+         self._flat_shape_parents = None
+@@ -2283,9 +2656,8 @@ void main() {
+         self._render_products = None
+ 
+         # release transform binding
+-        if self._transform_binding is not None:
+-            self._transform_binding.unbind()
+-            self._transform_binding = None
++        self._release_transform_binding()
++        self._release_gaussian_bindings()
+ 
+         # release ovrtx renderer
+         self._rtx = None
+diff --git a/newton/_src/viewer/viewer_usd.py b/newton/_src/viewer/viewer_usd.py
+index 6bbea356..47ee42f4 100644
+--- a/newton/_src/viewer/viewer_usd.py
++++ b/newton/_src/viewer/viewer_usd.py
+@@ -68,6 +68,38 @@ def _usd_set_xform(
+         xform_ops[2].Set(Gf.Vec3d(float(scale[0]), float(scale[1]), float(scale[2])), time)
+ 
+ 
++def _gaussian_frame_data(gaussian: newton.Gaussian) -> tuple[np.ndarray, np.ndarray]:
++    """Return the current splat centers ``(N, 3)`` and orientations ``(N, 4)``.
++
++    ``Gaussian.warp_data.transforms`` is the array a solver skins every step, so it
++    is the live source once the asset has been finalized. The immutable numpy
++    arrays on the asset are the fallback before that happens. Warp packs a
++    transform as ``(x, y, z, qx, qy, qz, qw)``, which matches the in-memory layout
++    of a USD ``quatf`` (imaginary part first), so no reordering is needed.
++
++    The USD backend authors time samples through the USD Python API, so it needs
++    host NumPy arrays.  The asset exposes its static arrays read-only, therefore
++    the fallback path copies them.  RTX has a separate GPU-DLPack update path and
++    does not use this helper for live CUDA-backed Gaussian data.
++    """
++    data = getattr(gaussian, "warp_data", None)
++    if data is not None and data.transforms is not None:
++        transforms = data.transforms.numpy().reshape(-1, 7)
++        return np.ascontiguousarray(transforms[:, 0:3]), np.ascontiguousarray(transforms[:, 3:7])
++    return (
++        np.array(gaussian.positions, dtype=np.float32, copy=True),
++        np.array(gaussian.rotations, dtype=np.float32, copy=True),
++    )
++
++
++def _gaussian_frame_scales(gaussian: newton.Gaussian) -> np.ndarray:
++    """Return the current per-axis Gaussian radii as writable host data."""
++    data = getattr(gaussian, "warp_data", None)
++    if data is not None and data.scales is not None:
++        return np.ascontiguousarray(data.scales.numpy())
++    return np.array(gaussian.scales, dtype=np.float32, copy=True)
++
++
+ class ViewerUSD(ViewerBase):
+     """
+     USD viewer backend for Newton physics simulations.
+@@ -163,6 +195,7 @@ class ViewerUSD(ViewerBase):
+         layer._texture_paths: dict[str, str] = {}
+         layer._mesh_appearance: dict[str, dict[str, Any]] = {}
+         layer._instance_appearance: dict[str, dict[str, np.ndarray]] = {}
++        layer._gaussians = {}  # gaussian_name -> ParticleField3DGaussianSplat prim
+ 
+     def _reset_stage(self):
+         self.stage.GetRootLayer().Clear()
+@@ -206,7 +239,13 @@ class ViewerUSD(ViewerBase):
+                     pass
+ 
+     def _remove_active_layer_prims(self):
+-        names = set(self._meshes) | set(self._instance_groups) | set(self._instancers) | set(self._points)
++        names = (
++            set(self._meshes)
++            | set(self._instance_groups)
++            | set(self._instancers)
++            | set(self._points)
++            | set(self._gaussians)
++        )
+         for name in sorted(names, key=lambda item: self._get_path(item).count("/"), reverse=True):
+             if self._is_layer_owned_path(name):
+                 self.stage.RemovePrim(self._get_path(name))
+@@ -1018,6 +1057,111 @@ class ViewerUSD(ViewerBase):
+         instancer.GetVisibilityAttr().Set("inherited" if not hidden else "invisible", self._frame_index)
+         return instancer.GetPath()
+ 
++    @override
++    def log_gaussian(
++        self,
++        name: str,
++        gaussian: newton.Gaussian,
++        xform: wp.transformf | None = None,
++        hidden: bool = False,
++    ):
++        """Author a :class:`newton.Gaussian` as a ``ParticleField3DGaussianSplat`` prim.
++
++        That prim type, together with its ``positions``, ``orientations``,
++        ``scales``, ``opacities`` and ``radiance:sphericalHarmonicsCoefficients``
++        attributes, is what RTX renderers consume to ray-trace splats, so the
++        recorded stage carries the real Gaussian field rather than a stand-in
++        point cloud.
++
++        Positions and orientations are authored initially. Subsequent time
++        samples are opt-in through ``gaussian._newton_dynamic_attributes``;
++        a deformable sample can select positions, positions and orientations,
++        or positions, orientations, and scales. Opacities and radiance are
++        static and written once.
++
++        Args:
++            name: Unique path/name for the Gaussian field.
++            gaussian: The :class:`newton.Gaussian` asset to visualize.
++            xform: Optional world-space transform applied to all splat centers.
++            hidden: Whether the field should be hidden.
++
++        Returns:
++            ``Sdf.Path`` of the created/updated primitive.
++        """
++        name = self._qualify(name)
++        path = self._get_path(name)
++
++        is_new = name not in self._gaussians
++        if is_new:
++            self._ensure_scopes_for_path(self.stage, path)
++            prim = self.stage.DefinePrim(path, "ParticleField3DGaussianSplat")
++            prim.CreateAttribute("scales", Sdf.ValueTypeNames.Float3Array).Set(
++                Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(gaussian.scales, dtype=np.float32))
++            )
++            prim.CreateAttribute("opacities", Sdf.ValueTypeNames.FloatArray).Set(
++                Vt.FloatArray.FromNumpy(np.ascontiguousarray(gaussian.opacities, dtype=np.float32))
++            )
++            prim.CreateAttribute("radiance:sphericalHarmonicsDegree", Sdf.ValueTypeNames.Int).Set(gaussian.sh_degree)
++            # Coefficients are stored per splat as a flat run of scalars; USD groups
++            # them into one float3 (an RGB triplet) per coefficient.
++            prim.CreateAttribute("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Float3Array).Set(
++                Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(gaussian.sh_coeffs, dtype=np.float32).reshape(-1, 3))
++            )
++            prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray)
++            prim.CreateAttribute("orientations", Sdf.ValueTypeNames.QuatfArray)
++            # Preserve an explicitly authored shadow policy from the source
++            # ParticleField.  In particular, OVRTX defaults Gaussian fields
++            # without this primvar to not casting shadows, so False must not
++            # be dropped while the viewer reconstructs the field.
++            if gaussian.do_not_cast_shadows is not None:
++                prim.CreateAttribute("primvars:doNotCastShadows", Sdf.ValueTypeNames.Bool).Set(
++                    gaussian.do_not_cast_shadows
++                )
++            # ``ParticleField3DGaussianSplat`` may be unknown to a host USD
++            # schema registry (notably an Isaac Sim process that loaded its
++            # own USD distribution).  Create the inherited Imageable property
++            # explicitly, rather than creating a custom token attribute with
++            # the same name, so it retains standard USD visibility semantics.
++            UsdGeom.Imageable(prim).CreateVisibilityAttr()
++            _usd_add_xform(prim)
++            self._gaussians[name] = prim
++
++        prim = self._gaussians[name]
++
++        positions, orientations = _gaussian_frame_data(gaussian)
++        dynamic_attributes = tuple(getattr(gaussian, "_newton_dynamic_attributes", ()))
++        if "positions" in dynamic_attributes or is_new:
++            prim.GetAttribute("positions").Set(Vt.Vec3fArray.FromNumpy(positions), self._frame_index)
++        if "orientations" in dynamic_attributes or is_new:
++            prim.GetAttribute("orientations").Set(Vt.QuatfArray.FromNumpy(orientations), self._frame_index)
++        if "scales" in dynamic_attributes:
++            prim.GetAttribute("scales").Set(
++                Vt.Vec3fArray.FromNumpy(_gaussian_frame_scales(gaussian)), self._frame_index
++            )
++
++        if is_new and dynamic_attributes and getattr(self, "_ovrtx_animated_gaussians", False):
++            # OVRTX chooses static versus PreprocessedAnimatedGaussians while
++            # populating the USD stage.  Its Fabric scene sync classifies an
++            # attribute as animated from more than one USD time sample, not
++            # from a later bind_array_attribute() write.  Seed an identical
++            # next-frame sample for exactly the data the RTX viewer will
++            # stream, so the runtime GPU binding reaches the animated update
++            # path rather than destroying and recreating static geometry.
++            animation_time = self._frame_index + 1
++            if "positions" in dynamic_attributes:
++                prim.GetAttribute("positions").Set(Vt.Vec3fArray.FromNumpy(positions), animation_time)
++            if "orientations" in dynamic_attributes:
++                prim.GetAttribute("orientations").Set(Vt.QuatfArray.FromNumpy(orientations), animation_time)
++            if "scales" in dynamic_attributes:
++                prim.GetAttribute("scales").Set(
++                    Vt.Vec3fArray.FromNumpy(_gaussian_frame_scales(gaussian)), animation_time
++                )
++
++        if xform is not None:
++            _usd_set_xform(prim, pos=xform.p, rot=xform.q, time=self._frame_index)
++        UsdGeom.Imageable(prim).GetVisibilityAttr().Set("invisible" if hidden else "inherited", self._frame_index)
++        return prim.GetPath()
++
+     @override
+     def log_array(self, name: str, array: wp.array[Any] | np.ndarray):
+         """

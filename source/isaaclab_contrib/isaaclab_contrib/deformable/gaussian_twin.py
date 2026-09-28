@@ -14,6 +14,7 @@ Gaussian transforms after every scene update.
 
 from __future__ import annotations
 
+import copy
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
@@ -22,9 +23,11 @@ import numpy as np
 import warp as wp
 from isaaclab_newton.physics import NewtonManager as SimulationManager
 
+from isaaclab.sim import schemas
 from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
-from isaaclab.sim.utils import clone, get_current_stage
+from isaaclab.sim.spawners.materials import spawn_physics_material
+from isaaclab.sim.utils import bind_physics_material, clone, get_current_stage, has_deformable_body_api
 from isaaclab.utils.configclass import configclass
 
 from .deformable_object import DeformableObject
@@ -136,6 +139,72 @@ class GaussianTwinRigidUsdFileCfg(UsdFileCfg):
 
     rigid_mass: float = 0.05
     """Rigid-body mass of one Gaussian-twin package [kg]."""
+
+
+@clone
+def spawn_gaussian_twin_deformable(
+    prim_path: str,
+    cfg: UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Spawn a Gaussian twin while excluding an auxiliary capture floor mesh."""
+    from pxr import Usd, UsdGeom
+
+    # Compose and apply the standard non-deformable overrides first.  Delaying
+    # deformable schema application lets us remove the package's preview Plane
+    # before Isaac Lab searches for the single visual deformable mesh.
+    spawn_cfg = copy.deepcopy(cfg)
+    deformable_props = spawn_cfg.deformable_props
+    physics_material = spawn_cfg.physics_material
+    spawn_cfg.deformable_props = None
+    spawn_cfg.physics_material = None
+    root_prim = spawn_from_usd(
+        prim_path,
+        spawn_cfg,
+        translation=translation,
+        orientation=orientation,
+        **kwargs,
+    )
+
+    for prim in Usd.PrimRange(root_prim):
+        if prim.GetName() == "Plane" and prim.IsA(UsdGeom.Mesh):
+            prim.SetActive(False)
+
+    if deformable_props is not None:
+        stage = get_current_stage()
+        if has_deformable_body_api(root_prim):
+            schemas.modify_deformable_body_properties(prim_path, deformable_props, stage)
+        else:
+            schemas.define_deformable_body_properties(prim_path, deformable_props, stage, "volume")
+        if spawn_cfg.mass_props is not None:
+            raise ValueError(
+                "MassPropertiesCfg are not supported for deformable bodies and should be set through "
+                "deformable_props with mass=<value>."
+            )
+
+    # The standard USD spawner binds materials while the package root has no
+    # deformable API yet.  Apply the material after the schema so Newton can
+    # resolve it on the deformable body.
+    if physics_material is not None:
+        stage = get_current_stage()
+        material_path = (
+            spawn_cfg.physics_material_path
+            if spawn_cfg.physics_material_path.startswith("/")
+            else f"{prim_path}/{spawn_cfg.physics_material_path}"
+        )
+        spawn_physics_material(material_path, physics_material, stage=stage)
+        bind_physics_material(prim_path, material_path, stage=stage)
+
+    return root_prim
+
+
+@configclass
+class GaussianTwinDeformableUsdFileCfg(UsdFileCfg):
+    """USD package configuration for a deformable Gaussian twin."""
+
+    func = "{DIR}.gaussian_twin:spawn_gaussian_twin_deformable"
 
 
 def _env_flag(name: str) -> bool:
@@ -285,6 +354,7 @@ def _bake_aligned_background_gaussian_scale(model) -> None:
             sh_degree=source.sh_degree,
             min_response=source.min_response,
             sorting_mode=source.sorting_mode,
+            do_not_cast_shadows=source.do_not_cast_shadows,
         )
         baked.finalize(device=source_data.transforms.device)
         model.shape_source[shape_index] = baked
@@ -451,6 +521,7 @@ class GaussianTwinDeformableObject(DeformableObject):
     # which toys are active during the same reset. The model identity keeps
     # separate environments in one Python process isolated.
     _selection_by_model_env: dict[tuple[int, int, int, int], np.ndarray] = {}
+    _spawn_offsets_by_model_env: dict[tuple[int, int, int, int], np.ndarray] = {}
     _MODE_ATTRIBUTES: ClassVar[dict[str, tuple[str, ...]]] = {
         "position": ("positions",),
         "position-rotation": ("positions", "orientations"),
@@ -458,10 +529,15 @@ class GaussianTwinDeformableObject(DeformableObject):
     }
 
     def __init__(self, cfg):
+        # The base deformable class establishes the actual instance count
+        # during initialization, rather than in its constructor.
+        self._num_instances = 0
         super().__init__(cfg)
         self._gaussian_bindings: list[_GaussianBinding] = []
         self._gaussian_initialized = False
         self._rest_particles: wp.array | None = None
+        self._base_rest_particles: np.ndarray | None = None
+        self._spawn_offsets: np.ndarray | None = None
         self._rest_particle_offsets: list[int] = []
         self._slot_index = int(getattr(cfg, "slot_index", 0))
         self._num_objects = int(getattr(cfg, "num_objects", 1))
@@ -646,6 +722,8 @@ class GaussianTwinDeformableObject(DeformableObject):
         self._rest_particles = wp.array(
             self._default_nodal_pos_w.numpy().reshape(-1, 3), dtype=wp.vec3, device=self.device
         )
+        self._base_rest_particles = self._default_nodal_pos_w.numpy().reshape(-1, 3).copy()
+        self._spawn_offsets = np.zeros((self._num_instances, 3), dtype=np.float32)
         shape_transforms = model.shape_transform.numpy()
         shape_scales = model.shape_scale.numpy()
         shape_bodies = model.shape_body.numpy()
@@ -738,6 +816,37 @@ class GaussianTwinDeformableObject(DeformableObject):
             self._selection_by_model_env[key] = selection
         return selection
 
+    def _spawn_offset(self, env_id: int, *, refresh: bool) -> np.ndarray:
+        """Return a shared per-slot XY reset jitter for one environment."""
+        model = SimulationManager.get_model()
+        key = (id(model), self._num_slots, self._num_objects, env_id)
+        offsets = self._spawn_offsets_by_model_env.get(key)
+        if refresh or offsets is None:
+            # Keep the movement inside the reachable tabletop workspace. The
+            # slot layout is already separated; this adds episode variation
+            # without requiring the expensive global inter-object contact path.
+            offsets = np.zeros((self._num_slots, 3), dtype=np.float32)
+            offsets[:, 0] = np.random.uniform(-0.06, 0.06, size=self._num_slots)
+            offsets[:, 1] = np.random.uniform(-0.08, 0.08, size=self._num_slots)
+            self._spawn_offsets_by_model_env[key] = offsets
+        return offsets[self._slot_index]
+
+    def _apply_spawn_offset(self, env_id: int, offset: np.ndarray, binding: _GaussianBinding) -> None:
+        """Move the TetMesh rest pose and its Gaussian bind pose together."""
+        if self._base_rest_particles is None or self._spawn_offsets is None:
+            return
+        delta = offset - self._spawn_offsets[env_id]
+        self._spawn_offsets[env_id] = offset
+        rest_particles = self._base_rest_particles.copy()
+        for index, current in enumerate(self._spawn_offsets):
+            start = index * self._particles_per_body
+            rest_particles[start : start + self._particles_per_body] += current
+        wp.copy(self._rest_particles, wp.array(rest_particles, dtype=wp.vec3, device=self.device))
+        rest = np.asarray(binding.rest_transforms.numpy(), dtype=np.float32).copy()
+        rest[:, :3] += delta
+        wp.copy(binding.rest_transforms, wp.array(rest, dtype=wp.transformf, device=self.device))
+        wp.copy(binding.transforms, wp.array(rest, dtype=wp.transformf, device=self.device))
+
     def reset(self, env_ids=None, env_mask=None) -> None:
         super().reset(env_ids, env_mask)
         if not self._gaussian_initialized or self._rest_particles is None:
@@ -758,6 +867,11 @@ class GaussianTwinDeformableObject(DeformableObject):
         for env_id in (int(value) for value in env_ids):
             active = self._slot_index in self._selection(env_id, refresh=self._slot_index == 0)
             binding = self._gaussian_bindings[env_id]
+            self._apply_spawn_offset(
+                env_id,
+                self._spawn_offset(env_id, refresh=self._slot_index == 0),
+                binding,
+            )
             for state in (state_0, state_1):
                 if state is None or state.particle_q is None or state.particle_qd is None:
                     continue

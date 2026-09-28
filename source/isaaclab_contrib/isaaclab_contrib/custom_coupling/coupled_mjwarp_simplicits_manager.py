@@ -12,14 +12,14 @@ from typing import Any
 
 import torch
 import warp as wp
-from isaaclab.physics import PhysicsManager
-from isaaclab.physics import PhysicsEvent
-from isaaclab.sim.utils.stage import get_current_stage
-from isaaclab.utils.timer import Timer
-from isaaclab.utils.string import resolve_matching_names
 from isaaclab_newton.physics.newton_manager import NewtonManager
 from newton import Contacts, Control, Model, State
 from newton.solvers import SolverBase, SolverMuJoCo
+
+from isaaclab.physics import PhysicsEvent, PhysicsManager
+from isaaclab.sim.utils.stage import get_current_stage
+from isaaclab.utils.string import resolve_matching_names
+from isaaclab.utils.timer import Timer
 
 from .newton_manager_cfg import CoupledMJWarpSimplicitsSolverCfg
 from .simplicits_assembly import build_gaussian_twin_simplicits_model
@@ -275,7 +275,9 @@ class NewtonCoupledMJWarpSimplicitsManager(NewtonManager):
         for substep in range(cls._num_substeps):
             for callback in cls._state_force_callbacks:
                 callback(cls._state_0)
-            if collide and (substep == 0 or (cls._collision_decimation > 0 and substep % cls._collision_decimation == 0)):
+            if collide and (
+                substep == 0 or (cls._collision_decimation > 0 and substep % cls._collision_decimation == 0)
+            ):
                 cls._collision_pipeline.collide(cls._state_0, contacts)
             cls._step_solver(cls._state_0, cls._state_1, cls._control, contacts, cls._solver_dt)
             NewtonManager._state_0, NewtonManager._state_1 = cls._state_1, cls._state_0

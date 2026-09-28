@@ -6,6 +6,7 @@
 import logging
 import math
 import os
+import random
 from pathlib import Path
 
 from isaaclab_newton.physics import (
@@ -41,16 +42,22 @@ from isaaclab.utils.configclass import configclass
 
 from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 from isaaclab_contrib.custom_coupling import CoupledFeatherstoneVBDSolverCfg, CoupledMJWarpSimplicitsSolverCfg
-from isaaclab_contrib.deformable.gaussian_twin import GaussianTwinDeformableObject, GaussianTwinRigidUsdFileCfg
+from isaaclab_contrib.deformable.gaussian_twin import (
+    GaussianTwinDeformableObject,
+    GaussianTwinDeformableUsdFileCfg,
+    GaussianTwinRigidUsdFileCfg,
+)
 from isaaclab_contrib.deformable.gaussian_twin_simplicits import (
     GaussianTwinSimplicitsCfg as GaussianTwinSimplicitsAssetCfg,
 )
 
+from isaaclab_tasks.contrib.gaussian_tasks.task_assets import task_asset_root
 from isaaclab_tasks.contrib.stack.stack_env_cfg import PhysicsCfg, mdp
 from isaaclab_tasks.utils import PresetCfg
 
 from . import stack_joint_pos_env_cfg
 
+_DEFAULT_ALIGNED_BACKGROUND_USD = Path(__file__).resolve().parents[7] / "nova_carter-galileo.usda"
 _LOGGER = logging.getLogger(__name__)
 
 # Interactive native-coupling profiles. Isaac Lab advances one 1/120 s physics
@@ -95,8 +102,15 @@ _GAUSSIAN_TWIN_PROXY_PROFILES = {
 
 _GAUSSIAN_TWIN_CONTACT_STIFFNESS = 3.0e4
 _GAUSSIAN_TWIN_CONTACT_DAMPING = 10.0
-_GAUSSIAN_TWIN_SOFT_CONTACT_FRICTION = 10.0
+# This is combined geometrically with the robot/table material friction (2.0),
+# so 10.0 produced an effective coefficient of ~4.5 and made released toys
+# cling to the gripper.  2.0 keeps an effective coefficient of 2.0 for a
+# secure grasp without adhesive-like release behavior.
+_GAUSSIAN_TWIN_SOFT_CONTACT_FRICTION = 2.0
 _GAUSSIAN_TWIN_GRIPPER_EFFORT_LIMIT = 10.0
+_GRASP_FAST_GAUSSIAN_TWIN_GRIPPER_STIFFNESS = 600.0
+_GRASP_FAST_GAUSSIAN_TWIN_GRIPPER_DAMPING = 40.0
+_GRASP_FAST_GAUSSIAN_TWIN_GRIPPER_EFFORT_LIMIT = 20.0
 
 
 def _boolean_env(name: str) -> bool:
@@ -156,16 +170,28 @@ def _optional_nonnegative_float_env(name: str, default: float, *, positive: bool
     return parsed
 
 
-def _gaussian_twin_slot_position(slot_index: int, num_slots: int) -> tuple[float, float, float]:
-    """Return a deterministic, non-overlapping table position for a toy slot."""
+def _gaussian_twin_slot_positions(num_slots: int) -> list[tuple[float, float, float]]:
+    """Return near-robot table positions with small per-run layout variation."""
     # Preserve the single-object demonstration pose exactly.  Multiple toys
     # are laid out in pairs across the table, with enough clearance for the
-    # largest packaged toy (about 0.28 m across) before physics starts.
+    # largest packaged toy (about 0.28 m across) before physics starts. Keep
+    # one generated layout so the USD scene and Simplicits solver agree.
     if num_slots == 1:
-        return (0.5, 0.0, 0.05)
-    column = slot_index % 2
-    row = slot_index // 2
-    return (0.42 + 0.22 * row, -0.24 + 0.48 * column, 0.05)
+        return [(0.5, 0.0, 0.05)]
+    seed = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_SPAWN_SEED", "").strip()
+    rng = random.Random(seed) if seed else random.SystemRandom()
+    positions = []
+    for slot_index in range(num_slots):
+        column = slot_index % 2
+        row = slot_index // 2
+        positions.append(
+            (
+                0.34 + 0.20 * row + rng.uniform(-0.025, 0.025),
+                -0.20 + 0.40 * column + rng.uniform(-0.045, 0.045),
+                0.05,
+            )
+        )
+    return positions
 
 
 def _spawn_aligned_background(prim_path, cfg, translation=None, orientation=None, **kwargs):
@@ -251,6 +277,9 @@ class FrankaCubeStackEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
 class FrankaCubeStackNewtonEnvCfg(FrankaCubeStackEnvCfg):
     """Newton-specific Franka stack configuration for interactive teleoperation."""
 
+    def _default_aligned_background_usd(self) -> Path:
+        return _DEFAULT_ALIGNED_BACKGROUND_USD
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -260,9 +289,10 @@ class FrankaCubeStackNewtonEnvCfg(FrankaCubeStackEnvCfg):
             "yes",
             "on",
         }
-        aligned_background_value = os.environ.get("ISAACLAB_ALIGNED_BACKGROUND_USD")
-        aligned_background = Path(aligned_background_value).expanduser() if aligned_background_value else None
-        if not background_disabled and aligned_background is not None and aligned_background.is_file():
+        aligned_background = Path(
+            os.environ.get("ISAACLAB_ALIGNED_BACKGROUND_USD", str(self._default_aligned_background_usd()))
+        ).expanduser()
+        if not background_disabled and aligned_background.is_file():
             self.scene.background = AssetBaseCfg(
                 prim_path="/World/GaussianBackground",
                 spawn=UsdFileCfg(
@@ -272,10 +302,6 @@ class FrankaCubeStackNewtonEnvCfg(FrankaCubeStackEnvCfg):
             )
         elif background_disabled:
             _LOGGER.info("Aligned Gaussian background disabled by ISAACLAB_DISABLE_ALIGNED_BACKGROUND.")
-        elif aligned_background is None:
-            _LOGGER.info(
-                "No aligned Gaussian background configured; set ISAACLAB_ALIGNED_BACKGROUND_USD to enable one."
-            )
         else:
             _LOGGER.warning("Aligned background USDA not found at '%s'; continuing without it.", aligned_background)
 
@@ -350,7 +376,7 @@ class GaussianTwinCfg(PresetCfg):
         prim_path="{ENV_REGEX_NS}/GaussianTwin",
         class_type=GaussianTwinDeformableObject,
         init_state=DeformableObjectCfg.InitialStateCfg(pos=(0.5, 0.0, 0.05)),
-        spawn=UsdFileCfg(
+        spawn=GaussianTwinDeformableUsdFileCfg(
             usd_path=os.environ.get("ISAACLAB_GAUSSIAN_TWIN_ASSET", ""),
             make_uninstanceable=True,
             deformable_props=NewtonDeformableBodyPropertiesCfg(),
@@ -544,6 +570,9 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
     num_slots: int = 1
     """Number of toy packages preloaded from the asset directory."""
 
+    def _default_aligned_background_usd(self) -> Path:
+        return task_asset_root("gaussian_twin", use_legacy_override=False) / "background/ebc/aligned.usda"
+
     def _configure_native_simulation(self) -> None:
         """Configure the interactive MJWarp/VBD proxy path."""
         self.sim.physics = GaussianTwinPhysicsCfg().newton_mjwarp_vbd_proxy
@@ -590,6 +619,18 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             proxy_cfg.proxy_relaxation,
         )
 
+    def _configure_background_view(self) -> None:
+        """Frame the workcell in the room unless the background is disabled."""
+        # EBC is the default room. Retain explicit opt-out for low-cost teleop.
+        if os.environ.get("ISAACLAB_ENABLE_ALIGNED_BACKGROUND", "").lower() in {"0", "false", "no", "off"}:
+            self.scene.background = None
+        if getattr(self.scene, "background", None) is not None:
+            from isaaclab_visualizers.newton.newton_visualizer_cfg import NewtonRTXVisualizerCfg
+
+            self.viewer.eye = (1.8, -2.2, 1.4)
+            self.viewer.lookat = (0.35, 0.0, 0.1)
+            self.sim.default_visualizer_cfg = NewtonRTXVisualizerCfg(eye=self.viewer.eye, lookat=self.viewer.lookat)
+
     def __post_init__(self):
         super().__post_init__()
         (
@@ -606,12 +647,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
         configured_num_slots = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_NUM_SLOTS")
         if configured_num_slots is not None:
             self.num_slots = int(configured_num_slots)
-        # The aligned background is itself a high-density Gaussian capture.
-        # It is useful for a composed recording but obscures the small robot
-        # scene and dominates RTX frame time during interactive teleoperation.
-        # Keep it opt-in for this task.
-        if os.environ.get("ISAACLAB_ENABLE_ALIGNED_BACKGROUND", "").lower() not in {"1", "true", "yes", "on"}:
-            self.scene.background = None
+        self._configure_background_view()
         self.scene.cube_1 = None
         self.scene.cube_2 = None
         self.scene.cube_3 = None
@@ -642,15 +678,16 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                     )
             self.num_slots = 1
         else:
-            asset_dir_value = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_DIR")
-            if not asset_dir_value:
-                raise ValueError(
-                    "No Gaussian twin asset configured. Set ISAACLAB_GAUSSIAN_TWIN_ASSET to one package or "
-                    "ISAACLAB_GAUSSIAN_TWIN_DIR to a directory containing packaged Gaussian-twin USDA files."
-                )
+            asset_dir_value = os.environ.get(
+                "ISAACLAB_GAUSSIAN_TWIN_DIR", str(task_asset_root("gaussian_twin") / "packages")
+            )
             asset_dir = Path(asset_dir_value).expanduser()
             if not asset_dir.is_dir():
-                raise ValueError(f"Gaussian twin asset directory does not exist: '{asset_dir}'.")
+                raise ValueError(
+                    f"Gaussian twin asset directory does not exist: '{asset_dir}'. "
+                    "Download it with source/isaaclab_tasks/isaaclab_tasks/contrib/gaussian_tasks/assets.py "
+                    "--task gaussian_twin, or set ISAACLAB_GAUSSIAN_TWIN_DIR."
+                )
             # The original Gaussian-twin packager emits ``*_package.usda``;
             # the DexSuite 4 mm / 512-node pipeline emits the equally valid
             # ``*_skinned_vbd_tet.usda`` form.  Both contain the same TetMesh
@@ -701,6 +738,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             )
             selected_paths = asset_paths[: self.num_slots]
             position_count = self.num_slots
+        slot_positions = _gaussian_twin_slot_positions(position_count)
         if simplicits_simulation:
             requested_splat_deformation = os.environ.get("ISAACLAB_GAUSSIAN_TWIN_SPLAT_DEFORMATION", "").strip()
             if requested_splat_deformation and requested_splat_deformation != "position":
@@ -714,7 +752,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
                 prim_path=f"{{ENV_REGEX_NS}}/GaussianTwin_{slot_index}",
                 spawn=base_cfg.spawn.replace(usd_path=str(asset_path)),
             )
-            slot_cfg.init_state.pos = _gaussian_twin_slot_position(slot_index, position_count)
+            slot_cfg.init_state.pos = slot_positions[slot_index]
             if rigid_simulation:
                 slot_cfg.spawn.rigid_mass = rigid_mass
             else:
@@ -762,9 +800,7 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             self.sim.physics = GaussianTwinPhysicsCfg().newton_mjwarp_simplicits
             solver_cfg = self.sim.physics.solver_cfg
             solver_cfg.asset_paths = [str(path) for path in selected_paths]
-            solver_cfg.slot_positions = [
-                _gaussian_twin_slot_position(slot_index, position_count) for slot_index in range(position_count)
-            ]
+            solver_cfg.slot_positions = slot_positions
             solver_cfg.enable_inter_object_collisions = self.num_objects > 1
             _LOGGER.info(
                 "Enabled Gaussian twin Simplicits benchmark: MJWarp + RKPM Simplicits, "
@@ -791,12 +827,16 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             )
         else:
             self._configure_native_simulation()
-        if self.num_objects > 1 and not rigid_simulation and not simplicits_simulation:
-            # VBD disables particle--particle contact by default.  This leaves
-            # independently imported TetMeshes ghosting through one another.
-            # These are contact-detection radii in metres, sized for the
-            # packaged toys' ~4 mm particles; the larger margin avoids misses
-            # at the task's 1/120 s tick.
+        if (
+            self.num_objects > 1
+            and not rigid_simulation
+            and not simplicits_simulation
+            and _boolean_env("ISAACLAB_GAUSSIAN_TWIN_INTER_OBJECT_COLLISIONS")
+        ):
+            # The pre-defined table slots do not overlap, so keep this
+            # expensive global self-contact solve opt-in. In the coupled VBD
+            # path it currently destabilizes rigid/table contacts when several
+            # independent TetMeshes share one particle model.
             soft_solver = (
                 self.sim.physics.solver_cfg.soft_solver_cfg
                 if dexsuite_simulation
@@ -805,8 +845,16 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             soft_solver.particle_enable_self_contact = True
             soft_solver.particle_self_contact_radius = 0.008
             soft_solver.particle_self_contact_margin = 0.012
+            # The default (-1) detects pairs only while the solver initializes.
+            # Separate toys meet after reset, so refresh broad-phase pairs during
+            # the solve.  A global vertex-triangle/edge-edge query is expensive;
+            # once every four VBD iterations is a practical interactive default.
+            soft_solver.particle_collision_detection_interval = _optional_positive_int_env(
+                "ISAACLAB_GAUSSIAN_TWIN_INTER_OBJECT_COLLISION_INTERVAL", 4
+            )
             soft_solver.particle_vertex_contact_buffer_size = 64
             soft_solver.particle_edge_contact_buffer_size = 128
+            _LOGGER.info("Enabled experimental Gaussian twin inter-object self-contact.")
         if balanced_simulation or grasp_fast_simulation or fast_simulation:
             if balanced_simulation:
                 substeps = _BALANCED_GAUSSIAN_TWIN_SUBSTEPS
@@ -835,15 +883,48 @@ class FrankaGaussianTwinStackNewtonEnvCfg(FrankaCubeStackNewtonEnvCfg):
             self.sim.physics.num_substeps = substeps
             self.sim.physics.solver_cfg.entries[1].solver_cfg.iterations = iterations
             hand = self.scene.robot.actuators["panda_hand"]
-            hand.stiffness *= drive_frequency_ratio**2
-            hand.damping *= drive_frequency_ratio
-            _LOGGER.info(
-                "Enabled Gaussian twin %s simulation: %d substeps, %d VBD iterations, %.1f Hz-equivalent hand drive.",
-                profile_name,
-                substeps,
-                iterations,
-                drive_frequency,
-            )
+            if grasp_fast_simulation:
+                # The generic Newton task deliberately uses a soft hand drive
+                # for rigid cubes.  On a deformable, that drive develops only
+                # about 1 N per finger before motion stops, far below its
+                # effort limit.  Use a firmer, still force-limited drive so a
+                # closed command maintains useful normal pressure.
+                hand.stiffness = _optional_nonnegative_float_env(
+                    "ISAACLAB_GAUSSIAN_TWIN_GRIPPER_STIFFNESS",
+                    _GRASP_FAST_GAUSSIAN_TWIN_GRIPPER_STIFFNESS,
+                    positive=True,
+                )
+                hand.damping = _optional_nonnegative_float_env(
+                    "ISAACLAB_GAUSSIAN_TWIN_GRIPPER_DAMPING",
+                    _GRASP_FAST_GAUSSIAN_TWIN_GRIPPER_DAMPING,
+                    positive=True,
+                )
+                hand.joint_effort_limit = _optional_nonnegative_float_env(
+                    "ISAACLAB_GAUSSIAN_TWIN_GRIPPER_EFFORT_LIMIT",
+                    _GRASP_FAST_GAUSSIAN_TWIN_GRIPPER_EFFORT_LIMIT,
+                    positive=True,
+                )
+            else:
+                hand.stiffness *= drive_frequency_ratio**2
+                hand.damping *= drive_frequency_ratio
+            if grasp_fast_simulation:
+                _LOGGER.info(
+                    "Enabled Gaussian twin grasp-fast simulation: %d substeps, %d VBD iterations, "
+                    "%.0f N/m hand stiffness, %.0f N effort limit.",
+                    substeps,
+                    iterations,
+                    hand.stiffness,
+                    hand.joint_effort_limit,
+                )
+            else:
+                _LOGGER.info(
+                    "Enabled Gaussian twin %s simulation: %d substeps, %d VBD iterations, "
+                    "%.1f Hz-equivalent hand drive.",
+                    profile_name,
+                    substeps,
+                    iterations,
+                    drive_frequency,
+                )
         self.terminations.cube_1_dropping = None
         self.terminations.cube_2_dropping = None
         self.terminations.cube_3_dropping = None

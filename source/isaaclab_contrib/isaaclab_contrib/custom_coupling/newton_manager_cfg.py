@@ -77,7 +77,9 @@ class CoupledMJWarpSimplicitsSolverCfg(NewtonSolverCfg):
     task to build one object for every environment/slot.
     """
 
-    class_type: type[NewtonManager] | str = "{DIR}.coupled_mjwarp_simplicits_manager:NewtonCoupledMJWarpSimplicitsManager"
+    class_type: type[NewtonManager] | str = (
+        "{DIR}.coupled_mjwarp_simplicits_manager:NewtonCoupledMJWarpSimplicitsManager"
+    )
     """Manager class implementing the mixed MJWarp/Simplicits step."""
 
     rigid_solver_cfg: MJWarpSolverCfg = MJWarpSolverCfg()

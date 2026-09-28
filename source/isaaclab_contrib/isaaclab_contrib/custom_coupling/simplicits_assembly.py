@@ -63,7 +63,9 @@ def _load_skinned_asset(path: str, device: str) -> Any:
     if stage is None:
         raise FileNotFoundError(f"Failed to open Simplicits asset '{path}'.")
     prim = _find_skinned_prim(stage)
-    skinned = kaolin_usd.get_skinned_physics(stage, prim.GetPath().pathString, instance_name="default", attribute="positions")
+    skinned = kaolin_usd.get_skinned_physics(
+        stage, prim.GetPath().pathString, instance_name="default", attribute="positions"
+    )
     if skinned is None:
         # Kaolin schemas can be registered after USD is opened by Isaac Sim.
         # The public writer also authors these underlying attributes, so retain
@@ -78,7 +80,9 @@ def _load_skinned_asset(path: str, device: str) -> Any:
         points = tensor("pts", (-1, 3))
         appx_vol = prim.GetAttribute("kaolin_skinned_physics:default:appx_vol").Get()
         renderable_weights = tensor("renderable_skinning_weights")
-        renderable_points = torch.as_tensor(np.asarray(prim.GetAttribute("positions").Get()).copy(), dtype=torch.float32)
+        renderable_points = torch.as_tensor(
+            np.asarray(prim.GetAttribute("positions").Get()).copy(), dtype=torch.float32
+        )
         if points is None or appx_vol is None or renderable_weights is None:
             raise ValueError(f"'{path}' is missing required Kaolin RKPM attributes on '{prim.GetPath()}'.")
         renderable = SkinnedPoints(
@@ -161,11 +165,7 @@ def _build_gaussian_proto(stage: Any, env_path: str, slot: int, up_axis: str) ->
 
     slot_prim = stage.GetPrimAtPath(f"{env_path}/GaussianTwin_{slot}")
     gaussian = next(
-        (
-            prim
-            for prim in Usd.PrimRange(slot_prim)
-            if prim.GetTypeName() == "ParticleField3DGaussianSplat"
-        ),
+        (prim for prim in Usd.PrimRange(slot_prim) if prim.GetTypeName() == "ParticleField3DGaussianSplat"),
         None,
     )
     if gaussian is None:
@@ -181,7 +181,9 @@ def _build_gaussian_proto(stage: Any, env_path: str, slot: int, up_axis: str) ->
     return builder
 
 
-def _transform(env_position: tuple[float, float, float], slot_position: tuple[float, float, float], device: str) -> torch.Tensor:
+def _transform(
+    env_position: tuple[float, float, float], slot_position: tuple[float, float, float], device: str
+) -> torch.Tensor:
     result = torch.eye(4, device=device, dtype=torch.float32)
     result[:3, 3] = torch.as_tensor(env_position, device=device) + torch.as_tensor(slot_position, device=device)
     return result

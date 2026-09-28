@@ -16,6 +16,8 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # Unified diffs require the leading space on blank context lines.
+        exclude: '^source/isaaclab_tasks/isaaclab_tasks/contrib/gaussian_tasks/dependencies/.*\.patch$'
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: check-added-large-files
