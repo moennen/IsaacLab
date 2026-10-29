@@ -115,8 +115,7 @@ Each module's docstring explains its part; the solvers' docstrings list their me
 The default **explicit** solver (`physics/grasp_explicit_mpm.py`) is an MLS-MPM with fixed-corotated elasticity,
 plasticity, damage (bruising and tearing) and frictional finger-pad contact; each berry is its own velocity field, in
 frictional contact with the others. The **implicit** solver (`physics/grasp_implicit_mpm.py`) builds on Newton's
-implicit MPM. It cannot yet hold a berry by friction, so while the fingers hold still the tissue they press is clamped
-to them. It is slower, and the arm passes through the tableware. The **vbd** solver (`physics/grasp_vbd.py`) is
+implicit MPM, which holds the berry by friction, configured as Newton's `example_mpm_pinch_carry`. It is slower, and the arm passes through the tableware. The **vbd** solver (`physics/grasp_vbd.py`) is
 Newton's VBD on a tetrahedral mesh of each berry, from its asset, gripped by friction; its Gaussians are skinned to
 the mesh (`gaussian_splats/vbd_binding.py`). Its tissue is damped elastic, without damage: a squeezed berry recovers
 its shape. The arm also passes through the tableware with it. Stiffnesses are empirical handling presets, not

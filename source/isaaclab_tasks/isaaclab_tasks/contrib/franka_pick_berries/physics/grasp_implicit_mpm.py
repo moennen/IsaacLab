@@ -3,140 +3,32 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Newton's implicit MPM with clamped finger grasping and a tissue damage model.
+"""Newton's implicit MPM with a tissue damage model; the fingers hold the berry by friction.
 
-:class:`SolverGraspImplicitMPM` extends :class:`~newton.solvers.SolverImplicitMPM` for gripping soft tissue:
+:class:`SolverGraspImplicitMPM` extends :class:`~newton.solvers.SolverImplicitMPM` with **damage**. Newton's implicit
+MPM has plasticity but no damage model. After each step, the solver accumulates a plastic strain history from the
+strain rate while a particle yields, and from it damage and tearing, plus a bruise dose from sustained compression;
+damage and tearing weaken the particle's shear and tensile yield limits. Stress is evaluated from the stored elastic
+deformation with the tissue's elastic law.
 
-* **Clamped grasping.** In Newton's implicit MPM, the stress with which a pinched solid pushes back on two fingers
-  drains away while the fingers hold it, even though its elastic deformation is kept: a berry held only by friction
-  slips out as soon as the hand carries it. The solver holds the berry the way Newton drives solids through
-  prescribed particles (see ``example_mpm_beam_twist``): while grasping is on, tissue particles that the solve presses
-  against a gripping body are clamped to it. A clamped particle has zero density, which Newton treats as a kinematic
-  boundary condition, and its position, velocity and velocity gradient follow the body's rigid motion. The rest of
-  the tissue hangs from them and deforms as MPM. Turning grasping off releases every clamp.
-* **Damage.** Newton's implicit MPM has plasticity but no damage model. After each step, the solver accumulates a
-  plastic strain history from the strain rate while a particle yields, and from it damage and tearing, plus a bruise
-  dose from sustained compression; damage and tearing weaken the particle's shear and tensile yield limits. Stress is
-  evaluated from the stored elastic deformation with the tissue's elastic law, not read from the solver's stress
-  output: at a constant deformation, that output drains away over the steps by an amount that depends on the step
-  size, while the elastic deformation is kept.
-
-Clamping needs a particle collider basis (``"pic"`` or ``"picN"``), where every tissue particle is a collider node.
-The tissue's yield limits and damage parameters are set per body of tissue with
-:meth:`SolverGraspImplicitMPM.set_tissue`.
+Grasping is Newton's own frictional contact between the finger proxies and the tissue, configured as in Newton's
+``example_mpm_pinch_carry`` (see :class:`GraspImplicitMPMSolverCfg`). The tissue's yield limits and damage parameters
+are set per body of tissue with :meth:`SolverGraspImplicitMPM.set_tissue`.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 import newton
 import numpy as np
 import warp as wp
-import warp.fem as fem
 from isaaclab_newton.physics import MPMSolver, MPMSolverCfg
 from newton.solvers import SolverImplicitMPM
 
 from isaaclab.utils import configclass
 
 from .materials import YOUNG_MODULUS
-
-_FREE = -1
-
-
-# --------------------------------------------------------------------------------------------------------------------
-# Clamped grasping
-# --------------------------------------------------------------------------------------------------------------------
-
-
-@wp.kernel
-def drive_clamped_particles(
-    grasping: wp.array[int],
-    clamp_body: wp.array[int],
-    anchor: wp.array[wp.vec3],
-    body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
-    body_com: wp.array[wp.vec3],
-    particle_mass: wp.array[float],
-    particle_volume: wp.array[float],
-    particle_q: wp.array[wp.vec3],
-    particle_qd: wp.array[wp.vec3],
-    particle_qd_grad: wp.array[wp.mat33],
-    particle_density: wp.array[float],
-):
-    """Move clamped particles rigidly with their finger, as kinematic particles; release them all when not grasping."""
-    particle = wp.tid()
-    body = clamp_body[particle]
-    if body == _FREE:
-        return
-    if grasping[0] == 0:
-        clamp_body[particle] = _FREE
-        particle_density[particle] = particle_mass[particle] / particle_volume[particle]
-        return
-    pose = body_q[body]
-    position = wp.transform_point(pose, anchor[particle])
-    angular = wp.spatial_bottom(body_qd[body])
-    particle_q[particle] = position
-    particle_qd[particle] = wp.spatial_top(body_qd[body]) + wp.cross(
-        angular, position - wp.transform_point(pose, body_com[body])
-    )
-    particle_qd_grad[particle] = wp.skew(angular)
-    particle_density[particle] = 0.0
-
-
-@wp.kernel
-def release_clamps(
-    particle_mass: wp.array[float],
-    particle_volume: wp.array[float],
-    clamp_body: wp.array[int],
-    particle_density: wp.array[float],
-):
-    """Release every clamped particle and restore its density."""
-    particle = wp.tid()
-    if clamp_body[particle] != _FREE:
-        clamp_body[particle] = _FREE
-        particle_density[particle] = particle_mass[particle] / particle_volume[particle]
-
-
-@wp.kernel
-def clamp_pressed_particles(
-    grasping: wp.array[int],
-    space_nodes: wp.array[int],
-    cell_particles: wp.array[int],
-    node_positions: wp.array[wp.vec3],
-    node_normals: wp.array[wp.vec3],
-    node_colliders: wp.array[int],
-    node_impulse: wp.array[wp.vec3],
-    collider_body: wp.array[int],
-    gripping_body: wp.array[int],
-    body_q: wp.array[wp.transform],
-    clamp_body: wp.array[int],
-    anchor: wp.array[wp.vec3],
-):
-    """Clamp particles that the solve pressed against a gripping body, at their current place on it."""
-    node = wp.tid()
-    if grasping[0] == 0 or node_positions[node][0] == fem.OUTSIDE:
-        # Not grasping, or an unused capacity slot that does not map to a particle.
-        return
-    collider = node_colliders[node]
-    if collider < 0:
-        return
-    body = collider_body[collider]
-    if body < 0 or gripping_body[body] == 0:
-        return
-    if wp.dot(node_impulse[node], node_normals[node]) <= 0.0:
-        return
-    # A particle collider basis: the node is an evaluation point of the particle quadrature.
-    particle = cell_particles[space_nodes[node]]
-    if clamp_body[particle] == _FREE:
-        clamp_body[particle] = body
-        anchor[particle] = wp.transform_point(wp.transform_inverse(body_q[body]), node_positions[node])
-
-
-# --------------------------------------------------------------------------------------------------------------------
-# Damage
-# --------------------------------------------------------------------------------------------------------------------
 
 
 @wp.func
@@ -180,7 +72,6 @@ def update_damage(
     base_shear: wp.array[float],
     tear_onset: wp.array[float],
     tear_end: wp.array[float],
-    clamp_body: wp.array[int],
     dt: float,
     config: DamageParameters,
     history: wp.array[float],
@@ -192,9 +83,6 @@ def update_damage(
 ):
     """Advance damage, tearing and bruising by ``dt`` [s] and weaken the particle's yield limits."""
     p = wp.tid()
-    if clamp_body[p] != _FREE:
-        # A clamped particle's motion is prescribed by its body, not by the tissue's deformation.
-        return
     principal = principal_stress(elastic_strain[p], young[p], poisson[p])
 
     # Strain history, standing in for accumulated plastic strain, which Newton does not store: once a particle sits on
@@ -323,23 +211,12 @@ def tissue_material(profile: dict) -> TissueMaterial:
 
 
 class SolverGraspImplicitMPM(SolverImplicitMPM):
-    """:class:`~newton.solvers.SolverImplicitMPM` with clamped grasping and damage (see the module docstring)."""
+    """:class:`~newton.solvers.SolverImplicitMPM` with tissue damage (see the module docstring)."""
 
     def __init__(self, model: newton.Model, config: SolverImplicitMPM.Config, **kwargs):
-        if not config.collider_basis.startswith("pic"):
-            raise ValueError(f"SolverGraspImplicitMPM needs a particle collider basis, not {config.collider_basis!r}")
         super().__init__(model, config, **kwargs)
         device = model.device
         count = model.particle_count
-        self.grasping = wp.zeros(1, dtype=int, device=device)
-        """Whether clamping is on (1) or off (0); set with :meth:`set_implicit_grasp`."""
-        self.clamp_body = wp.full(count, _FREE, dtype=int, device=device)
-        """Body each particle is clamped to, or -1."""
-        self.anchor = wp.zeros(count, dtype=wp.vec3, device=device)
-        """Clamped position of each particle in its body's frame [m]."""
-        self.gripping_body = wp.zeros(model.body_count, dtype=int, device=device)
-        """Whether each body clamps tissue (1) or not (0); set with :meth:`set_gripping_bodies`."""
-        self._pic = None
         self.damage_config = DamageConfig()
         """Damage model parameters; set before the first step."""
         with wp.ScopedDevice(device):
@@ -351,21 +228,6 @@ class SolverGraspImplicitMPM(SolverImplicitMPM):
             self.damage = wp.zeros(count, dtype=float)
             self.tear = wp.zeros(count, dtype=float)
             self.dose = wp.zeros(count, dtype=float)
-
-    def set_gripping_bodies(self, pattern: str) -> None:
-        """Select the bodies that clamp tissue: those whose label fully matches the regular expression."""
-        matches = np.array([re.fullmatch(pattern, label) is not None for label in self.model.body_label], np.int32)
-        if not matches.any():
-            raise ValueError(f"No body label matches {pattern!r}")
-        self.gripping_body.assign(matches)
-
-    def set_implicit_grasp(self, grasping: bool) -> None:
-        """Turn clamping on or off; turning it off releases every clamped particle on the next step.
-
-        Call outside CUDA graph capture; captured steps read the value when they run. :attr:`grasping` can also be
-        written on the device.
-        """
-        self.grasping.fill_(int(grasping))
 
     def set_tissue(self, start: int, interface: np.ndarray, field: int, material: TissueMaterial) -> None:
         """Set the material of a body of tissue: the particles from ``start`` on, one per ``interface`` flag.
@@ -405,14 +267,7 @@ class SolverGraspImplicitMPM(SolverImplicitMPM):
 
     def reset(self, state, world_mask=None, flags=None):
         super().reset(state, world_mask=world_mask, flags=flags)
-        # Clamps and damage are part of the particles' history.
-        wp.launch(
-            release_clamps,
-            dim=self.model.particle_count,
-            inputs=[self.model.particle_mass, self._mpm_model.particle_volume],
-            outputs=[self.clamp_body, self._mpm_model.particle_density],
-            device=self.model.device,
-        )
+        # Damage is part of the particles' history.
         for array in (self.history, self.damage, self.tear, self.dose):
             array.zero_()
         wp.launch(
@@ -425,27 +280,6 @@ class SolverGraspImplicitMPM(SolverImplicitMPM):
 
     def step(self, state_in, state_out, control, contacts, dt):
         model = self.model
-        wp.launch(
-            drive_clamped_particles,
-            dim=model.particle_count,
-            inputs=[
-                self.grasping,
-                self.clamp_body,
-                self.anchor,
-                state_in.body_q,
-                state_in.body_qd,
-                model.body_com,
-                model.particle_mass,
-                self._mpm_model.particle_volume,
-            ],
-            outputs=[
-                state_in.particle_q,
-                state_in.particle_qd,
-                state_in.mpm.particle_qd_grad,
-                self._mpm_model.particle_density,
-            ],
-            device=model.device,
-        )
         super().step(state_in, state_out, control, contacts, dt)
         config = self.damage_config
         parameters = DamageParameters()
@@ -471,7 +305,6 @@ class SolverGraspImplicitMPM(SolverImplicitMPM):
                 self.base_shear,
                 self.tear_onset,
                 self.tear_end,
-                self.clamp_body,
                 dt,
                 parameters,
             ],
@@ -486,31 +319,6 @@ class SolverGraspImplicitMPM(SolverImplicitMPM):
             device=model.device,
         )
 
-    def _step_impl(self, state_in, state_out, dt, pic, scratch):
-        # The collider nodes are the particles of this step's quadrature.
-        self._pic = pic
-        super()._step_impl(state_in, state_out, dt, pic, scratch)
-
-    def _update_particles(self, state_in, state_out, dt, pic, scratch):
-        wp.launch(
-            clamp_pressed_particles,
-            dim=scratch.collider_node_count,
-            inputs=[
-                self.grasping,
-                scratch.impulse_field.space_partition.space_node_indices(),
-                self._pic.cell_particle_indices,
-                scratch.collider_position_field.dof_values,
-                scratch.collider_normal_field.dof_values,
-                scratch.collider_ids,
-                scratch.impulse_field.dof_values,
-                self._mpm_model.collider.collider_body_index,
-                self.gripping_body,
-                state_in.body_q,
-            ],
-            outputs=[self.clamp_body, self.anchor],
-        )
-        super()._update_particles(state_in, state_out, dt, pic, scratch)
-
 
 # --------------------------------------------------------------------------------------------------------------------
 # Isaac Lab integration
@@ -522,23 +330,17 @@ class GraspImplicitMPMSolver(MPMSolver):
 
     solver_class = SolverGraspImplicitMPM
 
-    @classmethod
-    def build(
-        cls, cfg: GraspImplicitMPMSolverCfg, model, mode: wp.DeterministicMode, env_template: str | None = None
-    ) -> SolverGraspImplicitMPM:
-        solver = super().build(cfg, model, mode, env_template)
-        solver.set_gripping_bodies(cfg.gripping_bodies)
-        return solver
-
 
 @configclass
 class GraspImplicitMPMSolverCfg(MPMSolverCfg):
-    """Configuration of :class:`SolverGraspImplicitMPM`, with defaults tuned for berry tissue."""
+    """Configuration of :class:`SolverGraspImplicitMPM`, with defaults tuned for berry tissue.
+
+    The fingers hold the berry by friction, with the settings of Newton's ``example_mpm_pinch_carry``: GIMP integration,
+    the residual strain of unconverged solves carried (without it, a pinched solid's grip relaxes step after step), and
+    collider velocities from the fingers' successive poses (see :attr:`collider_velocity_mode`).
+    """
 
     class_type: type = GraspImplicitMPMSolver
-
-    gripping_bodies: str = ".*"
-    """Regular expression fully matching the labels of the bodies that clamp tissue."""
 
     grid_type: str = "sparse"
     grid_padding: int = 0
@@ -546,6 +348,8 @@ class GraspImplicitMPMSolverCfg(MPMSolverCfg):
     """P1d strain with many iterations resolves the elastic response; P0 or few iterations leave the tissue far softer
     than its Young's modulus."""
     transfer_scheme: str = "apic"
+    integration_scheme: str = "gimp"
+    carry_residual_strain: str = "unconverged"
     max_iterations: int = 100
     """Each solve is the dominant cost of a step. 50 iterations leave a carried berry visibly softer (it stretches
     out of shape)."""
@@ -553,7 +357,10 @@ class GraspImplicitMPMSolverCfg(MPMSolverCfg):
     warmstart_mode: str = "auto"
     velocity_basis: str = "Q1"
     collider_basis: str = "pic27"
-    """Collider basis; must be a particle basis, so that every particle is a collider node."""
-    collider_velocity_mode: str = "forward"
-    solver: str = "jacobi"
+    collider_velocity_mode: str = "backward"
+    """The coupled step hands the tissue the fingers' poses after the arm has moved them. ``"backward"`` takes the
+    collider velocity from that pose and the previous one, the motion the tissue actually sees; ``"forward"``
+    extrapolates from the posed velocity and lets a carried berry slip out of the fingers."""
+    solver: str = "auto"
+    """Newton picks the rheology solver; with GIMP integration, ``"jacobi"`` diverges on the pinched tissue."""
     separate_worlds: bool = True

@@ -7,7 +7,6 @@
 (:mod:`.grasp_explicit_mpm`, the default), implicit MPM (:mod:`.grasp_implicit_mpm`) or VBD (:mod:`.grasp_vbd`)."""
 
 import newton
-import warp as wp
 from isaaclab_newton.physics import (
     MJWarpSolverCfg,
     NewtonBackend,
@@ -26,7 +25,7 @@ from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerP
 from ..scene.tableware import PunnetSpec
 from . import grasp_explicit_mpm, grasp_implicit_mpm
 from .grasp_explicit_mpm import GraspExplicitMPMSolverCfg, SolverGraspExplicitMPM, explicit_solver_config
-from .grasp_implicit_mpm import GraspImplicitMPMSolverCfg, SolverGraspImplicitMPM
+from .grasp_implicit_mpm import GraspImplicitMPMSolverCfg
 from .grasp_vbd import GraspVBDSolverCfg
 
 ARM_ENTRY = "arm"
@@ -61,7 +60,7 @@ def coupled_physics_cfg(solver: str = "explicit") -> NewtonCfg:
     Args:
         solver: ``"explicit"`` for the explicit MLS-MPM with frictional finger pads
             (:class:`.grasp_explicit_mpm.SolverGraspExplicitMPM`), ``"implicit"`` for Newton's implicit MPM with
-            clamped grasping (:class:`.grasp_implicit_mpm.SolverGraspImplicitMPM`), or ``"vbd"`` for Newton's VBD on
+            frictional grasping (:class:`.grasp_implicit_mpm.SolverGraspImplicitMPM`), or ``"vbd"`` for Newton's VBD on
             the berries' tetrahedral meshes (:mod:`.grasp_vbd`).
     """
     collision_cfg = NewtonCollisionPipelineCfg(soft_contact_max=0)
@@ -70,7 +69,7 @@ def coupled_physics_cfg(solver: str = "explicit") -> NewtonCfg:
         # One implicit solve per coupled substep (240 Hz); a single solve per 120 Hz physics step diverges.
         tissue = CouplerEntryCfg(
             name=TISSUE_ENTRY,
-            solver_cfg=GraspImplicitMPMSolverCfg(gripping_bodies=_FINGERS),
+            solver_cfg=GraspImplicitMPMSolverCfg(),
             all_particles=True,
             include_static_shapes=True,
             substeps=1,
@@ -203,18 +202,6 @@ def register_tissues(tissues) -> None:
             tissue.particle_start, tissue.particles["interface"], field, module.tissue_material(tissue.profile)
         )
         tissue.bind_damage(solver)
-
-
-def set_implicit_grasp(grasping: wp.array) -> None:
-    """Clamp the tissue that the fingers press to them, or release it, with the implicit solver.
-
-    Args:
-        grasping: One-element ``int32`` flag on the simulation device, nonzero to grasp. It is copied on the device,
-            without synchronizing with the host.
-    """
-    solver = tissue_solver()[0]
-    if isinstance(solver, SolverGraspImplicitMPM):
-        wp.copy(solver.grasping, grasping)
 
 
 def check_tissue_solver() -> None:

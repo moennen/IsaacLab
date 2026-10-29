@@ -45,8 +45,8 @@ parser.add_argument(
     choices=["explicit", "implicit", "vbd"],
     default="explicit",
     help=(
-        "Explicit MLS-MPM with frictional finger pads, Newton's implicit MPM with clamped grasping, or Newton's VBD on"
-        " a tetrahedral mesh (elastic, without damage)"
+        "Explicit MLS-MPM with frictional finger pads, Newton's implicit MPM with frictional grasping, or Newton's"
+        " VBD on a tetrahedral mesh (elastic, without damage)"
     ),
 )
 parser.add_argument(
