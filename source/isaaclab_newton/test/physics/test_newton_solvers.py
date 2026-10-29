@@ -376,22 +376,23 @@ def test_mpm_cfg_translates_deprecated_collider_velocity_modes(mode, expected, d
     assert any(f"use {expected!r}" in message for message in deprecations) is deprecated
 
 
-def test_mpm_prepare_builder_makes_kinematic_bodies_massless():
-    """Kinematic bodies become massless so MPM treats them as kinematic colliders; dynamic bodies keep their mass."""
-    builder = ModelBuilder()
-    kinematic = builder.add_body(mass=0.35, inertia=wp.mat33(1.0), is_kinematic=True)
-    dynamic = builder.add_body(mass=1.2, inertia=wp.mat33(2.0))
+def test_mpm_prepare_builder_keeps_kinematic_body_mass():
+    """Kinematic bodies keep their mass, which a coupled rigid solver needs; MPM reads their kinematic flag."""
+    builder = newton.ModelBuilder()
+    kinematic_body = builder.add_body(
+        mass=0.35,
+        inertia=wp.mat33(2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0),
+        is_kinematic=True,
+        label="kinematic_collider",
+    )
 
     MPMSolver.prepare_builder(MPMSolverCfg(), builder)
 
-    assert builder.body_mass[kinematic] == builder.body_inv_mass[kinematic] == 0.0
-    assert np.allclose(np.array(builder.body_inertia[kinematic]), 0.0)
-    assert np.allclose(np.array(builder.body_inv_inertia[kinematic]), 0.0)
-    assert builder.body_mass[dynamic] == pytest.approx(1.2)
-    assert np.allclose(np.array(builder.body_inertia[dynamic]), 2.0)
+    assert builder.body_flags[kinematic_body] & int(newton.BodyFlags.KINEMATIC)
+    assert builder.body_mass[kinematic_body] == pytest.approx(0.35)
+    assert np.allclose(np.array(builder.body_inertia[kinematic_body]).reshape(3, 3), np.diag([2.0, 3.0, 4.0]))
 
 
-@pytest.mark.skipif(not wp.get_cuda_device_count(), reason="CUDA is unavailable")
 def test_mpm_prepare_builder_converts_convex_meshes_before_solver_construction():
     """Convex meshes become triangle meshes before implicit MPM consumes the model."""
     builder = ModelBuilder()

@@ -97,6 +97,13 @@ class MPMSolverCfg(NewtonSolverCfg):
     integration_scheme: Literal["pic", "gimp"] = "pic"
     """Integration scheme controlling shape-function support."""
 
+    carry_residual_strain: Literal["none", "unconverged", "sampled"] = "none"
+    """Residual strain carried into the elastic strain beyond the strain consistent with the solved stress.
+
+    ``"unconverged"`` keeps the strain an unconverged solve leaves, which a held solid otherwise loses step after step;
+    see :attr:`newton.solvers.SolverImplicitMPM.Config.carry_residual_strain`.
+    """
+
     # material / background
     critical_fraction: float = 0.0
     """Dimensionless fraction under which the yield surface collapses."""

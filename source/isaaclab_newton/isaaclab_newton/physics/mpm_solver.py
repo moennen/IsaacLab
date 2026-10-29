@@ -12,7 +12,7 @@ import warnings
 from typing import TYPE_CHECKING
 
 import warp as wp
-from newton import BodyFlags, Contacts, Control, GeoType, Model, ModelBuilder, State, StateFlags
+from newton import Contacts, Control, GeoType, Model, ModelBuilder, State, StateFlags
 from newton.solvers import SolverBase, SolverImplicitMPM
 from warp.fem import TemporaryStore
 
@@ -63,6 +63,7 @@ def _make_solver_config(solver_cfg: MPMSolverCfg, scene_prim: Usd.Prim | None = 
         "separate_worlds": solver_cfg.separate_worlds,
         "transfer_scheme": solver_cfg.transfer_scheme,
         "integration_scheme": solver_cfg.integration_scheme,
+        "carry_residual_strain": solver_cfg.carry_residual_strain,
         "critical_fraction": solver_cfg.critical_fraction,
         "air_drag": solver_cfg.air_drag,
         "collider_normal_from_sdf_gradient": solver_cfg.collider_normal_from_sdf_gradient,
@@ -210,17 +211,11 @@ class MPMSolver(NewtonSolver):
     def prepare_builder(cls, cfg: MPMSolverCfg, builder: ModelBuilder) -> None:
         """Normalize rigid colliders before solver construction.
 
-        Newton's implicit MPM treats positive-mass body colliders as finite-mass colliders, so kinematic bodies lose
-        their mass and inertia, matching Newton's MPM examples. The solver accepts only the triangle-mesh geometry
-        type, so convex meshes are classified as meshes without changing their geometry.
+        The solver accepts only the triangle-mesh geometry type, so convex meshes are classified as meshes without
+        changing their geometry. Kinematic bodies keep their mass: Newton's implicit MPM gives bodies flagged
+        :attr:`~newton.BodyFlags.KINEMATIC` zero effective mass, and a rigid solver coupled to the same model, such as
+        MuJoCo, needs their mass and inertia.
         """
-        kinematic_flag = int(BodyFlags.KINEMATIC)
-        for body_id, flags in enumerate(builder.body_flags):
-            if int(flags) & kinematic_flag:
-                builder.body_mass[body_id] = 0.0
-                builder.body_inv_mass[body_id] = 0.0
-                builder.body_inertia[body_id] = wp.mat33()
-                builder.body_inv_inertia[body_id] = wp.mat33()
         for shape_id, shape_type in enumerate(builder.shape_type):
             if shape_type == GeoType.CONVEX_MESH:
                 builder.shape_type[shape_id] = GeoType.MESH
