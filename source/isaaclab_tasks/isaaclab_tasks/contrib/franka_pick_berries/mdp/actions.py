@@ -7,24 +7,12 @@
 
 import numpy as np
 import torch
-import warp as wp
 
 from isaaclab.envs.mdp.actions.task_space_actions import (
     DifferentialInverseKinematicsAction,
 )
 from isaaclab.managers import ActionTerm, ActionTermCfg
 from isaaclab.utils.configclass import configclass
-
-from ..physics.coupling import set_implicit_grasp
-
-HOLD_TOLERANCE = 0.0005
-"""Distance [m] between commanded and current finger opening within which the fingers hold their aperture."""
-
-HOLD_MAX_OPENING = 0.036
-"""Commanded finger opening [m] from which the gripper is open, not holding (fully open is 0.04)."""
-
-HOLD_MAX_SPEED = 0.001
-"""Finger speed [m/s] above which the fingers are moving, not holding."""
 
 
 class WorkspaceIKAction(DifferentialInverseKinematicsAction):
@@ -63,14 +51,7 @@ class WorkspaceIKAction(DifferentialInverseKinematicsAction):
 
 
 class GripperApertureAction(ActionTerm):
-    """Map [-1, 1] continuously to total finger aperture [0, 0.08 m], and grasp the tissue the fingers hold.
-
-    The fingers hold an aperture while they are commanded close to their current opening, short of fully open, and
-    are still. With the implicit tissue solver, the tissue they press is then clamped to them (see
-    :class:`~..physics.grasp_implicit_mpm.SolverGraspImplicitMPM`). Moving the fingers releases it: closing
-    compresses the tissue through contact alone, and opening lets go, where two clamped fingers would crush or tear
-    it without limit.
-    """
+    """Map [-1, 1] continuously to total finger aperture [0, 0.08 m]."""
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
@@ -96,14 +77,6 @@ class GripperApertureAction(ActionTerm):
             raise ValueError("Nonfinite grasp command")
         self._raw[:] = actions.clamp(-1, 1)
         self._target[:] = (self._raw + 1) * 0.02
-        opening = self._asset.data.joint_pos.torch[:, self._joint_ids]
-        speed = self._asset.data.joint_vel.torch[:, self._joint_ids]
-        holding = (
-            ((self._target - opening).abs() <= HOLD_TOLERANCE)
-            & (self._target < HOLD_MAX_OPENING)
-            & (speed.abs() <= HOLD_MAX_SPEED)
-        )
-        set_implicit_grasp(wp.from_torch(holding.all().to(torch.int32).reshape(1)))
 
     def apply_actions(self):
         self._asset.set_joint_position_target(self._target, joint_ids=self._joint_ids)
