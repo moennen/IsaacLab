@@ -53,7 +53,7 @@ dependencies = [
     "pillow>=12.3.0",
     "botocore",  # omni.replicator.core S3 backend
     "starlette>=1.3.1",  # livestream; minimum patched for current security advisories
-    "omniverseclient==2.74.0",
+    "omniverseclient==2.75.1",
     "filelock",
     "lazy_loader>=0.4",
     # ----- project template generator -----
@@ -178,9 +178,10 @@ isaacsim = [
     "PyJWT[crypto]>=2.15.1,<3",
 ]
 
-ov = ["ovphysx==0.6.4.72118723", "ovrtx==0.5.1.385782", "ovstage==0.2.1.385922"]
-ovphysx = ["ovphysx==0.6.4.72118723", "ovstage==0.2.1.385922"]
-ovrtx = ["ovrtx==0.5.1.385782", "ovstage==0.2.1.385922"]
+# OvPhysX is left out until OvPhysX 0.7, the first to accept OVStage 0.3 (which OVRTX 0.6 needs), is on PyPI.
+ov = ["ovrtx==0.6.0.1791947691", "ovstage==0.3.0.1791986420"]
+ovphysx = []
+ovrtx = ["ovrtx==0.6.0.1791947691", "ovstage==0.3.0.1791986420"]
 
 mimic = [
     "isaaclab-mimic",
@@ -228,8 +229,8 @@ usd_exchange = "3.0.1"
 torch = "2.11.0"
 torchvision = "0.26.0"
 ovphysx = "0.6.4.72118723"
-ovrtx = "0.5.1.385782"
-ovstage = "0.2.1.385922"
+ovrtx = "0.6.0.1791947691"
+ovstage = "0.3.0.1791986420"
 newton = "1.8.0.dev0"
 warp = "1.17.0"
 

@@ -98,6 +98,7 @@
             ["IsaacContrib-Open-Drawer-Franka-IK-Abs", "rsl_rl", "isaacsim_physx,newton_mjwarp,ovphysx", "", "", "environment-previews/franka_open_drawer.jpg", false, {}, {}, "", null, ["||", "isaacsim_physx||", "newton_mjwarp||", "ovphysx||"]],
             ["IsaacContrib-Open-Drawer-Franka-IK-Rel", "rsl_rl", "isaacsim_physx,newton_mjwarp,ovphysx", "", "", "environment-previews/franka_open_drawer.jpg", false, {}, {}, "", null, ["||", "isaacsim_physx||", "newton_mjwarp||", "ovphysx||"]],
             ["IsaacContrib-Open-Drawer-OpenArm", "rl_games,rsl_rl", "", "", "", "environment-previews/openarm_uni_open_drawer.jpg"],
+            ["IsaacContrib-Pick-Berry-Franka-IK-Rel-Newton", "", "", "", "", "environment-previews/franka_pick_berries.jpg"],
             ["IsaacContrib-PickPlace-FixedBaseUpperBodyIK-G1-Abs", "", "", "isaacsim_rtx,newton_renderer", "", "environment-previews/g1_pick_place_fixed_base.jpg", false, {}, {}, "", null, ["||", "|isaacsim_rtx|", "|newton_renderer|"]],
             ["IsaacContrib-PickPlace-G1-InspireFTP-Abs", "", "", "", "", "environment-previews/g1_pick_place.jpg"],
             ["IsaacContrib-PickPlace-GR1T2-Abs", "", "", "isaacsim_rtx,newton_renderer", "", "environment-previews/gr_1_pick_place.jpg", false, {}, {}, "", null, ["||", "|isaacsim_rtx|", "|newton_renderer|"]],

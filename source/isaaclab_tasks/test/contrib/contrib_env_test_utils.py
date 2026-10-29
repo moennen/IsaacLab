@@ -107,6 +107,11 @@ def contrib_environment_params(runtime: Runtime) -> list:
 
 def num_envs(task_name: str) -> int:
     """Return how many environments the smoke test steps for a task."""
-    if task_name in ("IsaacContrib-Franka-Pour", "IsaacContrib-G1-Terrain", "IsaacContrib-UR10-Particle-Push"):
+    if task_name in (
+        "IsaacContrib-Franka-Pour",
+        "IsaacContrib-G1-Terrain",
+        "IsaacContrib-UR10-Particle-Push",
+        "IsaacContrib-Pick-Berry-Franka-IK-Rel-Newton",
+    ):
         return 1
     return 3 if task_name == "IsaacContrib-Multitask-Manipulation" else 2

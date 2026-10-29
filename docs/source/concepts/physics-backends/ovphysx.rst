@@ -78,15 +78,20 @@ See :doc:`/source/concepts/sensors/index` for sensor configuration and
 Installation
 ------------
 
-The ``ovphysx`` extra requires OvPhysX 0.6.4.72118723. Install it from the repository root with:
+.. note::
+
+    The ``ovphysx`` extra is temporarily empty: OVRTX 0.6 needs OVStage 0.3, which no OvPhysX on PyPI accepts
+    yet. It installs OvPhysX again once OvPhysX 0.7 is published.
+
+Install the ``ovphysx`` extra from the repository root with:
 
 .. code-block:: bash
 
     uv sync --inexact --extra ovphysx
 
 The ``--inexact`` flag preserves packages installed through other extras.
-Use ``--extra ov`` to install both public OvPhysX and OVRTX runtimes. The combined
-extra pairs OVRTX 0.5.1.385782 with OVStage 0.2.1; OVRTX 0.4.1 is not compatible
+Use ``--extra ov`` to install the OV runtimes. The combined
+extra pairs OVRTX 0.6.0.1791947691 with OVStage 0.3.0.1791986420; OVRTX 0.4.1 is not compatible
 with this runtime combination.
 
 Opt-in OVPhysX 0.7 support
