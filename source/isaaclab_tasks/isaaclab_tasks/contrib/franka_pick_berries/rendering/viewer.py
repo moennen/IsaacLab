@@ -9,6 +9,7 @@ import math
 import time
 
 import numpy as np
+import ovstage
 import warp as wp
 from newton.viewer import ViewerRTX
 
@@ -30,8 +31,9 @@ class BerryViewer(ViewerRTX):
     """Newton's RTX viewer, extended with the berries' Gaussians, the tableware and the room.
 
     On every :meth:`draw`, each berry's Gaussians follow its tissue
-    (:class:`..gaussian_splats.render_delegate.GaussianRenderDelegate`). Rendering overlaps the next physics step: a
-    frame is submitted asynchronously and collected before the next one changes the scene.
+    (:class:`..gaussian_splats.render_delegate.GaussianRenderDelegate`), written to the renderer's OVStage scene with
+    the rest of the viewer's updates. Rendering overlaps the next physics step: a frame is submitted asynchronously and
+    collected before the next one changes the scene.
 
     Args:
         env: The berry environment.
@@ -68,6 +70,8 @@ class BerryViewer(ViewerRTX):
         self.keyboard_aperture = 0.08
         self.pending_frame = None
         self._prepared = []
+        # Camera lens attributes [mm or f-number] to write with the next scene update.
+        self._pending_lens = {}
         self.camera_follows_berry = False
         # Set by the reset button or the R key; the caller resets and clears it.
         self.reset_requested = False
@@ -83,9 +87,6 @@ class BerryViewer(ViewerRTX):
             for name, berry in env.berries.items()
         ]
         super().__init__(**kwargs, environment="studio", fps=30, async_rendering=False)
-        # Let OVRTX load the stage itself, as the Gaussians' delegates write to the renderer: Newton's OVStage scene
-        # path passes ``time_code`` to ``ovstage.population.open_usd``, which OVStage 0.3 names ``time``.
-        self._use_ovstage = False
         self.set_model(self._newton.model)
         # The berries appear as their Gaussians only, not as the VBD solver's tetrahedral mesh.
         self.show_triangles = False
@@ -213,8 +214,6 @@ class BerryViewer(ViewerRTX):
     def close(self):
         self.finish_frame()
         renderer = self._rtx
-        for delegate in self.render_delegates:
-            delegate.close()
         super().close()
         if renderer is not None:
             renderer.destroy()
@@ -238,9 +237,17 @@ class BerryViewer(ViewerRTX):
         add_tableware_visuals(self.stage, self.bowl_material)
         # The room scan shares the berries' material, so it is also composited non-stochastically with the built-in one.
         add_room_scan(self.stage, UsdShade.Shader.Get(self.stage, self.render_delegates[0].shader_path))
-        super()._init_ovrtx()
-        for delegate in self.render_delegates:
-            delegate.bind_to_renderer(self._rtx)
+        # Newton loads the stage with OVStage 0.2's ``open_usd(..., time_code=)``, which OVStage 0.3 names ``time``.
+        open_usd = ovstage.population.open_usd
+
+        def open_usd_at_time_code(stage, path, ordinal, time_code=math.nan, **kwargs):
+            return open_usd(stage, path, ordinal, time=time_code, **kwargs)
+
+        ovstage.population.open_usd = open_usd_at_time_code
+        try:
+            super()._init_ovrtx()
+        finally:
+            ovstage.population.open_usd = open_usd
 
     def _add_studio_lights(self):
         # The scan already contains the room's illumination. Light the meshes with broad, warm indoor sources.
@@ -284,12 +291,23 @@ class BerryViewer(ViewerRTX):
         product.CreateAttribute("omni:rtx:rtpt:maxBounces", Sdf.ValueTypeNames.Int).Set(8)
         product.CreateAttribute("omni:rtx:rtpt:maxSpecularAndTransmissionBounces", Sdf.ValueTypeNames.Int).Set(8)
 
+    def _update_ovrtx_camera(self):
+        super()._update_ovrtx_camera()
+        for attribute, value in self._pending_lens.items():
+            self._write_runtime_attribute([self._camera_prim_path], attribute, np.array([value], np.float32))
+        self._pending_lens.clear()
+
+    def _update_ovrtx_mesh_points(self):
+        # The deformed Gaussians are written with the scene's other per-frame geometry.
+        super()._update_ovrtx_mesh_points()
+        for delegate, prepared in zip(self.render_delegates, self._prepared):
+            delegate.publish(prepared, self._write_runtime_attribute)
+        self._prepared = []
+
     def _render_and_display(self):
-        # Publish the deformed Gaussians, show the frame that just finished, and submit the next one without waiting.
+        # Show the frame that just finished and submit the next one, of the updated scene, without waiting.
         from ovrtx import Device
 
-        for delegate, arrays in zip(self.render_delegates, self._prepared):
-            delegate.publish(arrays)
         if self._window is not None and self._window.context is not None:
             for var in self._color_outputs():
                 with var.map(device=Device.CUDA) as mapping:
@@ -299,7 +317,9 @@ class BerryViewer(ViewerRTX):
             # The blit only fills the presentation texture; drawing it, with the UI, swaps the window's buffers.
             frame = self._displayed_frame
             self._present(frame.texture or None, frame.width, frame.height)
-        self.pending_frame = self._rtx.step_async(render_products={self._render_product_path}, delta_time=1 / 30)
+        self.pending_frame = self._rtx.step_async(
+            render_products={self._render_product_path}, delta_time=1 / 30, ordinal=self._ovstage_ordinal
+        )
 
     def _color_outputs(self):
         # OVRTX 0.6 keys render variables by prim path, not by source name.
@@ -312,9 +332,7 @@ class BerryViewer(ViewerRTX):
     def _write_camera(self, attribute: str, value: float) -> None:
         # Before the renderer starts, the authored camera applies.
         if self._rtx is not None:
-            self._rtx.write_attribute(
-                prim_paths=[self._camera_prim_path], attribute_name=attribute, tensor=np.array([value], np.float32)
-            )
+            self._pending_lens[attribute] = value
 
     def _look(self, eye: np.ndarray, target: np.ndarray) -> None:
         delta = target - eye
@@ -325,14 +343,3 @@ class BerryViewer(ViewerRTX):
         )
         self.camera.near = 0.0001
         self.camera.pivot = type(self.camera.pos)(*target)
-
-    # Newton 1.6's RTX viewer builds multi-component arrays (overlay line batches and deforming mesh points) with
-    # ``ovrtx._src.dlpack.DLTensor.from_dlpack``, which OVRTX 0.6 removed. OVRTX 0.6 infers ``float3``/``half4``
-    # elements from an (N, lanes) array instead.
-    @staticmethod
-    def _make_laned_array_dltensor(values_np, lanes):
-        return np.ascontiguousarray(values_np).reshape(-1, lanes)
-
-    @staticmethod
-    def _make_point3f_dltensor(points_np):
-        return np.ascontiguousarray(points_np, dtype=np.float32).reshape(-1, 3)

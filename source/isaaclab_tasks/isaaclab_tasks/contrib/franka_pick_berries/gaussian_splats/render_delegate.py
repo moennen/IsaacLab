@@ -8,7 +8,7 @@
 The berry's Gaussians are authored once in the render stage, from its asset. On every frame
 :meth:`GaussianRenderDelegate.deform` deforms and shades them from the tissue particles (:mod:`.mpm_binding`), or
 from the nodes of the tissue's tetrahedral mesh with the VBD solver (:mod:`.vbd_binding`), and
-:meth:`GaussianRenderDelegate.publish` hands the renderer the resulting GPU arrays, which it reads in place. Only the
+:meth:`GaussianRenderDelegate.publish` writes the resulting GPU arrays to the renderer's OVStage scene. Only the
 per-frame attributes change: positions, scales, orientations and, with the berry's own material, the shading
 quaternion; opacities and spherical harmonics stay as authored.
 """
@@ -70,7 +70,6 @@ class GaussianRenderDelegate:
         self.builtin_material = builtin_material
         # The built-in material ignores the shading quaternion, which is then not published.
         self._dynamic = [(name, lanes) for name, lanes in _DYNAMIC if not (builtin_material and name == SHADING)]
-        self._bindings = {}
         gaussians = tissue.gaussians
         device = tissue.device
         particles = tissue.particles
@@ -86,11 +85,9 @@ class GaussianRenderDelegate:
         count = len(gaussians["xyz"])
         with wp.ScopedDevice(device):
             self._extent = wp.empty((2, 3), dtype=float)
-            # The renderer reads the published arrays in place, after the write returns. Two sets alternate: a set is
-            # refilled only after the frame that read it has finished rendering.
+            # The stage copies the published arrays when they are written, so one set is refilled every frame.
             dtypes = {"positions": wp.vec3, "scales": wp.vec3, "orientations": wp.quat, SHADING: wp.vec4}
-            self._buffers = [{name: wp.empty(count, dtype=dtypes[name]) for name, _ in self._dynamic} for _ in range(2)]
-        self._frame = 0
+            self._buffers = {name: wp.empty(count, dtype=dtypes[name]) for name, _ in self._dynamic}
 
     def author_in_stage(self, stage: Usd.Stage) -> None:
         """Copy the berry's Gaussians and material from its asset into the render stage."""
@@ -142,27 +139,12 @@ class GaussianRenderDelegate:
             shader.SetSourceAsset(Sdf.AssetPath("ParticleFieldEmissive.mdl"), "mdl")
             shader.SetSourceAssetSubIdentifier("ParticleFieldEmissive", "mdl")
 
-    def bind_to_renderer(self, rtx) -> None:
-        """Bind the per-frame attributes to the running renderer."""
-        from ovrtx import BindingFlag
-
-        # Persistent bindings establish the renderer's animated-geometry dataflow; by-name writes can leave its
-        # acceleration structure stale.
-        self._rtx = rtx
-        self._bindings = {
-            name: rtx.bind_array_attribute(
-                [self.path], name, dtype="float32", shape=(lanes,), flags=BindingFlag.OPTIMIZE
-            )
-            for name, lanes in self._dynamic
-        }
-
     def deform(self) -> tuple[np.ndarray, dict]:
         """Deform and shade the Gaussians on the GPU; return their transform and the arrays to publish."""
         binding = self.binding
         with wp.ScopedDevice(self.tissue.device):
             binding.deform(self.tissue.positions_warp(), self.tissue.damage)
-            out = self._buffers[self._frame % 2]
-            self._frame += 1
+            out = self._buffers
             # Local frame: center the deformed Gaussians on their rest center and shrink them into their rest bounds.
             self._extent.assign(np.array([[np.inf] * 3, [-np.inf] * 3], np.float32))
             wp.launch(_bounds, dim=len(binding.positions), inputs=[binding.positions, binding.scales, self._extent])
@@ -186,19 +168,23 @@ class GaussianRenderDelegate:
         transform[3, :3] = center - factor * self._rest_center + self.tissue.offset
         return transform, out
 
-    def publish(self, prepared: tuple[np.ndarray, dict]) -> None:
-        """Publish arrays from :meth:`deform` to the renderer."""
-        from ovrtx import DataAccess, Semantic
+    def publish(self, prepared: tuple[np.ndarray, dict], write) -> None:
+        """Publish arrays from :meth:`deform` to the renderer's stage.
+
+        Args:
+            prepared: The transform and arrays returned by :meth:`deform`.
+            write: The viewer's stage writer, called as ``write(prim_paths, attribute_name, values, **flags)`` while
+                the viewer updates its scene.
+        """
+        import ovstage
 
         transform, values = prepared
-        self._rtx.write_attribute(
-            prim_paths=[self.path], attribute_name="omni:xform", tensor=transform[None], semantic=Semantic.XFORM_MAT4x4
-        )
+        write([self.path], "omni:xform", transform[None], is_matrix=True)
         cuda_stream = wp.get_stream(self.tissue.device).cuda_stream
+        lanes = dict(self._dynamic)
         for name, array in values.items():
-            # The renderer reads the GPU buffers in place, ordered after the kernels on their stream.
-            self._bindings[name].write([array], data_access=DataAccess.ASYNC, cuda_stream=cuda_stream)
-
-    def close(self) -> None:
-        for binding in self._bindings.values():
-            binding.unbind()
+            # A GPU array of float vectors, which the stage copies after the kernels on its stream.
+            tensor = ovstage.make_dltensor(
+                array, dtype=ovstage.numpy_to_dldatatype(np.dtype(np.float32), lanes=lanes[name]), shape=[len(array)]
+            )
+            write([self.path], name, [tensor], is_array=True, cuda_stream=cuda_stream)

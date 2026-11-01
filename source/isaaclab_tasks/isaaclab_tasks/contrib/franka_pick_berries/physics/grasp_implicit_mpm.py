@@ -265,6 +265,29 @@ class SolverGraspImplicitMPM(SolverImplicitMPM):
             device=self.model.device,
         )
 
+    def notify_model_changed(self, flags):
+        super().notify_model_changed(flags)
+        if flags & newton.ModelFlags.BODY_INERTIAL_PROPERTIES:
+            self._refresh_collider_body_mass()
+
+    def _refresh_collider_body_mass(self) -> None:
+        """Give the tissue the colliders' current masses, with kinematic bodies at zero (infinite) mass.
+
+        The coupler installs the finger proxies' masses after the solver is built. When a kinematic body has mass, the
+        solver keeps a copy of the masses it was built with, and the tissue pushes the fingers away as if they had
+        their own few grams. Remove once the pinned Newton refreshes collider masses on body inertial changes.
+        """
+        mpm_model = self._mpm_model
+        body_mass = self.model.body_mass.numpy().copy()
+        kinematic = (self.model.body_flags.numpy() & int(newton.BodyFlags.KINEMATIC)) != 0
+        body_mass[kinematic] = 0.0
+        if mpm_model.collider_body_mass.ptr == self.model.body_mass.ptr:
+            mpm_model.collider_body_mass = wp.array(body_mass, dtype=float, device=self.model.device)
+        else:
+            mpm_model.collider_body_mass.assign(body_mass)
+        mpm_model.collider_body_inv_inertia = self.model.body_inv_inertia
+        mpm_model.notify_collider_changed(body_mass)
+
     def reset(self, state, world_mask=None, flags=None):
         super().reset(state, world_mask=world_mask, flags=flags)
         # Damage is part of the particles' history.
