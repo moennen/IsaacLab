@@ -52,6 +52,57 @@ def _normalize(
     local_s[i] = s[i] / factor
 
 
+def author_berry_visual(stage: Usd.Stage, tissue, root_path: str, builtin_material: bool = False) -> None:
+    """Author a berry's placed Gaussian field and material from its asset."""
+    field_path = f"{root_path}/Gaussians/Field"
+    shader_path = f"{root_path}/Materials/Radiance/Shader"
+    source = tissue.stage
+    layer = source.Flatten()
+    Sdf.CreatePrimInLayer(stage.GetRootLayer(), root_path)
+    Sdf.CopySpec(layer, "/Berry", stage.GetRootLayer(), root_path)
+    # The physics data is not part of the render scene.
+    stage.RemovePrim(f"{root_path}/TaskData")
+    stage.RemovePrim(f"{root_path}/Tissue")
+    stage.RemovePrim(f"{root_path}/SimulationMesh")
+    # The renderer only loads a Gaussian field copied on its own under a defined transform, not one copied as
+    # part of the asset's tree.
+    stage.RemovePrim(f"{root_path}/Gaussians")
+    UsdGeom.Xform.Define(stage, f"{root_path}/Gaussians")
+    Sdf.CopySpec(layer, "/Berry/Gaussians", stage.GetRootLayer(), field_path)
+    prim = stage.GetPrimAtPath(field_path)
+    for attr in prim.GetAttributes():
+        if attr.GetName().startswith("berry:"):
+            prim.RemoveProperty(attr.GetName())
+    # The berry may have been turned and moved into the punnet: author its placed Gaussians. Time samples mark the
+    # attributes the renderer should expect to change.
+    original = source.GetPrimAtPath("/Berry/Gaussians")
+    for name, key, array_type in (
+        ("positions", "xyz", Vt.Vec3fArray),
+        ("scales", "scales", Vt.Vec3fArray),
+        ("orientations", "rotations", Vt.QuatfArray),
+        ("opacities", "alpha", Vt.FloatArray),
+        ("radiance:sphericalHarmonicsCoefficients", "sh", Vt.Vec3fArray),
+    ):
+        array = tissue.gaussians[key].reshape(-1, 3) if key == "sh" else tissue.gaussians[key]
+        value = array_type.FromNumpy(np.ascontiguousarray(array, np.float32))
+        attr = prim.GetAttribute(name)
+        attr.Clear()
+        attr.Set(value)
+        if original.GetAttribute(name).GetNumTimeSamples():
+            attr.Set(value, 0)
+            attr.Set(value, 1)
+    shading = prim.GetAttribute(SHADING)
+    value = shading.Get()
+    shading.Clear()
+    for time in (Usd.TimeCode.Default(), 0, 1):
+        shading.Set(value, time)
+    UsdShade.MaterialBindingAPI.Apply(prim).Bind(UsdShade.Material.Get(stage, f"{root_path}/Materials/Radiance"))
+    if builtin_material:
+        shader = UsdShade.Shader.Get(stage, shader_path)
+        shader.SetSourceAsset(Sdf.AssetPath("ParticleFieldEmissive.mdl"), "mdl")
+        shader.SetSourceAssetSubIdentifier("ParticleFieldEmissive", "mdl")
+
+
 class GaussianRenderDelegate:
     """Author one berry's Gaussians in the render stage and publish their deformation on every frame.
 
@@ -91,53 +142,7 @@ class GaussianRenderDelegate:
 
     def author_in_stage(self, stage: Usd.Stage) -> None:
         """Copy the berry's Gaussians and material from its asset into the render stage."""
-        source = self.tissue.stage
-        layer = source.Flatten()
-        Sdf.CreatePrimInLayer(stage.GetRootLayer(), self.root_path)
-        Sdf.CopySpec(layer, "/Berry", stage.GetRootLayer(), self.root_path)
-        # The physics data is not part of the render scene.
-        stage.RemovePrim(f"{self.root_path}/TaskData")
-        stage.RemovePrim(f"{self.root_path}/Tissue")
-        stage.RemovePrim(f"{self.root_path}/SimulationMesh")
-        # The renderer only loads a Gaussian field copied on its own under a defined transform, not one copied as
-        # part of the asset's tree.
-        stage.RemovePrim(f"{self.root_path}/Gaussians")
-        UsdGeom.Xform.Define(stage, f"{self.root_path}/Gaussians")
-        Sdf.CopySpec(layer, "/Berry/Gaussians", stage.GetRootLayer(), self.path)
-        prim = stage.GetPrimAtPath(self.path)
-        for attr in prim.GetAttributes():
-            if attr.GetName().startswith("berry:"):
-                prim.RemoveProperty(attr.GetName())
-        # The berry may have been turned and moved into the punnet: author its placed Gaussians. Time samples mark the
-        # attributes the renderer should expect to change.
-        original = source.GetPrimAtPath("/Berry/Gaussians")
-        for name, key, array_type in (
-            ("positions", "xyz", Vt.Vec3fArray),
-            ("scales", "scales", Vt.Vec3fArray),
-            ("orientations", "rotations", Vt.QuatfArray),
-            ("opacities", "alpha", Vt.FloatArray),
-            ("radiance:sphericalHarmonicsCoefficients", "sh", Vt.Vec3fArray),
-        ):
-            array = self.tissue.gaussians[key].reshape(-1, 3) if key == "sh" else self.tissue.gaussians[key]
-            value = array_type.FromNumpy(np.ascontiguousarray(array, np.float32))
-            attr = prim.GetAttribute(name)
-            attr.Clear()
-            attr.Set(value)
-            if original.GetAttribute(name).GetNumTimeSamples():
-                attr.Set(value, 0)
-                attr.Set(value, 1)
-        shading = prim.GetAttribute(SHADING)
-        value = shading.Get()
-        shading.Clear()
-        for time in (Usd.TimeCode.Default(), 0, 1):
-            shading.Set(value, time)
-        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
-            UsdShade.Material.Get(stage, f"{self.root_path}/Materials/Radiance")
-        )
-        if self.builtin_material:
-            shader = UsdShade.Shader.Get(stage, self.shader_path)
-            shader.SetSourceAsset(Sdf.AssetPath("ParticleFieldEmissive.mdl"), "mdl")
-            shader.SetSourceAssetSubIdentifier("ParticleFieldEmissive", "mdl")
+        author_berry_visual(stage, self.tissue, self.root_path, self.builtin_material)
 
     def deform(self) -> tuple[np.ndarray, dict]:
         """Deform and shade the Gaussians on the GPU; return their transform and the arrays to publish."""

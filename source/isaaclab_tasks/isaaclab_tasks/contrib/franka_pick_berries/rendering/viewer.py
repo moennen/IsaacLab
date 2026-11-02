@@ -13,14 +13,14 @@ import ovstage
 import warp as wp
 from newton.viewer import ViewerRTX
 
-from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade
+from pxr import Gf, Sdf, UsdGeom, UsdLux
 
 from isaaclab.sim import get_current_stage
 
 from ..gaussian_splats.render_delegate import GaussianRenderDelegate
-from ..scene.room_scan import add_room_scan
-from ..scene.tableware import add_tableware_visuals
+from ..scene.visuals import author_scene_visuals
 from ..scene.workcell_materials import restore_workcell_materials
+from .camera import VERTICAL_FOV_DEG, camera_view
 
 CAMERA_VIEWS = ("punnet_and_bowl", "berry_closeup", "room", "scripted_camera")
 """Camera views: the punnet and bowl, a close-up following the handled berry, the whole room, or a camera moved by a
@@ -87,6 +87,7 @@ class BerryViewer(ViewerRTX):
             for name, berry in env.berries.items()
         ]
         super().__init__(**kwargs, environment="studio", fps=30, async_rendering=False)
+        self.camera.fov = VERTICAL_FOV_DEG
         self.set_model(self._newton.model)
         # The berries appear as their Gaussians only, not as the VBD solver's tetrahedral mesh.
         self.show_triangles = False
@@ -101,15 +102,7 @@ class BerryViewer(ViewerRTX):
 
     def set_camera_view(self, view: str) -> None:
         """Move the camera to a fixed view; the berry view then follows the handled berry."""
-        if view == "room":
-            eye, target = np.array([1.5, -2.0, 1.1]), np.array([0.25, 0.05, -0.18])
-        elif view == "punnet_and_bowl":
-            eye, target = np.array([0.75, -0.24, 0.36]), np.array([0.46, 0.07, 0.035])
-        elif view == "berry_closeup":
-            target = self.handled_berry.offset + self.handled_berry.positions().mean(0)
-            eye = target + np.array([0.08, -0.025, 0.027])
-        else:
-            raise ValueError(f"Unknown camera view: {view}")
+        eye, target = camera_view(view, self.handled_berry)
         self.camera_follows_berry = view == "berry_closeup"
         self._look(eye, target)
 
@@ -232,11 +225,9 @@ class BerryViewer(ViewerRTX):
                 for index, shape in enumerate(batch.model_shapes)
             ),
         )
-        for delegate in self.render_delegates:
-            delegate.author_in_stage(self.stage)
-        add_tableware_visuals(self.stage, self.bowl_material)
-        # The room scan shares the berries' material, so it is also composited non-stochastically with the built-in one.
-        add_room_scan(self.stage, UsdShade.Shader.Get(self.stage, self.render_delegates[0].shader_path))
+        author_scene_visuals(
+            self.stage, self.env.berries.values(), self.bowl_material, not self.stochastic_gaussian_rendering
+        )
         # Newton loads the stage with OVStage 0.2's ``open_usd(..., time_code=)``, which OVStage 0.3 names ``time``.
         open_usd = ovstage.population.open_usd
 

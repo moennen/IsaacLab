@@ -94,6 +94,16 @@ throughout: an arm command that leads the arm's lag keeps it from waiting, and t
 Frame rates while grasping, at 1280 × 720 on an RTX 6000 Ada: about 17 frames/s with one berry, 9 with three
 (`--num_berries 3`). Rendering the berries' Gaussians dominates, so `--tissue_resolution half` hardly changes them.
 
+### Render backends
+
+The berries, container, dishes, and aligned room scan share one USD visual scene authored by `scene/visuals.py`.
+The OVRTX viewer consumes that scene directly. Newton Warp uses Newton's standard USD importer for the same mesh
+and Gaussian fields; its adapter updates the deforming berry buffers and acceleration bounds before camera capture.
+Both renderer paths share the camera poses and a 45-degree vertical field of view.
+
+Renderer capabilities affect appearance: Warp uses DC Gaussian color and opaque tableware materials, while OVRTX
+supports the packaged MDL shading and transparent plastic. The scene assets and their placement are shared.
+
 ### Code layout
 
 | Path | |

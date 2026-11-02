@@ -5,6 +5,8 @@
 
 """Single workcell environment: a Franka and deformable berry tissue on Newton's coupled MPM or VBD."""
 
+from contextlib import nullcontext
+
 from isaaclab.envs import ManagerBasedRLEnv
 
 from .physics.coupling import (
@@ -53,11 +55,36 @@ class BerryPickEnv(ManagerBasedRLEnv):
             cfg.sim.physics = coupled_physics_cfg(solver=cfg.tissue_solver)
             cfg.sim.physics.use_cuda_graph = use_cuda_graph
         configure_tissue_solver(cfg.sim.physics, specs, punnet)
-        super().__init__(cfg, **kwargs)
+        warp_cameras = [
+            value
+            for value in vars(cfg.scene).values()
+            if getattr(getattr(value, "renderer_cfg", None), "renderer_type", None) == "newton_warp"
+        ]
+        scope = nullcontext()
+        if warp_cameras:
+            from isaaclab_newton.cloner import newton_builder_world_hook
+
+            from .gaussian_splats.warp_visuals import import_scene_visuals
+
+            def add_warp_visuals(builder, *_):
+                import_scene_visuals(builder, specs)
+
+            scope = newton_builder_world_hook(add_warp_visuals)
+        with scope:
+            super().__init__(cfg, **kwargs)
         self.berries = {spec.name: BerryTissue(spec, self.scene[spec.scene_name]) for spec in specs}
         register_tissues(self.berries.values())
         # The berry being handled, which the close-up follows; the scripted demo moves on through the others.
         self.handled_berry = next(iter(self.berries.values()))
+        if warp_cameras:
+            from .gaussian_splats.warp_visuals import WarpGaussianVisuals, configure_camera
+
+            self.warp_visuals = WarpGaussianVisuals(self)
+            for camera_name in vars(cfg.scene):
+                camera_cfg = getattr(cfg.scene, camera_name)
+                if camera_cfg in warp_cameras:
+                    camera = self.scene[camera_name]
+                    configure_camera(camera, self.warp_visuals)
 
     def step(self, action):
         result = super().step(action)
