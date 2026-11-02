@@ -52,6 +52,15 @@ class DeformableStageEntry:
     """Authored source environment origin [m]. None assumes the source was placed by the clone plan."""
 
     @property
+    def has_visual_mesh(self) -> bool:
+        """Whether this entry publishes a mesh visual in addition to its splats."""
+        return not (
+            self.gaussian_splats_embeddings
+            and self.vis_mesh_path == self.sim_mesh_path
+            and self.deformable_type in ("volume", "particle")
+        )
+
+    @property
     def bind_points(self) -> np.ndarray:
         """Return authored bind nodes, falling back to the simulation's initial nodes."""
         return self.bind_vertices if len(self.bind_vertices) else self.vertices
@@ -76,11 +85,7 @@ def deformable_geometry_batches(
     prototype_remaps = {}
     output_offset = 0
     for entry, offset in zip(entries, offsets, strict=True):
-        if (
-            entry.gaussian_splats_embeddings
-            and entry.vis_mesh_path == entry.sim_mesh_path
-            and entry.deformable_type in ("volume", "particle")
-        ):
+        if not entry.has_visual_mesh:
             continue
         key = (id(entry.vertices), id(entry.indices), id(entry.vis_vertices))
         if key not in prototype_remaps:

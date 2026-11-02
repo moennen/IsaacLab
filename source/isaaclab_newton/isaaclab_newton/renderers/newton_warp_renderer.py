@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import newton
 import warp as wp
-from newton._src.geometry.bvh import SHAPE_BOUNDS_BLOCK_DIM, compute_shape_local_bounds
+from newton._src.geometry.bvh import SHAPE_BOUNDS_BLOCK_DIM, compute_gaussian_bounds
 
 from isaaclab.renderers import BaseRenderer, RenderBufferKind, RenderBufferSpec
 from isaaclab.renderers.camera_render_spec import CameraRenderSpec
@@ -57,6 +57,18 @@ def _check_shared_intrinsics(intrinsics: wp.array(dtype=wp.mat33f), different: w
                 wp.atomic_or(different, 0, 1)
 
 
+@wp.struct
+class _GaussianSplatsTarget:
+    transforms: wp.array(dtype=wp.transformf)
+    scales: wp.array(dtype=wp.vec3f)
+    opacities: wp.array(dtype=wp.float32)
+    coefficients: wp.array2d(dtype=wp.float32)
+    min_response: float
+    lowers: wp.array(dtype=wp.vec3f)
+    uppers: wp.array(dtype=wp.vec3f)
+    shape_index: int
+
+
 @wp.kernel(enable_backward=False)
 def _write_deformable_gaussian_splats(
     positions: wp.array(dtype=wp.vec3f),
@@ -64,20 +76,46 @@ def _write_deformable_gaussian_splats(
     scales: wp.array(dtype=wp.vec3f),
     coefficients: wp.array(dtype=wp.vec3f),
     basis_count: int,
-    transforms_out: wp.array(dtype=wp.transformf),
-    scales_out: wp.array(dtype=wp.vec3f),
-    coefficients_out: wp.array2d(dtype=wp.float32),
+    target_indices: wp.array(dtype=wp.int32),
+    point_indices: wp.array(dtype=wp.int32),
+    targets: wp.array(dtype=_GaussianSplatsTarget),
 ):
-    """Write local Gaussian arrays directly into Newton's native shape storage."""
+    """Write an entire publication batch and update internal BVH leaves on device."""
     splat = wp.tid()
-    transforms_out[splat] = wp.transformf(positions[splat], orientations[splat])
-    scales_out[splat] = scales[splat]
+    target = targets[target_indices[splat]]
+    index = point_indices[splat]
+    target.transforms[index] = wp.transformf(positions[splat], orientations[splat])
+    target.scales[index] = scales[splat]
     if basis_count:
         for basis in range(basis_count):
-            value = coefficients[splat * basis_count + basis]
-            coefficients_out[splat, basis * 3] = value[0]
-            coefficients_out[splat, basis * 3 + 1] = value[1]
-            coefficients_out[splat, basis * 3 + 2] = value[2]
+            value = coefficients[(splat * basis_count + basis) % coefficients.shape[0]]
+            target.coefficients[index, basis * 3] = value[0]
+            target.coefficients[index, basis * 3 + 1] = value[1]
+            target.coefficients[index, basis * 3 + 2] = value[2]
+    data = newton.Gaussian.Data()
+    data.transforms = target.transforms
+    data.scales = target.scales
+    data.opacities = target.opacities
+    data.min_response = target.min_response
+    lower, upper = compute_gaussian_bounds(data, index)
+    target.lowers[index] = lower
+    target.uppers[index] = upper
+
+
+@wp.kernel(enable_backward=False)
+def _update_gaussian_shape_bounds(targets: wp.array(dtype=_GaussianSplatsTarget), bounds: wp.array2d(dtype=wp.vec3f)):
+    target_index, lane = wp.tid()
+    target = targets[target_index]
+    lower = wp.vec3f(1.0e30)
+    upper = wp.vec3f(-1.0e30)
+    for index in range(lane, target.transforms.shape[0], wp.block_dim()):
+        lower = wp.min(lower, target.lowers[index])
+        upper = wp.max(upper, target.uppers[index])
+    lower = wp.tile_reduce(wp.min, wp.tile(lower, preserve_type=True))[0]
+    upper = wp.tile_reduce(wp.max, wp.tile(upper, preserve_type=True))[0]
+    if lane == 0:
+        bounds[target.shape_index, 0] = lower
+        bounds[target.shape_index, 1] = upper
 
 
 @wp.kernel(enable_backward=False)
@@ -479,6 +517,7 @@ class NewtonWarpRenderer(BaseRenderer):
         self._scene_data_provider.prepare_deformable_gaussian_splats(self._sim.device)
         self._transform_mapping = self._scene_data_provider.create_mapping(list(self.backend.model.body_label))
         self._gaussian_splats_timestamp = -1
+        self._gaussian_splats_targets = {}
         self._gaussian_splats_embeddings = {
             embedding.path: embedding
             for entry in self._scene_data_provider.backend.get_gaussian_splats_entries()
@@ -489,6 +528,7 @@ class NewtonWarpRenderer(BaseRenderer):
             for index, label in enumerate(self.backend.model.shape_label)
             if label in self._gaussian_splats_embeddings
         }
+        self._update_deformable_gaussian_splats()
 
         self.newton_sensor = newton.sensors.SensorTiledCamera(
             self.backend.model,
@@ -652,49 +692,68 @@ class NewtonWarpRenderer(BaseRenderer):
 
     def _update_deformable_gaussian_splats(self) -> None:
         """Update independent Newton Gaussian data and refit their ray-tracing BVHs."""
+        if not self._gaussian_splats_shapes:
+            return
         states = self._scene_data_provider.get_deformable_gaussian_splats()
         timestamp = self._scene_data_provider.backend.geometry_timestamp
         if not states or self._gaussian_splats_timestamp == timestamp:
             return
         model = self.backend.model
-        for path, state in states.items():
-            shape_index = self._gaussian_splats_shapes[path]
-            source = model.shape_source[shape_index]
-            local = self._scene_data_provider.get_gaussian_splats_device_embedding(path, str(model.device)).to_local(
-                state, model.shape_transform, model.shape_scale, shape_index
-            )
-            data = source._warp_data
+        for paths, state, evaluator in states.batches:
+            cached = self._gaussian_splats_targets.get(paths)
+            if cached is None:
+                targets, sources, shapes, points, indices = [], [], [], [], []
+                for target_index, path in enumerate(paths):
+                    shape_index = self._gaussian_splats_shapes[path]
+                    source = model.shape_source[shape_index]
+                    target = _GaussianSplatsTarget()
+                    data = source._warp_data
+                    target.transforms, target.scales = data.transforms, data.scales
+                    target.opacities, target.coefficients = data.opacities, data.sh_coeffs
+                    target.min_response = data.min_response
+                    target.lowers, target.uppers = source._warp_bvh.lowers, source._warp_bvh.uppers
+                    target.shape_index = shape_index
+                    targets.append(target)
+                    sources.append(source)
+                    shapes.extend([shape_index] * source.count)
+                    points.extend(range(source.count))
+                    indices.extend([target_index] * source.count)
+                cached = (
+                    wp.array(targets, dtype=_GaussianSplatsTarget, device=model.device),
+                    sources,
+                    wp.array(shapes, dtype=wp.int32, device=model.device),
+                    wp.array(points, dtype=wp.int32, device=model.device),
+                    wp.array(indices, dtype=wp.int32, device=model.device),
+                )
+                self._gaussian_splats_targets[paths] = cached
+            targets, sources, shapes, points, indices = cached
+            local = evaluator.to_local_batch(state, model.shape_transform, model.shape_scale, shapes)
             coefficients = local.sh_coefficients
-            basis_count = (
-                0 if coefficients is None or not len(local.positions) else len(coefficients) // len(local.positions)
-            )
+            basis_count = (evaluator.embedding.sh_degree + 1) ** 2 if coefficients is not None else 0
             wp.launch(
                 _write_deformable_gaussian_splats,
-                dim=source.count,
+                dim=len(local.positions),
                 inputs=[
                     local.positions,
                     local.orientations,
                     local.scales,
-                    coefficients if coefficients is not None else wp.array(dtype=wp.vec3f, device=model.device),
+                    coefficients if coefficients is not None else evaluator.rest,
                     basis_count,
-                    data.transforms,
-                    data.scales,
-                    data.sh_coeffs,
+                    indices,
+                    points,
+                    targets,
                 ],
                 device=model.device,
             )
-            source.bvh_refit()
+            # Warp exposes one native refit per BVH; leaf calculations are batched above.
+            for source in sources:
+                source._warp_bvh.refit()
             if model.bvh_shape_bounds is not None:
                 wp.launch_tiled(
-                    compute_shape_local_bounds,
-                    dim=1,
+                    _update_gaussian_shape_bounds,
+                    dim=len(sources),
                     block_dim=SHAPE_BOUNDS_BLOCK_DIM,
-                    inputs=[
-                        model.shape_type[shape_index : shape_index + 1],
-                        model.shape_source_ptr[shape_index : shape_index + 1],
-                        model.gaussians_data,
-                        model.bvh_shape_bounds[shape_index : shape_index + 1],
-                    ],
+                    inputs=[targets, model.bvh_shape_bounds],
                     device=model.device,
                 )
         model.bvh_refit_shapes(self.backend.state_0)
@@ -774,4 +833,5 @@ class NewtonWarpRenderer(BaseRenderer):
 
     def close(self) -> None:
         """Release borrowed native handles and SDP bindings after camera cleanup."""
+        self._gaussian_splats_targets = {}
         self.newton_sensor = self.backend = self._scene_data_provider = self._transform_mapping = None

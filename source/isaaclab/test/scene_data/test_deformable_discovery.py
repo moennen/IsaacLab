@@ -251,6 +251,7 @@ def test_deformable_gaussian_splats_publication_updates_after_native_nodes_chang
     )
     provider = SceneDataProvider(backend)
     provider.prepare_deformable_gaussian_splats(device)
+    reads.clear()
     with monkeypatch.context() as patch:
         patch.setattr(wp.array, "numpy", lambda self: pytest.fail("Gaussian evaluation read back a native array"))
         positions = provider.get_deformable_gaussian_splats()["/Visual"].positions
@@ -463,3 +464,78 @@ def test_backend_geometry_nested_owners_partial_rows_and_shared_roots(source_x):
     for ordered in (prototypes, prototypes[::-1]):
         expanded = {entry.root_path: entry for entry in expand_deformable_entries(ordered, plan, np.asarray([3]))}
         assert expanded["/Lab/Cell3/Nested/Cloth"].vertices is shared.vertices
+
+
+def test_half_precision_gaussian_splats_preserves_authored_channels():
+    """Half-only splat assets retain centers, covariance, and directional appearance."""
+    stage = Usd.Stage.CreateInMemory()
+    prim = stage.DefinePrim("/Splats", "ParticleField3DGaussianSplat")
+    prim.CreateAttribute("positionsh", Sdf.ValueTypeNames.Half3Array).Set([(0.25, 0.25, 0.25)])
+    prim.CreateAttribute("orientationsh", Sdf.ValueTypeNames.QuathArray).Set(
+        [Gf.Quath(np.sqrt(0.5), np.sqrt(0.5), 0, 0)]
+    )
+    prim.CreateAttribute("scalesh", Sdf.ValueTypeNames.Half3Array).Set([(1, 2, 3)])
+    prim.CreateAttribute("radiance:sphericalHarmonicsDegree", Sdf.ValueTypeNames.Int).Set(0)
+    prim.CreateAttribute("radiance:sphericalHarmonicsCoefficientsh", Sdf.ValueTypeNames.Half3Array).Set(
+        [(0.5, 0.25, 0.125)]
+    )
+    points = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], dtype=np.float32)
+    embedding = read_gaussian_splats_embedding(prim, points, np.arange(4), element_width=4)
+    np.testing.assert_allclose(embedding.bind_centers, [[0.25] * 3])
+    np.testing.assert_allclose(embedding.bind_orientations, [[np.sqrt(0.5), 0, 0, np.sqrt(0.5)]], atol=5e-4)
+    np.testing.assert_allclose(embedding.bind_scales, [[1, 2, 3]])
+    np.testing.assert_allclose(embedding.sh_coefficients, [[0.5, 0.25, 0.125]])
+
+
+@pytest.mark.parametrize("device", test_devices())
+def test_cloned_gaussian_splats_batch_keeps_independent_motion(device):
+    """Shared embedding tables retain each clone's deformation and native buffer replacement."""
+    from dataclasses import replace
+
+    stage = Usd.Stage.CreateInMemory()
+    prim = stage.DefinePrim("/Splats", "ParticleField3DGaussianSplat")
+    prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.25, 0.25, 0.25)])
+    prim.CreateAttribute("isaaclab:deformableChannels", Sdf.ValueTypeNames.TokenArray).Set(
+        ["centers", "covariance", "sphericalHarmonics"]
+    )
+    prim.CreateAttribute("radiance:sphericalHarmonicsDegree", Sdf.ValueTypeNames.Int).Set(1)
+    coefficients = np.array([[0.25, 0.5, 0.75], [0, 0, 0], [0, 0, 0], [1, 0, 0]], dtype=np.float32)
+    prim.CreateAttribute("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Float3Array).Set(
+        [Gf.Vec3f(*map(float, value)) for value in coefficients]
+    )
+    points = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], dtype=np.float32)
+    embedding = read_gaussian_splats_embedding(prim, points, np.arange(4), element_width=4)
+    entry = DeformableStageEntry(
+        "/Body0", "/Sim0", "/Mesh0", "volume", 4, 4, vertices=points, gaussian_splats_embeddings=[embedding]
+    )
+    clone = replace(
+        entry,
+        root_path="/Body1",
+        sim_mesh_path="/Sim1",
+        init_pos=(10, 0, 0),
+        gaussian_splats_embeddings=[replace(embedding, path="/CloneSplats")],
+    )
+    first = points * [2, 1, 1]
+    second = points * [1, 3, 1] + [10, 0, 0]
+    native = wp.array(np.concatenate((first, second)), dtype=wp.vec3f, device=device)
+    backend = SimpleNamespace(
+        geometry_timestamp=0,
+        get_gaussian_splats_entries=lambda: [entry, clone],
+        get_gaussian_splats_points=lambda: {"/Sim0": native[:4], "/Sim1": native[4:]},
+        refresh_gaussian_splats_timestamp=lambda: None,
+    )
+    provider = SceneDataProvider(backend)
+    provider.prepare_deformable_gaussian_splats(device)
+    states = provider.get_deformable_gaussian_splats()
+    assert len(states.batches) == 1
+    np.testing.assert_allclose(states["/Splats"].positions.numpy(), [[0.5, 0.25, 0.25]], atol=1e-5)
+    np.testing.assert_allclose(states["/CloneSplats"].positions.numpy(), [[10.25, 0.75, 0.25]], atol=1e-5)
+    np.testing.assert_allclose(np.sort(states["/Splats"].scales.numpy()), [[1, 1, 2]], atol=1e-5)
+    np.testing.assert_allclose(np.sort(states["/CloneSplats"].scales.numpy()), [[1, 1, 3]], atol=1e-5)
+    np.testing.assert_allclose(states["/Splats"].sh_coefficients.numpy(), coefficients, atol=2e-4)
+    np.testing.assert_allclose(states["/CloneSplats"].sh_coefficients.numpy(), coefficients, atol=2e-4)
+    native = wp.array(np.concatenate((first, second)) + [0, 0, 2], dtype=wp.vec3f, device=device)
+    backend.geometry_timestamp += 1
+    updated = provider.get_deformable_gaussian_splats()
+    np.testing.assert_allclose(updated["/Splats"].positions.numpy(), [[0.5, 0.25, 2.25]], atol=1e-5)
+    np.testing.assert_allclose(updated["/CloneSplats"].positions.numpy(), [[10.25, 0.75, 2.25]], atol=1e-5)

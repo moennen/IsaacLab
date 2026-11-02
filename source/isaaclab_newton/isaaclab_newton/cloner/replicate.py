@@ -308,8 +308,6 @@ def _replicate_newton(
         ranges.update(zip(builder.volume_label, builder._volume_particle_start, strict=True))
         offsets = [ranges[entry.root_path] for entry in geometry]
         batches = deformable_geometry_batches(geometry, offsets, device=sim.device)
-        particle_offsets = [particle_ranges[entry.sim_mesh_path][0] for entry in particle_geometry]
-        batches.extend(deformable_geometry_batches(particle_geometry, particle_offsets, device=sim.device))
         if visual_ranges:
             batches.append((SceneDataFormat.Points(), visual_ranges))
         record = NewtonCloneRecord(
@@ -319,9 +317,7 @@ def _replicate_newton(
             cable_bindings=cable_bindings,
             geometry_batches=batches,
             gaussian_splats_entries=[
-                entry
-                for entry in (*geometry, *particle_geometry)
-                if load_visual_shapes and entry.gaussian_splats_embeddings
+                entry for entry in (*geometry, *particle_geometry) if entry.gaussian_splats_embeddings
             ],
         )
         sim.backend_manager.record_clone(record, site_index_map)

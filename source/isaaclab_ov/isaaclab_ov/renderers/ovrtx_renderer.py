@@ -398,7 +398,6 @@ class OVRTXRenderer(BaseRenderer):
         self._geometry_writes = _AsyncWriteBuffers[wp.array]()
         self._geometry_timestamp = -1
         self._gaussian_splats_timestamp = -1
-        self._gaussian_splats_arrays: list[wp.array] = []
         self._gaussian_splats_bindings: dict[tuple[str, tuple[str, ...]], AttributeBinding] = {}
         self._gaussian_splats_writes: deque[list[tuple[Operation[bool], list[wp.array]]]] = deque()
         self._gaussian_splats_paths: set[str] = set()
@@ -513,6 +512,7 @@ class OVRTXRenderer(BaseRenderer):
                 for embedding in entry.gaussian_splats_embeddings
             ]
         )
+        self._update_deformable_gaussian_splats()
         self._initialized_scene = True
         self._needs_transform_initialization = not self._use_ovstage and self.backend.cfg.read_gpu_transforms
 
@@ -1184,29 +1184,41 @@ class OVRTXRenderer(BaseRenderer):
             for operation, _ in self._gaussian_splats_writes[0]:
                 operation.wait()
             self._gaussian_splats_writes.popleft()
-        arrays = []
         stream = (self._warp_device.stream.cuda_stream or 1) if self._warp_device.is_cuda else 1
         self._reset_gaussian_splats_paths(list(states))
         grouped = {}
+        converted = {}
         for path, state in states.items():
-            attributes = {"positions": state.positions, "orientations": state.orientations, "scales": state.scales}
-            if state.sh_coefficients is not None:
-                attributes["radiance:sphericalHarmonicsCoefficients"] = state.sh_coefficients
+            batch = state.batch or state
+            attributes = {"positions": batch.positions, "orientations": batch.orientations, "scales": batch.scales}
+            if batch.sh_coefficients is not None:
+                attributes["radiance:sphericalHarmonicsCoefficients"] = batch.sh_coefficients
             for name, values in attributes.items():
-                array = values
-                if array.device != self._warp_device:
-                    array = wp.empty(len(values), dtype=values.dtype, device=self._warp_device)
-                    wp.copy(array, values)
-                if name == "orientations":
-                    reordered = wp.empty(len(array), dtype=wp.quatf, device=self._warp_device)
-                    wp.launch(
-                        gaussian_orientations_wxyz, dim=len(array), inputs=[array, reordered], device=self._warp_device
-                    )
-                    array = reordered
-                arrays.append(array)
-                paths, values = grouped.setdefault(name, ([], []))
+                key = (name, values.ptr)
+                array = converted.get(key)
+                if array is None:
+                    array = values
+                    if array.device != self._warp_device:
+                        array = wp.empty(len(values), dtype=values.dtype, device=self._warp_device)
+                        wp.copy(array, values)
+                    if name == "orientations":
+                        reordered = wp.empty(len(array), dtype=wp.quatf, device=self._warp_device)
+                        wp.launch(
+                            gaussian_orientations_wxyz,
+                            dim=len(array),
+                            inputs=[array, reordered],
+                            device=self._warp_device,
+                        )
+                        array = reordered
+                    converted[key] = array
+                if name == "radiance:sphericalHarmonicsCoefficients":
+                    count = len(state.sh_coefficients)
+                    start = 0 if len(array) == count else state.start * (count // len(state.positions))
+                else:
+                    count, start = len(state.positions), state.start
+                paths, buffers = grouped.setdefault(name, ([], []))
                 paths.append(path)
-                values.append(array)
+                buffers.append(array[start : start + count])
         writes = []
         if not self._use_ovstage:
             self._gaussian_splats_writes.append(writes)
@@ -1247,7 +1259,6 @@ class OVRTXRenderer(BaseRenderer):
                     self._bindings.callback(binding.unbind)
                 operation = binding.write_async(values, data_access=DataAccess.ASYNC, cuda_stream=stream)
                 writes.append((operation, values))
-        self._gaussian_splats_arrays = arrays
         self._gaussian_splats_timestamp = timestamp
 
     def update_camera(
@@ -1429,7 +1440,6 @@ class OVRTXRenderer(BaseRenderer):
             self._geometry_paths = []
             self._geometry_timestamp = -1
             self._gaussian_splats_timestamp = -1
-            self._gaussian_splats_arrays.clear()
             self._gaussian_splats_bindings.clear()
             self._gaussian_splats_paths.clear()
             self._transforms_timestamp = -1

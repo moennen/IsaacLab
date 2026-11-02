@@ -196,6 +196,7 @@ class IsaacRtxRenderer(BaseRenderer):
                 for embedding in entry.gaussian_splats_embeddings
             )
         )
+        self._fabric.update_gaussian_splats(provider)
 
     @property
     def visual_material_writer(self):

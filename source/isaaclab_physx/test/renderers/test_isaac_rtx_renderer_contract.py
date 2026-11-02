@@ -95,7 +95,7 @@ def test_fabric_writes_deformable_gaussian_splats_arrays_to_stage(monkeypatch, d
 
     from pxr import Sdf, Usd
 
-    from isaaclab.scene_data.deformable_gaussian_splats import GaussianSplatsState
+    from isaaclab.scene_data.deformable_gaussian_splats import GaussianSplatsPublication, GaussianSplatsState
 
     stage = Usd.Stage.CreateInMemory()
     prim = stage.DefinePrim("/Splats", "ParticleField3DGaussianSplat")
@@ -106,29 +106,45 @@ def test_fabric_writes_deformable_gaussian_splats_arrays_to_stage(monkeypatch, d
         ("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Float3Array),
     ):
         prim.CreateAttribute(name, value_type)
+    prim.GetAttribute("positions").Set([(0, 0, 0)])
     fabric = FabricBackend.__new__(FabricBackend)
     fabric.usd_stage = stage
-    fabric.stage = SimpleNamespace(SynchronizeToFabric=MagicMock(), GetPrimAtPath=MagicMock())
+    fabric.stage = SimpleNamespace(SynchronizeToFabric=MagicMock(), GetPrimAtPath=MagicMock(), SelectPrims=MagicMock())
     fabric.device = device
     fabric._gaussian_splats_paths = set()
     fabric._gaussian_splats_timestamp = -1
+    fabric._gaussian_splats_bindings = {}
     state = GaussianSplatsState(
         positions=wp.array([[1, 2, 3]], dtype=wp.vec3f, device=device),
         orientations=wp.array([[0, 0, 0, 1]], dtype=wp.quatf, device=device),
         scales=wp.array([[1, 2, 3]], dtype=wp.vec3f, device=device),
         sh_coefficients=wp.array([[0.1, 0.2, 0.3]], dtype=wp.vec3f, device=device),
     )
+    states = GaussianSplatsPublication()
+    states["/Splats"] = state
+    states.batches.append((("/Splats",), state, None))
     provider = SimpleNamespace(
-        get_deformable_gaussian_splats=lambda: {"/Splats": state},
+        get_deformable_gaussian_splats=lambda: states,
         backend=SimpleNamespace(geometry_timestamp=1),
     )
+    if device.startswith("cuda"):
+        outputs = {
+            name: wp.empty((1, 1), dtype=dtype, device=device)
+            for name, dtype in (
+                ("positions", wp.vec3f),
+                ("orientations", wp.quatf),
+                ("scales", wp.vec3f),
+                ("radiance:sphericalHarmonicsCoefficients", wp.vec3f),
+            )
+        }
+        monkeypatch.setattr(wp, "fabricarray", lambda *args, **kwargs: wp.array([0], dtype=wp.int32, device=device))
+        monkeypatch.setattr(wp, "fabricarrayarray", lambda selection, name, **kwargs: outputs[name])
     fabric.update_gaussian_splats(provider)
     if device.startswith("cuda"):
-        from isaaclab_physx.renderers import fabric as fabric_module
-
-        source = fabric_module.usdrt.Vt.Vec3fArray.call_args_list[0].args[0]
-        assert str(source.device) == device
-        assert fabric.stage.GetPrimAtPath.call_count == 1
+        np.testing.assert_allclose(outputs["positions"].numpy()[0], [[1, 2, 3]])
+        np.testing.assert_allclose(outputs["orientations"].numpy()[0], [[0, 0, 0, 1]])
+        np.testing.assert_allclose(outputs["scales"].numpy()[0], [[1, 2, 3]])
+        np.testing.assert_allclose(outputs["radiance:sphericalHarmonicsCoefficients"].numpy()[0], [[0.1, 0.2, 0.3]])
         assert fabric.stage.SynchronizeToFabric.call_count == 1
         return
     assert tuple(prim.GetAttribute("positions").Get()[0]) == (1, 2, 3)

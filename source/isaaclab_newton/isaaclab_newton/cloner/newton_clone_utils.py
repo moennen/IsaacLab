@@ -105,8 +105,9 @@ def add_deformable_gaussian_splats(builder: ModelBuilder, stage: Usd.Stage, geom
             continue
         prim = stage.GetPrimAtPath(embedding.path)
         matrix = xforms.GetLocalToWorldTransform(prim)
-        rotation = matrix.ExtractRotationQuat()
-        scale = Gf.Transform(matrix).GetScale()
+        transform = Gf.Transform(matrix)
+        rotation = transform.GetRotation().GetQuat()
+        scale = transform.GetScale()
         builder.add_shape_gaussian(
             -1,
             gaussian=Gaussian.create_from_usd(prim),
@@ -126,11 +127,7 @@ def add_visual_deformables_to_sources(
             if builder is None:
                 continue
             add_deformable_gaussian_splats(builder, stage, entry)
-            if (
-                entry.gaussian_splats_embeddings
-                and entry.vis_mesh_path == entry.sim_mesh_path
-                and entry.deformable_type in ("volume", "particle")
-            ):
+            if not entry.has_visual_mesh:
                 continue
             pose = dict(pos=wp.vec3(*entry.init_pos), rot=wp.quat(*entry.init_rot), scale=1.0, vel=wp.vec3())
             surface = entry.deformable_type == "surface" or entry.vis_mesh_path != entry.sim_mesh_path

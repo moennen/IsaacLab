@@ -253,9 +253,9 @@ def test_ovstage_gaussian_splats_writes_use_cuda_buffers(device):
         "scales",
         "radiance:sphericalHarmonicsCoefficients",
     ]
-    assert [call.kwargs["tensors"][0].data for call in writes] == [
-        array.ptr for array in renderer._gaussian_splats_arrays
-    ]
+    assert writes[0].kwargs["tensors"][0].data == state.positions.ptr
+    assert writes[2].kwargs["tensors"][0].data == state.scales.ptr
+    assert writes[3].kwargs["tensors"][0].data == state.sh_coefficients.ptr
     assert all(call.kwargs["cuda_stream"] == renderer._warp_device.stream.cuda_stream for call in writes)
 
 

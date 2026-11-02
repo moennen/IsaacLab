@@ -514,6 +514,8 @@ def test_scene_data_binding_is_deferred_until_requested(manager, monkeypatch, mo
     runtime = SimpleNamespace(create_tensor_binding=bind, **{"read_sync" if modern else "read": read})
     native = SimpleNamespace(physx=runtime, rigid_body_view=None)
     backend = OvPhysxSceneDataBackend(manager)
+    assert backend.get_gaussian_splats_entries() == []
+    assert backend.get_gaussian_splats_points() == {}
     backend._defer_setup(native, "cpu", ())
     assert calls == []
     from isaaclab.scene_data import SceneDataProvider

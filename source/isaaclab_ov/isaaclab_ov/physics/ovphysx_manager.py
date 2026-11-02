@@ -132,6 +132,9 @@ class OvPhysxSceneDataBackend(SceneDataBackend):
         self.geometry_timestamp = 0
         self._geometry = TimestampedBuffer()
         self._deformable_bindings: list[tuple[OvPhysxView, Any, wp.array]] = []
+        self._gaussian_splats_entries: list[DeformableStageEntry] = []
+        self._gaussian_splats_ranges: dict[str, tuple[int, int]] = {}
+        self._gaussian_splats_point_buffer: wp.array | None = None
         self._pending_setup: tuple[OvPhysxBackend, str, Sequence[DeformableStageEntry] | None] | None = None
 
     def _defer_setup(

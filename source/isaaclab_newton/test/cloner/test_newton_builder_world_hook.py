@@ -172,9 +172,12 @@ def _author_deformable(stage, path, kind):
 
 
 @pytest.mark.parametrize("kind", ["volume", "surface"])
-def test_deformable_gaussian_splats_shape_survives_ignored_usd_subtree(kind):
+@pytest.mark.parametrize("load_visual_shapes", [True, False])
+def test_deformable_gaussian_splats_shape_survives_ignored_usd_subtree(kind, load_visual_shapes):
     """A Newton deformable imports its Gaussian child as an independent render shape."""
-    sim_cfg = SimulationCfg(device="cpu", physics=NewtonCfg(solver_cfg=VBDSolverCfg(), load_visual_shapes=True))
+    sim_cfg = SimulationCfg(
+        device="cpu", physics=NewtonCfg(solver_cfg=VBDSolverCfg(), load_visual_shapes=load_visual_shapes)
+    )
     with build_simulation_context(sim_cfg=sim_cfg) as sim:
         stage = sim.stage
         UsdGeom.SetStageUpAxis(stage, "Z")
@@ -204,13 +207,21 @@ def test_deformable_gaussian_splats_shape_survives_ignored_usd_subtree(kind):
         sim.reset()
 
         model = sim.backend_manager.backend.model
-        assert gaussian_splats_path in model.shape_label
-        assert isinstance(model.shape_source[model.shape_label.index(gaussian_splats_path)], newton.Gaussian)
+        assert (gaussian_splats_path in model.shape_label) == load_visual_shapes
+        if load_visual_shapes:
+            assert isinstance(model.shape_source[model.shape_label.index(gaussian_splats_path)], newton.Gaussian)
         assert any(
             binding.path == gaussian_splats_path
             for entry in sim.get_scene_data_provider().backend.get_gaussian_splats_entries()
             for binding in entry.gaussian_splats_embeddings
         )
+        provider = sim.get_scene_data_provider()
+        before = provider.get_deformable_gaussian_splats()[gaussian_splats_path].positions.numpy()
+        model_state = sim.backend_manager.backend.state_0
+        model_state.particle_q.assign(model_state.particle_q.numpy() + [1, 0, 0])
+        provider.backend.geometry_timestamp += 1
+        after = provider.get_deformable_gaussian_splats()[gaussian_splats_path].positions.numpy()
+        np.testing.assert_allclose(after, before + [1, 0, 0], atol=1e-5)
 
 
 @pytest.mark.parametrize("heterogeneous", [False, True], ids=["batched", "heterogeneous"])
@@ -302,6 +313,9 @@ def test_render_only_deformable_splats_have_independent_sources_and_matching_pro
         stage.RemovePrim(root + "/vis")
     prim = stage.DefinePrim(root + "/Splats", "ParticleField3DGaussianSplat")
     prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.2, 0.2, 0.1)])
+    xform = UsdGeom.Xformable(prim)
+    xform.AddRotateXOp().Set(90)
+    xform.AddScaleOp().Set((0.01, 0.01, 0.01))
     plan = make_clone_plan(
         (AssetBaseCfg(prim_path="/World/env_[^/]+/Soft", spawn=SpawnerCfg(spawn_path=root)),),
         ((0,),),
@@ -319,6 +333,8 @@ def test_render_only_deformable_splats_have_independent_sources_and_matching_pro
     assert len(builder.volume_label) == 0
     assert len(builder.surface_label) == (2 if kind == "surface" else 0)
     model = builder.finalize(device="cpu")
+    pose = model.shape_transform.numpy()[model.shape_label.index(root + "/Splats")]
+    np.testing.assert_allclose(np.abs(pose[3:]), [np.sqrt(0.5), 0, 0, np.sqrt(0.5)], atol=1e-6)
     sources = [model.shape_source[model.shape_label.index(f"/World/env_{i}/Soft/Splats")] for i in range(2)]
     first, second = (source._warp_data.transforms for source in sources)
     assert first.ptr != second.ptr

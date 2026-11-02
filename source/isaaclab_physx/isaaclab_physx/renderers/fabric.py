@@ -8,14 +8,17 @@
 from __future__ import annotations
 
 from dataclasses import field
+from typing import Any
 
+import numpy as np
 import warp as wp
 
 import usdrt
 import usdrt.hierarchy
-from pxr import Usd, UsdGeom, UsdUtils, Vt
+from pxr import Sdf, Usd, UsdGeom, UsdUtils, Vt
 
 from isaaclab.scene_data import SceneDataFormat, SceneDataProvider
+from isaaclab.scene_data.deformable_gaussian_splats import read_gaussian_splats_attribute
 from isaaclab.sim import BackendCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.buffers import TimestampedBuffer
@@ -34,6 +37,37 @@ def _capture_scales(
         wp.length(wp.vec3f(matrix[1, 0], matrix[1, 1], matrix[1, 2])),
         wp.length(wp.vec3f(matrix[2, 0], matrix[2, 1], matrix[2, 2])),
     )
+
+
+@wp.kernel(enable_backward=False)
+def _splat_destination_rows(tags: Any, rows: wp.array(dtype=wp.int32)):
+    row = wp.tid()
+    rows[tags[row]] = row
+
+
+@wp.kernel(enable_backward=False)
+def _write_fabric_splats(
+    positions: wp.array(dtype=wp.vec3f),
+    orientations: wp.array(dtype=wp.quatf),
+    scales: wp.array(dtype=wp.vec3f),
+    coefficients: wp.array(dtype=wp.vec3f),
+    count: int,
+    basis_count: int,
+    rows: wp.array(dtype=wp.int32),
+    out_positions: Any,
+    out_orientations: Any,
+    out_scales: Any,
+    out_coefficients: Any,
+):
+    splat = wp.tid()
+    row, index = rows[splat // count], splat % count
+    out_positions[row, index] = positions[splat]
+    out_orientations[row, index] = orientations[splat]
+    out_scales[row, index] = scales[splat]
+    for basis in range(basis_count):
+        out_coefficients[row, index * basis_count + basis] = coefficients[
+            (splat * basis_count + basis) % coefficients.shape[0]
+        ]
 
 
 class FabricBackend:
@@ -57,6 +91,7 @@ class FabricBackend:
         self._geometry_bindings = None
         self._gaussian_splats_timestamp = -1
         self._gaussian_splats_paths: set[str] = set()
+        self._gaussian_splats_bindings: dict[tuple[str, ...], tuple] = {}
 
     def bind_transforms(self, provider: SceneDataProvider) -> None:
         """Bind the initialized simulation's rigid destinations once; native Fabric needs no conversion binding."""
@@ -164,36 +199,84 @@ class FabricBackend:
         if device_states != any(state.positions.device.is_cuda for state in states.values()):
             raise ValueError("Gaussian states for one Fabric update must share a device representation.")
         self.prepare_gaussian_splats(tuple(states), synchronize=device_states)
-        gpu_updates = []
-        for path, state in states.items():
-            prim = self.usd_stage.GetPrimAtPath(path)
-            if not prim.IsValid():
-                raise RuntimeError(f"Deformable Gaussian prim {path!r} is absent from the RTX stage.")
-            if state.positions.device.is_cuda:
-                rt_prim = self.stage.GetPrimAtPath(path)
-                gpu_updates.append((rt_prim, state.positions, state.orientations, state.scales, state.sh_coefficients))
-            else:
+        if device_states:
+            for paths, state, _ in states.batches:
+                binding = self._gaussian_splats_bindings.get(paths)
+                new_binding = binding is None
+                if binding is None:
+                    tag = f"isaaclab:splatIndex:group{len(self._gaussian_splats_bindings)}"
+                    for index, path in enumerate(paths):
+                        self.stage.GetPrimAtPath(path).CreateAttribute(
+                            tag, usdrt.Sdf.ValueTypeNames.Int, custom=True
+                        ).Set(index)
+                    attributes = [
+                        (usdrt.Sdf.ValueTypeNames.Int, tag, usdrt.Usd.Access.Read),
+                        (usdrt.Sdf.ValueTypeNames.Point3fArray, "positions", usdrt.Usd.Access.ReadWrite),
+                        (usdrt.Sdf.ValueTypeNames.QuatfArray, "orientations", usdrt.Usd.Access.ReadWrite),
+                        (usdrt.Sdf.ValueTypeNames.Float3Array, "scales", usdrt.Usd.Access.ReadWrite),
+                    ]
+                    if state.sh_coefficients is not None:
+                        attributes.append(
+                            (
+                                usdrt.Sdf.ValueTypeNames.Float3Array,
+                                "radiance:sphericalHarmonicsCoefficients",
+                                usdrt.Usd.Access.ReadWrite,
+                            )
+                        )
+                    selection = self.stage.SelectPrims(require_attrs=attributes, device=self.device)
+                    rows = wp.empty(len(paths), dtype=wp.int32, device=self.device)
+                    binding = (selection, rows, tag)
+                    self._gaussian_splats_bindings[paths] = binding
+                selection, rows, tag = binding
+                changed = selection.PrepareForReuse()
+                if new_binding or changed:
+                    wp.launch(
+                        _splat_destination_rows,
+                        dim=len(paths),
+                        inputs=[wp.fabricarray(selection, tag, dtype=wp.int32), rows],
+                        device=self.device,
+                    )
+                positions = wp.fabricarrayarray(selection, "positions", dtype=wp.vec3f)
+                orientations = wp.fabricarrayarray(selection, "orientations", dtype=wp.quatf)
+                scales = wp.fabricarrayarray(selection, "scales", dtype=wp.vec3f)
+                coefficients = (
+                    wp.fabricarrayarray(selection, "radiance:sphericalHarmonicsCoefficients", dtype=wp.vec3f)
+                    if state.sh_coefficients is not None
+                    else positions
+                )
+                count = len(state.positions) // len(paths)
+                basis_count = (
+                    len(states[paths[0]].sh_coefficients) // count if state.sh_coefficients is not None and count else 0
+                )
+                wp.launch(
+                    _write_fabric_splats,
+                    dim=len(state.positions),
+                    inputs=[
+                        state.positions,
+                        state.orientations,
+                        state.scales,
+                        state.sh_coefficients if state.sh_coefficients is not None else state.positions,
+                        count,
+                        basis_count,
+                        rows,
+                        positions,
+                        orientations,
+                        scales,
+                        coefficients,
+                    ],
+                    device=self.device,
+                )
+            wp.synchronize_stream(self.device)
+        else:
+            for path, state in states.items():
+                prim = self.usd_stage.GetPrimAtPath(path)
                 prim.GetAttribute("positions").Set(Vt.Vec3fArray.FromNumpy(state.positions.numpy()))
-                if state.orientations is not None:
-                    prim.GetAttribute("orientations").Set(Vt.QuatfArray.FromNumpy(state.orientations.numpy()))
-                    prim.GetAttribute("scales").Set(Vt.Vec3fArray.FromNumpy(state.scales.numpy()))
+                prim.GetAttribute("orientations").Set(Vt.QuatfArray.FromNumpy(state.orientations.numpy()))
+                prim.GetAttribute("scales").Set(Vt.Vec3fArray.FromNumpy(state.scales.numpy()))
                 if state.sh_coefficients is not None:
                     prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").Set(
                         Vt.Vec3fArray.FromNumpy(state.sh_coefficients.numpy())
                     )
-        if device_states:
-            # USDRT VtArray.Set has no producer-stream parameter; synchronize once for all prims.
-            wp.synchronize_stream(self.device)
-            for rt_prim, positions, orientations, scales, coefficients in gpu_updates:
-                rt_prim.GetAttribute("positions").Set(usdrt.Vt.Vec3fArray(positions))
-                if orientations is not None:
-                    rt_prim.GetAttribute("orientations").Set(usdrt.Vt.QuatfArray(orientations))
-                    rt_prim.GetAttribute("scales").Set(usdrt.Vt.Vec3fArray(scales))
-                if coefficients is not None:
-                    rt_prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").Set(
-                        usdrt.Vt.Vec3fArray(coefficients)
-                    )
-        else:
             self.stage.SynchronizeToFabric()
         self._gaussian_splats_timestamp = timestamp
 
@@ -204,6 +287,23 @@ class FabricBackend:
             prim = self.usd_stage.GetPrimAtPath(path)
             if not prim.IsValid():
                 raise RuntimeError(f"Deformable Gaussian prim {path!r} is absent from the RTX stage.")
+            positions = read_gaussian_splats_attribute(prim, "positions")
+            count = len(positions) if positions is not None else 0
+            for name, dtype, default in (
+                ("positions", Sdf.ValueTypeNames.Point3fArray, np.zeros((count, 3), dtype=np.float32)),
+                ("orientations", Sdf.ValueTypeNames.QuatfArray, np.tile([0, 0, 0, 1], (count, 1))),
+                ("scales", Sdf.ValueTypeNames.Float3Array, np.ones((count, 3), dtype=np.float32)),
+                ("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Float3Array, None),
+            ):
+                if prim.GetAttribute(name).Get() is not None:
+                    continue
+                value = read_gaussian_splats_attribute(prim, name)
+                if value is not None and name == "orientations":
+                    value = [[*q.GetImaginary(), q.GetReal()] for q in value]
+                value = default if value is None else np.asarray(value, dtype=np.float32)
+                if value is not None:
+                    array_type = Vt.QuatfArray if name == "orientations" else Vt.Vec3fArray
+                    prim.CreateAttribute(name, dtype).Set(array_type.FromNumpy(np.asarray(value, dtype=np.float32)))
             xformable = UsdGeom.Xformable(prim)
             xformable.ClearXformOpOrder()
             xformable.SetResetXformStack(True)
@@ -256,6 +356,7 @@ class FabricBackend:
         self.transforms = self._selection = self._write_selection = None
         self._mapping = self._scales = self.hierarchy = self.stage = None
         self._geometry_bindings = None
+        self._gaussian_splats_bindings.clear()
         self._gaussian_splats_paths.clear()
         self._gaussian_splats_timestamp = -1
 

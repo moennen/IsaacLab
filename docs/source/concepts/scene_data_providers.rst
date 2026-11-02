@@ -121,6 +121,9 @@ OVRTX, and Newton Warp write the selected channels into their own Gaussian splat
 Embedding tables are uploaded to the simulation device during renderer initialization. Warp
 evaluates Gaussian splats on either CPU or CUDA from native simulation nodes. On CUDA, evaluation
 and renderer writes remain on the device during subsequent updates.
+Translated clones share bind-frame and SH tables. Evaluation and renderer conversion kernels
+process batches grouped by prototype, root rotation, and native nodal allocation. Per-prim views
+borrow slices of those batches; they do not allocate separate device outputs for each environment.
 
 PhysX publishes native Fabric matrices through SDP without fetching packed poses.
 ``isaaclab_physx.renderers.fabric.FabricBackend`` owns the stage and hierarchy

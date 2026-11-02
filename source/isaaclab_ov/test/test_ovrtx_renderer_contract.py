@@ -20,6 +20,7 @@ import warp as wp
 
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.renderers.camera_render_spec import CameraRenderSpec
+from isaaclab.scene_data import SceneDataBackend, SceneDataProvider
 from isaaclab.sensors.camera import CameraCfg
 from isaaclab.sensors.camera.camera_data import CameraData, RenderBufferKind, RenderBufferSpec
 from isaaclab.sim import PinholeCameraCfg, SimulationContext
@@ -119,9 +120,13 @@ def _simulation_registry(monkeypatch):
     )
     sim.render_context = sim._render_context
     sim.get_clone_plan = lambda: sim.plan
-    sim.get_scene_data_provider = lambda: types.SimpleNamespace(
-        backend=types.SimpleNamespace(transform_paths=[]), get_geometry_points=lambda: {}
-    )
+
+    class EmptySceneDataBackend(SceneDataBackend):
+        @property
+        def transform_paths(self) -> list[str]:
+            return []
+
+    sim.get_scene_data_provider = lambda: SceneDataProvider(EmptySceneDataBackend())
     sim.get_backends = SimulationContext.get_backends.__get__(sim)
     sim.get_or_create_backend = SimulationContext.get_or_create_backend.__get__(sim)
     sim.close_backend = SimulationContext.close_backend.__get__(sim)

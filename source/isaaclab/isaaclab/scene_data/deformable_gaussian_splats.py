@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -22,6 +23,21 @@ _CHANNEL_SETS = (
     ("centers", "covariance"),
     ("centers", "covariance", "sphericalHarmonics"),
 )
+
+
+def read_gaussian_splats_attribute(prim: Usd.Prim, name: str) -> Any:
+    """Read the float attribute, falling back to the schema's half-precision variant."""
+    value = prim.GetAttribute(name).Get()
+    return prim.GetAttribute(name + "h").Get() if value is None else value
+
+
+def _sphere_directions(count: int) -> np.ndarray:
+    """Return deterministic Fibonacci-sphere directions for SH fitting."""
+    index = np.arange(count, dtype=np.float64) + 0.5
+    z = 1.0 - 2.0 * index / count
+    phi = np.pi * (3.0 - np.sqrt(5.0)) * index
+    radius = np.sqrt(1.0 - z * z)
+    return np.column_stack((radius * np.cos(phi), radius * np.sin(phi), z))
 
 
 @dataclass
@@ -75,7 +91,7 @@ def read_gaussian_splats_embedding(
         Validated embedding in simulation point order.
     """
     path = str(prim.GetPath())
-    centers_value = prim.GetAttribute("positions").Get()
+    centers_value = read_gaussian_splats_attribute(prim, "positions")
     if centers_value is None:
         raise ValueError(f"Gaussian prim {path!r} has no default positions.")
     centers = np.asarray(centers_value, dtype=np.float32).reshape(-1, 3)
@@ -160,8 +176,8 @@ def read_gaussian_splats_embedding(
             if rank < required_rank:
                 raise ValueError(f"Gaussian covariance embedding has degenerate proxy nodes on {path!r}.")
     count = len(centers)
-    orientations = prim.GetAttribute("orientations").Get()
-    scales = prim.GetAttribute("scales").Get()
+    orientations = read_gaussian_splats_attribute(prim, "orientations")
+    scales = read_gaussian_splats_attribute(prim, "scales")
     if orientations is None:
         orientations_array = np.tile([0.0, 0.0, 0.0, 1.0], (count, 1)).astype(np.float32)
     else:
@@ -170,7 +186,7 @@ def read_gaussian_splats_embedding(
         )
     scales_array = np.ones((count, 3), dtype=np.float32) if scales is None else np.asarray(scales, dtype=np.float32)
     degree = int(prim.GetAttribute("radiance:sphericalHarmonicsDegree").Get() or 0)
-    coefficients = prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").Get()
+    coefficients = read_gaussian_splats_attribute(prim, "radiance:sphericalHarmonicsCoefficients")
     coefficients_array = (
         np.empty((0, 3), dtype=np.float32) if coefficients is None else np.asarray(coefficients, dtype=np.float32)
     )
@@ -226,6 +242,16 @@ class GaussianSplatsState:
     orientations: wp.array
     scales: wp.array
     sh_coefficients: wp.array | None
+    batch: GaussianSplatsState | None = None
+    start: int = 0
+
+
+class GaussianSplatsPublication(dict[str, GaussianSplatsState]):
+    """Per-prim views plus their shared device batches for renderer kernels."""
+
+    def __init__(self):
+        super().__init__()
+        self.batches: list[tuple[tuple[str, ...], GaussianSplatsState, WarpGaussianSplatsEmbedding]] = []
 
 
 def _sh_basis(directions: np.ndarray, degree: int) -> np.ndarray:
@@ -254,11 +280,7 @@ def _rotate_sh_many(coefficients: np.ndarray, rotations: np.ndarray, degree: int
     if degree == 0:
         return coefficients.copy()
     samples = 2 * (degree + 1) ** 2
-    index = np.arange(samples, dtype=np.float64) + 0.5
-    z = 1.0 - 2.0 * index / samples
-    phi = np.pi * (3.0 - np.sqrt(5.0)) * index
-    radius = np.sqrt(1.0 - z * z)
-    directions = np.column_stack((radius * np.cos(phi), radius * np.sin(phi), z))
+    directions = _sphere_directions(samples)
     target = _sh_basis(directions, degree)
     result = np.empty_like(coefficients)
     for start in range(0, len(coefficients), 4096):
@@ -322,6 +344,7 @@ def _gaussian_covariance_axes(covariance: wp.mat33f) -> tuple[wp.quatf, wp.vec3f
 @wp.kernel(enable_backward=False)
 def _evaluate_gaussian_splats_kernel(
     current: wp.array(dtype=wp.vec3f),
+    node_offsets: wp.array(dtype=wp.int32),
     rest: wp.array(dtype=wp.vec3f),
     offsets: wp.array(dtype=wp.int32),
     indices: wp.array(dtype=wp.int32),
@@ -329,6 +352,8 @@ def _evaluate_gaussian_splats_kernel(
     normal_offsets: wp.array(dtype=wp.float32),
     rest_inverse: wp.array(dtype=wp.mat33f),
     bind_covariance: wp.array(dtype=wp.mat33f),
+    bind_orientations: wp.array(dtype=wp.quatf),
+    bind_scales: wp.array(dtype=wp.vec3f),
     bind_rotation: wp.array(dtype=wp.mat33f),
     element_width: int,
     deform_covariance: bool,
@@ -339,28 +364,32 @@ def _evaluate_gaussian_splats_kernel(
     rotations: wp.array(dtype=wp.mat33f),
 ):
     """Evaluate each asset embedding independently from native proxy nodes."""
-    splat = wp.tid()
+    instance, splat = wp.tid()
+    output = instance * (offsets.shape[0] - 1) + splat
+    node_offset = node_offsets[instance]
     start = offsets[splat]
     end = offsets[splat + 1]
     center = wp.vec3f(0.0)
     for slot in range(start, end):
-        center += weights[slot] * current[indices[slot]]
+        center += weights[slot] * current[node_offset + indices[slot]]
     if element_width == 3 and end - start == 3:
-        a = current[indices[start]]
-        b = current[indices[start + 1]]
-        c = current[indices[start + 2]]
+        a = current[node_offset + indices[start]]
+        b = current[node_offset + indices[start + 1]]
+        c = current[node_offset + indices[start + 2]]
         normal = wp.cross(b - a, c - a)
         if wp.length(normal) > 1.0e-12:
             center += normal_offsets[splat] * wp.normalize(normal)
-    positions[splat] = center
+    positions[output] = center
     if not deform_covariance:
+        orientations[output] = bind_orientations[splat]
+        scales[output] = bind_scales[splat]
         return
 
     deformation = wp.mat33f(0.0)
     if element_width == 3:
-        a = current[indices[start]]
-        b = current[indices[start + 1]]
-        c = current[indices[start + 2]]
+        a = current[node_offset + indices[start]]
+        b = current[node_offset + indices[start + 1]]
+        c = current[node_offset + indices[start + 2]]
         normal = wp.cross(b - a, c - a)
         if wp.length(normal) > 1.0e-12:
             normal = wp.normalize(normal)
@@ -384,12 +413,12 @@ def _evaluate_gaussian_splats_kernel(
             rest_center += weights[slot] * rest[indices[slot]]
         for slot in range(start, end):
             node = indices[slot]
-            deformation += wp.outer(current[node] - center, rest[node] - rest_center)
+            deformation += wp.outer(current[node_offset + node] - center, rest[node] - rest_center)
         deformation = deformation @ rest_inverse[splat]
     covariance = deformation @ bind_covariance[splat] @ wp.transpose(deformation)
     orientation, scale = _gaussian_covariance_axes(covariance)
-    orientations[splat] = orientation
-    scales[splat] = scale
+    orientations[output] = orientation
+    scales[output] = scale
     if deform_sh:
         left, _, right = wp.svd3(deformation)
         rotation = left @ wp.transpose(right)
@@ -398,7 +427,7 @@ def _evaluate_gaussian_splats_kernel(
             left[1, 2] = -left[1, 2]
             left[2, 2] = -left[2, 2]
             rotation = left @ wp.transpose(right)
-        rotations[splat] = rotation @ bind_rotation[0]
+        rotations[output] = rotation @ bind_rotation[0]
 
 
 @wp.func
@@ -443,7 +472,7 @@ def _sample_rotated_gaussian_sh_kernel(
     value = wp.vec3f(0.0)
     for basis in range(basis_count):
         weight = _gaussian_sh_basis_value(direction, basis, basis_offsets, basis_terms, basis_values, exponents)
-        value += weight * coefficients[splat * basis_count + basis]
+        value += weight * coefficients[(splat * basis_count + basis) % coefficients.shape[0]]
     samples[splat * directions.shape[0] + sample] = value
 
 
@@ -458,7 +487,7 @@ def _solve_rotated_gaussian_sh_kernel(
     """Recover rotated coefficients while preserving the constant SH term exactly."""
     splat, basis = wp.tid()
     if basis == 0:
-        output[splat * basis_count] = coefficients[splat * basis_count]
+        output[splat * basis_count] = coefficients[(splat * basis_count) % coefficients.shape[0]]
         return
     value = wp.vec3f(0.0)
     for sample in range(inverse_basis.shape[1]):
@@ -470,7 +499,7 @@ def _solve_rotated_gaussian_sh_kernel(
 def _gaussian_splats_to_local_kernel(
     shape_poses: wp.array(dtype=wp.transformf),
     shape_scales: wp.array(dtype=wp.vec3f),
-    shape_index: int,
+    shape_indices: wp.array(dtype=wp.int32),
     world_positions: wp.array(dtype=wp.vec3f),
     world_orientations: wp.array(dtype=wp.quatf),
     world_scales: wp.array(dtype=wp.vec3f),
@@ -481,6 +510,7 @@ def _gaussian_splats_to_local_kernel(
 ):
     """Convert Gaussian world arrays to a Newton shape's local coordinates."""
     splat = wp.tid()
+    shape_index = shape_indices[splat]
     pose = shape_poses[shape_index]
     rotation = wp.quat_to_matrix(wp.transform_get_rotation(pose))
     shape_scale = shape_scales[shape_index]
@@ -542,6 +572,7 @@ class WarpGaussianSplatsEmbedding:
     basis_terms: wp.array | None
     basis_values: wp.array | None
     exponents: wp.array | None
+    node_offsets: wp.array
 
     @classmethod
     def create(
@@ -554,22 +585,26 @@ class WarpGaussianSplatsEmbedding:
     ) -> WarpGaussianSplatsEmbedding:
         """Prepare geometry and SH fit tables before the first simulation step."""
         device = wp.get_device(device)
-        rest, _, bind_rotation, covariance = _prepare_bind_frame(embedding, bind_points, root_pos, root_rot)
+        # Translation cancels in the deformation gradient; all translated clones share these tables.
+        rest, _, bind_rotation, covariance = _prepare_bind_frame(embedding, bind_points, (0, 0, 0), root_rot)
         orientations, scales = _covariance_axes(covariance)
         count = len(embedding.bind_centers)
         rest_inverse = np.zeros((count, 3, 3), dtype=np.float32)
         if "covariance" in embedding.channels:
-            for splat, (start, end) in enumerate(zip(embedding.offsets[:-1], embedding.offsets[1:], strict=True)):
-                nodes = rest[embedding.indices[start:end]]
+            counts = np.diff(embedding.offsets)
+            for width in np.unique(counts):
+                rows = np.flatnonzero(counts == width)
+                slots = embedding.offsets[rows, None] + np.arange(width)
+                nodes = rest[embedding.indices[slots]]
                 if embedding.element_width == 3:
-                    edges = (nodes[1:] - nodes[:1]).T
-                    normal = np.cross(edges[:, 0], edges[:, 1])
-                    normal /= max(np.linalg.norm(normal), 1.0e-12)
-                    rest_inverse[splat] = np.linalg.pinv(np.column_stack((edges, normal)))
+                    edges = (nodes[:, 1:] - nodes[:, :1]).transpose(0, 2, 1)
+                    normal = np.cross(edges[:, :, 0], edges[:, :, 1])
+                    normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1.0e-12)
+                    rest_inverse[rows] = np.linalg.pinv(np.concatenate((edges, normal[:, :, None]), axis=2))
                 else:
-                    center = np.einsum("n,nj->j", embedding.weights[start:end], nodes)
-                    centered = nodes - center
-                    rest_inverse[splat] = np.linalg.pinv(centered.T @ centered)
+                    center = np.einsum("nk,nkj->nj", embedding.weights[slots], nodes)
+                    centered = nodes - center[:, None]
+                    rest_inverse[rows] = np.linalg.pinv(centered.transpose(0, 2, 1) @ centered)
         basis_count = (embedding.sh_degree + 1) ** 2
         coefficients = static_coefficients = None
         directions = inverse_basis = basis_offsets = basis_terms = basis_values = exponents = None
@@ -581,17 +616,8 @@ class WarpGaussianSplatsEmbedding:
                 static_coefficients = wp.array(baked.reshape(-1, 3), dtype=wp.vec3f, device=device)
             if embedding.sh_degree > 0:
                 sample_count = 2 * basis_count
-                sample_index = np.arange(sample_count, dtype=np.float64) + 0.5
-                z = 1.0 - 2.0 * sample_index / sample_count
-                phi = np.pi * (3.0 - np.sqrt(5.0)) * sample_index
-                radius = np.sqrt(1.0 - z * z)
-                sample_directions = np.column_stack((radius * np.cos(phi), radius * np.sin(phi), z))
-                fit_count = 256
-                fit_index = np.arange(fit_count, dtype=np.float64) + 0.5
-                fit_z = 1.0 - 2.0 * fit_index / fit_count
-                fit_phi = np.pi * (3.0 - np.sqrt(5.0)) * fit_index
-                fit_radius = np.sqrt(1.0 - fit_z * fit_z)
-                fit_directions = np.column_stack((fit_radius * np.cos(fit_phi), fit_radius * np.sin(fit_phi), fit_z))
+                sample_directions = _sphere_directions(sample_count)
+                fit_directions = _sphere_directions(256)
                 powers = np.array(
                     [
                         (i, j, level - i - j)
@@ -642,6 +668,7 @@ class WarpGaussianSplatsEmbedding:
             basis_terms,
             basis_values,
             exponents,
+            wp.zeros(1, dtype=wp.int32, device=device),
         )
 
     def _rotate_sh(self, coefficients: wp.array, rotations: wp.array) -> wp.array:
@@ -676,19 +703,25 @@ class WarpGaussianSplatsEmbedding:
 
     def evaluate(self, current_points: wp.array) -> GaussianSplatsState:
         """Evaluate all dynamic channels on the proxy's Warp device."""
-        count = len(self.embedding.bind_centers)
+        return self.evaluate_batch(current_points, self.node_offsets)
+
+    def evaluate_batch(self, current_points: wp.array, node_offsets: wp.array) -> GaussianSplatsState:
+        """Evaluate translated clones of one prototype in a single launch."""
+        prototype_count = len(self.embedding.bind_centers)
+        count = prototype_count * len(node_offsets)
         positions = wp.empty(count, dtype=wp.vec3f, device=self.device)
         deform_covariance = "covariance" in self.embedding.channels
         deform_sh = "sphericalHarmonics" in self.embedding.channels and self.embedding.sh_degree > 0
-        orientations = wp.empty(count, dtype=wp.quatf, device=self.device) if deform_covariance else self.orientations
-        scales = wp.empty(count, dtype=wp.vec3f, device=self.device) if deform_covariance else self.scales
+        orientations = wp.empty(count, dtype=wp.quatf, device=self.device)
+        scales = wp.empty(count, dtype=wp.vec3f, device=self.device)
         rotations = wp.empty(count if deform_sh else 0, dtype=wp.mat33f, device=self.device)
         if count:
             wp.launch(
                 _evaluate_gaussian_splats_kernel,
-                dim=count,
+                dim=(len(node_offsets), prototype_count),
                 inputs=[
                     current_points,
+                    node_offsets,
                     self.rest,
                     self.offsets,
                     self.indices,
@@ -696,6 +729,8 @@ class WarpGaussianSplatsEmbedding:
                     self.normal_offsets,
                     self.rest_inverse,
                     self.covariance,
+                    self.orientations,
+                    self.scales,
                     self.bind_rotation,
                     self.embedding.element_width,
                     deform_covariance,
@@ -716,6 +751,13 @@ class WarpGaussianSplatsEmbedding:
         self, state: GaussianSplatsState, shape_poses: wp.array, shape_scales: wp.array, shape_index: int
     ) -> GaussianSplatsState:
         """Convert world Gaussian arrays to a Newton shape's local frame on either Warp device."""
+        shape_indices = wp.full(len(state.positions), shape_index, dtype=wp.int32, device=self.device)
+        return self.to_local_batch(state, shape_poses, shape_scales, shape_indices)
+
+    def to_local_batch(
+        self, state: GaussianSplatsState, shape_poses: wp.array, shape_scales: wp.array, shape_indices: wp.array
+    ) -> GaussianSplatsState:
+        """Convert a complete publication batch without launching per clone."""
         count = len(state.positions)
         positions = wp.empty(count, dtype=wp.vec3f, device=self.device)
         orientations = wp.empty(count, dtype=wp.quatf, device=self.device)
@@ -729,7 +771,7 @@ class WarpGaussianSplatsEmbedding:
                 inputs=[
                     shape_poses,
                     shape_scales,
-                    shape_index,
+                    shape_indices,
                     state.positions,
                     state.orientations,
                     state.scales,
