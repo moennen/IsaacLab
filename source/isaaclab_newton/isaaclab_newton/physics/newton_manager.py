@@ -467,7 +467,9 @@ class NewtonManager(PhysicsManager):
         if clone is not None:
             self.backend.particle_ranges = clone.particle_ranges
         self._scene_data_backend.initialize_geometry(
-            [] if clone is None else clone.geometry_batches, {} if clone is None else clone.cable_bindings
+            [] if clone is None else clone.geometry_batches,
+            {} if clone is None else clone.cable_bindings,
+            [] if clone is None else clone.gaussian_splats_entries,
         )
         logger.info("Dispatching PHYSICS_READY callbacks")
         self.dispatch_event(PhysicsEvent.PHYSICS_READY)

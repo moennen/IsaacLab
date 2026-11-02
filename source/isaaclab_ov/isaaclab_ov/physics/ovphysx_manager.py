@@ -202,6 +202,9 @@ class OvPhysxSceneDataBackend(SceneDataBackend):
         self._transforms.data.transforms = None
         self.transforms_timestamp += 1
         self._deformable_bindings = []
+        self._gaussian_splats_entries = []
+        self._gaussian_splats_ranges = {}
+        self._gaussian_splats_point_buffer = None
         self.geometry_timestamp += 1
         self._geometry = TimestampedBuffer()
 
@@ -215,10 +218,19 @@ class OvPhysxSceneDataBackend(SceneDataBackend):
 
     def _setup_deformable_bindings(self, physx, entries: Sequence[DeformableStageEntry], device: str) -> None:
         """Bind exact planned deformables directly into one flat publication buffer."""
+        self._gaussian_splats_entries = [
+            entry
+            for entry in entries
+            if entry.gaussian_splats_embeddings and entry.deformable_type in ("volume", "surface")
+        ]
+        self._gaussian_splats_ranges = {}
+        self._gaussian_splats_point_buffer = None
         from isaaclab_ov import tensor_types as TT
 
         groups = {}
         for entry in entries:
+            if entry.deformable_type not in ("volume", "surface"):
+                continue
             groups.setdefault((entry.deformable_type, entry.vertex_count), []).append(entry)
 
         views, native_entries = [], []
@@ -247,6 +259,7 @@ class OvPhysxSceneDataBackend(SceneDataBackend):
             return
         counts = [entry.vertex_count for entry in native_entries]
         points = wp.empty(sum(counts), dtype=wp.vec3f, device=device)
+        self._gaussian_splats_point_buffer = points
         offset = 0
         for view, tensor_type, count in views:
             buffer = wp.array(
@@ -259,9 +272,28 @@ class OvPhysxSceneDataBackend(SceneDataBackend):
             self._deformable_bindings.append((view, tensor_type, buffer))
             offset += view.count * count
         offsets = np.cumsum(np.r_[0, counts[:-1]])
+        self._gaussian_splats_ranges = {
+            entry.sim_mesh_path: (int(offset), entry.vertex_count)
+            for entry, offset in zip(native_entries, offsets, strict=True)
+            if entry.gaussian_splats_embeddings
+        }
         self._geometry.data = deformable_geometry_batches(native_entries, offsets, device=device)
         for publication, _ in self._geometry.data:
             publication.points = points
+
+    def get_gaussian_splats_entries(self) -> list[DeformableStageEntry]:
+        """Return Gaussian-bearing deformables in clone-plan order."""
+        self._ensure_setup()
+        return self._gaussian_splats_entries
+
+    def get_gaussian_splats_points(self) -> dict[str, wp.array]:
+        """Borrow native nodal positions for Gaussian bindings without publishing sim prims."""
+        self._ensure_setup()
+        if not self._gaussian_splats_ranges:
+            return {}
+        self.get_geometry_batches()
+        nodes = self._gaussian_splats_point_buffer
+        return {path: nodes[start : start + count] for path, (start, count) in self._gaussian_splats_ranges.items()}
 
     def get_geometry_batches(self, output_format: Any = SceneDataFormat.Points) -> list:
         """Publish native positions with exact visual paths and interpolation metadata.

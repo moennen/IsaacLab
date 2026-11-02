@@ -14,6 +14,14 @@ from isaaclab.renderers.segmentation_colors import random_color_from_id_wp
 
 
 @wp.kernel(enable_backward=False)
+def gaussian_orientations_wxyz(source: wp.array(dtype=wp.quatf), destination: wp.array(dtype=wp.quatf)):
+    """Reorder Warp quaternions for OVRTX's USD quaternion array layout."""
+    index = wp.tid()
+    value = source[index]
+    destination[index] = wp.quatf(value[3], value[0], value[1], value[2])
+
+
+@wp.kernel(enable_backward=False)
 def create_marker_transforms_kernel(
     positions: wp.array(dtype=wp.vec3),
     orientations: wp.array(dtype=wp.quat),

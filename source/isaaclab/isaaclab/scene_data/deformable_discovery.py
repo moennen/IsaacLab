@@ -21,6 +21,7 @@ from .. import sim as sim_utils
 from ..cloner import ClonePlan
 from ..cloner import path as cloner_path
 from ..sim.utils.queries import has_deformable_body_api
+from .deformable_gaussian_splats import GaussianSplatsEmbedding, read_gaussian_splats_embedding
 from .deformable_vis_remap import build_volume_vis_barycentric_remap
 from .scene_data_backend import SceneDataFormat
 
@@ -38,15 +39,22 @@ class DeformableStageEntry:
     vertex_count: int
     vis_vertex_count: int
     vertices: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    bind_vertices: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
     indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int32))
     vis_vertices: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
     vis_indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int32))
+    gaussian_splats_embeddings: list[GaussianSplatsEmbedding] = field(default_factory=list)
     init_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
     """Parent-frame world position [m]."""
     init_rot: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     """Parent-frame world orientation as an xyzw quaternion."""
     source_env_origin: tuple[float, float, float] | None = None
     """Authored source environment origin [m]. None assumes the source was placed by the clone plan."""
+
+    @property
+    def bind_points(self) -> np.ndarray:
+        """Return authored bind nodes, falling back to the simulation's initial nodes."""
+        return self.bind_vertices if len(self.bind_vertices) else self.vertices
 
 
 def deformable_geometry_batches(
@@ -68,6 +76,12 @@ def deformable_geometry_batches(
     prototype_remaps = {}
     output_offset = 0
     for entry, offset in zip(entries, offsets, strict=True):
+        if (
+            entry.gaussian_splats_embeddings
+            and entry.vis_mesh_path == entry.sim_mesh_path
+            and entry.deformable_type in ("volume", "particle")
+        ):
+            continue
         key = (id(entry.vertices), id(entry.indices), id(entry.vis_vertices))
         if key not in prototype_remaps:
             if entry.vertices is entry.vis_vertices or np.array_equal(entry.vertices, entry.vis_vertices):
@@ -137,11 +151,18 @@ def deformable_entry(root_prim: Usd.Prim, *, env_template: str | None = None) ->
     """
     stage = root_prim.GetStage()
     root_path = root_prim.GetPath()
-    mesh_prims = sim_utils.get_all_matching_child_prims(
+    geometry_prims = sim_utils.get_all_matching_child_prims(
         prim_path=root_path, predicate=lambda p: p.GetTypeName() in ("TetMesh", "Mesh"), stage=stage
     )
-    tet_prims = [prim for prim in mesh_prims if prim.GetTypeName() == "TetMesh"]
-    mesh_prims = [prim for prim in mesh_prims if prim.GetTypeName() == "Mesh"]
+    tet_prims = [prim for prim in geometry_prims if prim.GetTypeName() == "TetMesh"]
+    mesh_prims = [prim for prim in geometry_prims if prim.GetTypeName() == "Mesh"]
+    particle_prims = sim_utils.get_all_matching_child_prims(
+        prim_path=root_path,
+        predicate=lambda p: (
+            p.GetTypeName() == "Points" and "NewtonPointsDeformableSimAPI" in p.GetPrimTypeInfo().GetAppliedAPISchemas()
+        ),
+        stage=stage,
+    )
     sim_candidates, vis_candidates = [], []
     for prim in mesh_prims:
         schemas = prim.GetPrimTypeInfo().GetAppliedAPISchemas()
@@ -163,6 +184,14 @@ def deformable_entry(root_prim: Usd.Prim, *, env_template: str | None = None) ->
         pts = tet_mesh.GetPointsAttr().Get() or []
         raw_tet_indices = tet_mesh.GetTetVertexIndicesAttr().Get() or []
         indices = np.asarray(raw_tet_indices, dtype=np.int32).reshape(-1)
+    elif particle_prims:
+        if len(particle_prims) != 1:
+            raise ValueError(f"Expected one simulation point cloud under deformable {root_path}.")
+        deformable_type = "particle"
+        sim_mesh_prim = particle_prims[0]
+        vis_candidates = []
+        pts = UsdGeom.Points(sim_mesh_prim).GetPointsAttr().Get() or []
+        indices = np.empty(0, dtype=np.int32)
     elif mesh_prims:
         deformable_type = "surface"
         sim_mesh_prim = sim_candidates[0] if sim_candidates else mesh_prims[0]
@@ -181,8 +210,32 @@ def deformable_entry(root_prim: Usd.Prim, *, env_template: str | None = None) ->
     world_to_parent = parent_transform.GetInverse()
     mesh_to_parent = np.asarray(xform_cache.GetLocalToWorldTransform(sim_mesh_prim) * world_to_parent)
     # USD affine transforms multiply row vectors.
+    # A bind pose can differ from the initial dynamic state. The proposal identifies
+    # it by purpose; older OmniPhysics assets use a different property namespace.
+    bind_points = None
+    for schema in sim_mesh_prim.GetPrimTypeInfo().GetAppliedAPISchemas():
+        if "DeformablePoseAPI:" not in schema:
+            continue
+        instance = schema.rsplit(":", 1)[-1]
+        for prefix in (f"physics:deformablePose:{instance}", f"deformablePose:{instance}:omniphysics"):
+            purposes = sim_mesh_prim.GetAttribute(f"{prefix}:purposes").Get()
+            if purposes is not None and "bindPose" in purposes:
+                bind_points = sim_mesh_prim.GetAttribute(f"{prefix}:points").Get()
+                if bind_points is not None:
+                    break
+        if bind_points is not None:
+            break
+    if bind_points is not None and len(bind_points) != len(pts):
+        raise ValueError(f"Bind pose point count differs from simulation points on {sim_mesh_prim.GetPath()}.")
     vertices = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
     vertices = (vertices @ mesh_to_parent[:3, :3] + mesh_to_parent[3, :3]).astype(np.float32)
+    bind_vertices = (
+        vertices
+        if bind_points is None
+        else (
+            np.asarray(bind_points, dtype=np.float32).reshape(-1, 3) @ mesh_to_parent[:3, :3] + mesh_to_parent[3, :3]
+        ).astype(np.float32)
+    )
     vis_vertices = vertices
     if vis_mesh_prim != sim_mesh_prim:
         vis_pts = UsdGeom.PointBased(vis_mesh_prim).GetPointsAttr().Get()
@@ -193,6 +246,26 @@ def deformable_entry(root_prim: Usd.Prim, *, env_template: str | None = None) ->
     vis_indices = np.empty(0, dtype=np.int32)
     if vis_mesh_prim.GetTypeName() == "Mesh":
         vis_indices = np.asarray(UsdGeom.Mesh(vis_mesh_prim).GetFaceVertexIndicesAttr().Get() or [], dtype=np.int32)
+
+    gaussian_splats_embeddings = []
+    element_width = 4 if deformable_type == "volume" else 3 if deformable_type == "surface" else 0
+    for gaussian_splats_prim in sim_utils.get_all_matching_child_prims(
+        prim_path=root_path,
+        predicate=lambda p: p.GetTypeName() == "ParticleField3DGaussianSplat",
+        stage=stage,
+    ):
+        gaussian_splats_to_parent = np.asarray(
+            xform_cache.GetLocalToWorldTransform(gaussian_splats_prim) * world_to_parent
+        )
+        gaussian_splats_embeddings.append(
+            read_gaussian_splats_embedding(
+                gaussian_splats_prim,
+                bind_vertices,
+                indices,
+                element_width=element_width,
+                gaussian_splats_to_parent=gaussian_splats_to_parent,
+            )
+        )
 
     rotation = parent_transform.ExtractRotationQuat()
     source_env_origin = None
@@ -209,9 +282,11 @@ def deformable_entry(root_prim: Usd.Prim, *, env_template: str | None = None) ->
         vertex_count=len(pts),
         vis_vertex_count=len(vis_vertices),
         vertices=vertices,
+        bind_vertices=bind_vertices,
         indices=indices,
         vis_vertices=vis_vertices,
         vis_indices=vis_indices,
+        gaussian_splats_embeddings=gaussian_splats_embeddings,
         init_pos=tuple(parent_transform.ExtractTranslation()),
         init_rot=(*rotation.GetImaginary(), rotation.GetReal()),
         source_env_origin=source_env_origin,
@@ -320,6 +395,10 @@ def expand_deformable_entries(
                         root_path=cloner_path.rebase(entry.root_path, source, target),
                         sim_mesh_path=cloner_path.rebase(entry.sim_mesh_path, source, target),
                         vis_mesh_path=cloner_path.rebase(entry.vis_mesh_path, source, target),
+                        gaussian_splats_embeddings=[
+                            replace(embedding, path=cloner_path.rebase(embedding.path, source, target))
+                            for embedding in entry.gaussian_splats_embeddings
+                        ],
                         init_pos=tuple(np.asarray(entry.init_pos) + offset),
                     )
                     # An overlapping child declaration wins within the same destination.

@@ -186,7 +186,16 @@ class IsaacRtxRenderer(BaseRenderer):
     def initialize(self) -> None:
         """Bind shared Fabric destinations after scene creation."""
         self._fabric = self._sim.get_or_create_backend(FabricBackendCfg(stage=self._sim.stage, device=self._sim.device))
-        self._fabric.bind_transforms(self._sim.get_scene_data_provider())
+        provider = self._sim.get_scene_data_provider()
+        self._fabric.bind_transforms(provider)
+        provider.prepare_deformable_gaussian_splats(self._sim.device)
+        self._fabric.prepare_gaussian_splats(
+            tuple(
+                embedding.path
+                for entry in provider.backend.get_gaussian_splats_entries()
+                for embedding in entry.gaussian_splats_embeddings
+            )
+        )
 
     @property
     def visual_material_writer(self):
@@ -540,7 +549,9 @@ class IsaacRtxRenderer(BaseRenderer):
 
     def update_geometries(self) -> None:
         """Update shared Fabric geometry from SDP's visual point publication."""
-        self._fabric.update_geometries(self._sim.get_scene_data_provider(), self._sim.render_generation)
+        provider = self._sim.get_scene_data_provider()
+        self._fabric.update_geometries(provider, self._sim.render_generation)
+        self._fabric.update_gaussian_splats(provider)
 
     def update_camera(
         self,

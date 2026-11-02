@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import newton
 import warp as wp
+from newton._src.geometry.bvh import SHAPE_BOUNDS_BLOCK_DIM, compute_shape_local_bounds
 
 from isaaclab.renderers import BaseRenderer, RenderBufferKind, RenderBufferSpec
 from isaaclab.renderers.camera_render_spec import CameraRenderSpec
@@ -54,6 +55,29 @@ def _check_shared_intrinsics(intrinsics: wp.array(dtype=wp.mat33f), different: w
         for column in range(3):
             if wp.abs(intrinsics[i][row, column] - intrinsics[0][row, column]) > 1.0e-4:
                 wp.atomic_or(different, 0, 1)
+
+
+@wp.kernel(enable_backward=False)
+def _write_deformable_gaussian_splats(
+    positions: wp.array(dtype=wp.vec3f),
+    orientations: wp.array(dtype=wp.quatf),
+    scales: wp.array(dtype=wp.vec3f),
+    coefficients: wp.array(dtype=wp.vec3f),
+    basis_count: int,
+    transforms_out: wp.array(dtype=wp.transformf),
+    scales_out: wp.array(dtype=wp.vec3f),
+    coefficients_out: wp.array2d(dtype=wp.float32),
+):
+    """Write local Gaussian arrays directly into Newton's native shape storage."""
+    splat = wp.tid()
+    transforms_out[splat] = wp.transformf(positions[splat], orientations[splat])
+    scales_out[splat] = scales[splat]
+    if basis_count:
+        for basis in range(basis_count):
+            value = coefficients[splat * basis_count + basis]
+            coefficients_out[splat, basis * 3] = value[0]
+            coefficients_out[splat, basis * 3 + 1] = value[1]
+            coefficients_out[splat, basis * 3 + 2] = value[2]
 
 
 @wp.kernel(enable_backward=False)
@@ -452,7 +476,19 @@ class NewtonWarpRenderer(BaseRenderer):
         """Acquire the clone-built native resource and bind its SDP layout."""
         self.backend = self._sim.get_or_create_backend(self.newton_cfg)
         self._scene_data_provider = self._sim.get_scene_data_provider()
+        self._scene_data_provider.prepare_deformable_gaussian_splats(self._sim.device)
         self._transform_mapping = self._scene_data_provider.create_mapping(list(self.backend.model.body_label))
+        self._gaussian_splats_timestamp = -1
+        self._gaussian_splats_embeddings = {
+            embedding.path: embedding
+            for entry in self._scene_data_provider.backend.get_gaussian_splats_entries()
+            for embedding in entry.gaussian_splats_embeddings
+        }
+        self._gaussian_splats_shapes = {
+            label: index
+            for index, label in enumerate(self.backend.model.shape_label)
+            if label in self._gaussian_splats_embeddings
+        }
 
         self.newton_sensor = newton.sensors.SensorTiledCamera(
             self.backend.model,
@@ -590,6 +626,7 @@ class NewtonWarpRenderer(BaseRenderer):
             backend.state_0.body_q = poses.transforms
         if backend.geometry_offsets:
             provider.get_geometry_points(output=backend.state_0.particle_q, offsets=backend.geometry_offsets)
+        self._update_deformable_gaussian_splats()
         # Native triangle-mesh updates read back indices and may allocate after pointer swaps.
         use_graph = self.cfg.use_cuda_graph and backend.device.is_cuda and backend.model.tri_count == 0
         timestamp = provider.backend.transforms_timestamp + provider.backend.geometry_timestamp
@@ -612,6 +649,56 @@ class NewtonWarpRenderer(BaseRenderer):
                 render_data._ppisp_hdr_source,
                 render_data._ppisp_rgba_dest,
             )
+
+    def _update_deformable_gaussian_splats(self) -> None:
+        """Update independent Newton Gaussian data and refit their ray-tracing BVHs."""
+        states = self._scene_data_provider.get_deformable_gaussian_splats()
+        timestamp = self._scene_data_provider.backend.geometry_timestamp
+        if not states or self._gaussian_splats_timestamp == timestamp:
+            return
+        model = self.backend.model
+        for path, state in states.items():
+            shape_index = self._gaussian_splats_shapes[path]
+            source = model.shape_source[shape_index]
+            local = self._scene_data_provider.get_gaussian_splats_device_embedding(path, str(model.device)).to_local(
+                state, model.shape_transform, model.shape_scale, shape_index
+            )
+            data = source._warp_data
+            coefficients = local.sh_coefficients
+            basis_count = (
+                0 if coefficients is None or not len(local.positions) else len(coefficients) // len(local.positions)
+            )
+            wp.launch(
+                _write_deformable_gaussian_splats,
+                dim=source.count,
+                inputs=[
+                    local.positions,
+                    local.orientations,
+                    local.scales,
+                    coefficients if coefficients is not None else wp.array(dtype=wp.vec3f, device=model.device),
+                    basis_count,
+                    data.transforms,
+                    data.scales,
+                    data.sh_coeffs,
+                ],
+                device=model.device,
+            )
+            source.bvh_refit()
+            if model.bvh_shape_bounds is not None:
+                wp.launch_tiled(
+                    compute_shape_local_bounds,
+                    dim=1,
+                    block_dim=SHAPE_BOUNDS_BLOCK_DIM,
+                    inputs=[
+                        model.shape_type[shape_index : shape_index + 1],
+                        model.shape_source_ptr[shape_index : shape_index + 1],
+                        model.gaussians_data,
+                        model.bvh_shape_bounds[shape_index : shape_index + 1],
+                    ],
+                    device=model.device,
+                )
+        model.bvh_refit_shapes(self.backend.state_0)
+        self._gaussian_splats_timestamp = timestamp
 
     def _launch_render(self, render_data: RenderData) -> None:
         """Launch the tiled-camera render kernels for sensor graph capture."""

@@ -206,6 +206,8 @@ class PhysxSceneDataBackend(SceneDataBackend):
         self.backend = None
         self._rigid_body_view: omni.physics.tensors.RigidBodyView | None = None
         self._deformable_bindings: list[tuple[Any, list]] | None = None
+        self._gaussian_splats_entries: list[DeformableStageEntry] = []
+        self._gaussian_splats_sources = []
         self._transforms.data.transforms = None
         self.transforms_timestamp += 1
         self.geometry_timestamp += 1
@@ -223,6 +225,12 @@ class PhysxSceneDataBackend(SceneDataBackend):
 
     def _setup_deformable_geometry(self, entries: Sequence[DeformableStageEntry]) -> None:
         """Bind exact visual mesh paths directly to padded native nodal buffers."""
+        self._gaussian_splats_entries = [
+            entry
+            for entry in entries
+            if entry.gaussian_splats_embeddings and entry.deformable_type in ("volume", "surface")
+        ]
+        self._gaussian_splats_sources = []
         bindings = []
         for deformable_type in ("volume", "surface"):
             declared = [entry for entry in entries if entry.deformable_type == deformable_type]
@@ -243,8 +251,26 @@ class PhysxSceneDataBackend(SceneDataBackend):
             native_offsets = np.arange(view.count) * view.max_simulation_nodes_per_body
             batches = deformable_geometry_batches(ordered, native_offsets, device=str(self._manager._device))
             bindings.append((view, batches))
+            if any(entry.gaussian_splats_embeddings for entry in ordered):
+                self._gaussian_splats_sources.append((view, ordered, native_offsets))
         self._deformable_bindings = bindings
         self._geometry = TimestampedBuffer([batch for _, batches in bindings for batch in batches])
+
+    def get_gaussian_splats_entries(self) -> list[DeformableStageEntry]:
+        """Return Gaussian-bearing deformables in clone-plan order."""
+        return self._gaussian_splats_entries
+
+    def get_gaussian_splats_points(self) -> dict[str, wp.array]:
+        """Borrow native nodal positions for Gaussian bindings without publishing sim prims."""
+        points = {}
+        for view, entries, offsets in self._gaussian_splats_sources:
+            nodes = view.get_simulation_nodal_positions().view(wp.vec3f).flatten()
+            points.update(
+                (entry.sim_mesh_path, nodes[int(offset) : int(offset) + entry.vertex_count])
+                for entry, offset in zip(entries, offsets, strict=True)
+                if entry.gaussian_splats_embeddings
+            )
+        return points
 
     @property
     def native_geometry_formats(self) -> tuple[Any, ...]:

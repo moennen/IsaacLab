@@ -113,6 +113,15 @@ OVRTX receives the same exact visual-path publications through SDP. It neither i
 managers nor requests a Newton model. Meshes, particle clouds, and cable curves use one point-binding
 path.
 
+Gaussian splat visuals use a separate publication because splats may also update orientation,
+scale, and spherical harmonics. :meth:`SceneDataProvider.get_deformable_gaussian_splats` returns
+world-space arrays by exact Gaussian splat prim path. The provider reads the asset-authored
+embedding once and re-evaluates it when the physics geometry timestamp changes. Isaac RTX,
+OVRTX, and Newton Warp write the selected channels into their own Gaussian splat storage.
+Embedding tables are uploaded to the simulation device during renderer initialization. Warp
+evaluates Gaussian splats on either CPU or CUDA from native simulation nodes. On CUDA, evaluation
+and renderer writes remain on the device during subsequent updates.
+
 PhysX publishes native Fabric matrices through SDP without fetching packed poses.
 ``isaaclab_physx.renderers.fabric.FabricBackend`` owns the stage and hierarchy
 handles, keyed by stage and device. After physics initializes, Kit, Isaac RTX, and

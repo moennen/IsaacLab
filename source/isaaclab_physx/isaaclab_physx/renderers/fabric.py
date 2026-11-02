@@ -13,7 +13,7 @@ import warp as wp
 
 import usdrt
 import usdrt.hierarchy
-from pxr import Usd, UsdGeom, UsdUtils
+from pxr import Usd, UsdGeom, UsdUtils, Vt
 
 from isaaclab.scene_data import SceneDataFormat, SceneDataProvider
 from isaaclab.sim import BackendCfg
@@ -55,6 +55,8 @@ class FabricBackend:
         self._mapping = self._scales = None
         self._transforms_timestamp = -1
         self._geometry_bindings = None
+        self._gaussian_splats_timestamp = -1
+        self._gaussian_splats_paths: set[str] = set()
 
     def bind_transforms(self, provider: SceneDataProvider) -> None:
         """Bind the initialized simulation's rigid destinations once; native Fabric needs no conversion binding."""
@@ -152,6 +154,63 @@ class FabricBackend:
             cached.data, cached.timestamp = output, provider.backend.geometry_timestamp
             self._geometry_bindings[index] = (selections, frequency, cached, offsets, frame)
 
+    def update_gaussian_splats(self, provider: SceneDataProvider) -> None:
+        """Write CUDA Gaussian arrays to Fabric, or CPU arrays through USD."""
+        states = provider.get_deformable_gaussian_splats()
+        timestamp = provider.backend.geometry_timestamp
+        if not states or self._gaussian_splats_timestamp == timestamp:
+            return
+        device_states = all(state.positions.device.is_cuda for state in states.values())
+        if device_states != any(state.positions.device.is_cuda for state in states.values()):
+            raise ValueError("Gaussian states for one Fabric update must share a device representation.")
+        self.prepare_gaussian_splats(tuple(states), synchronize=device_states)
+        gpu_updates = []
+        for path, state in states.items():
+            prim = self.usd_stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                raise RuntimeError(f"Deformable Gaussian prim {path!r} is absent from the RTX stage.")
+            if state.positions.device.is_cuda:
+                rt_prim = self.stage.GetPrimAtPath(path)
+                gpu_updates.append((rt_prim, state.positions, state.orientations, state.scales, state.sh_coefficients))
+            else:
+                prim.GetAttribute("positions").Set(Vt.Vec3fArray.FromNumpy(state.positions.numpy()))
+                if state.orientations is not None:
+                    prim.GetAttribute("orientations").Set(Vt.QuatfArray.FromNumpy(state.orientations.numpy()))
+                    prim.GetAttribute("scales").Set(Vt.Vec3fArray.FromNumpy(state.scales.numpy()))
+                if state.sh_coefficients is not None:
+                    prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").Set(
+                        Vt.Vec3fArray.FromNumpy(state.sh_coefficients.numpy())
+                    )
+        if device_states:
+            # USDRT VtArray.Set has no producer-stream parameter; synchronize once for all prims.
+            wp.synchronize_stream(self.device)
+            for rt_prim, positions, orientations, scales, coefficients in gpu_updates:
+                rt_prim.GetAttribute("positions").Set(usdrt.Vt.Vec3fArray(positions))
+                if orientations is not None:
+                    rt_prim.GetAttribute("orientations").Set(usdrt.Vt.QuatfArray(orientations))
+                    rt_prim.GetAttribute("scales").Set(usdrt.Vt.Vec3fArray(scales))
+                if coefficients is not None:
+                    rt_prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").Set(
+                        usdrt.Vt.Vec3fArray(coefficients)
+                    )
+        else:
+            self.stage.SynchronizeToFabric()
+        self._gaussian_splats_timestamp = timestamp
+
+    def prepare_gaussian_splats(self, paths: tuple[str, ...], *, synchronize: bool = True) -> None:
+        """Reset Gaussian transforms and populate Fabric before dynamic device writes."""
+        new_paths = [path for path in paths if path not in self._gaussian_splats_paths]
+        for path in new_paths:
+            prim = self.usd_stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                raise RuntimeError(f"Deformable Gaussian prim {path!r} is absent from the RTX stage.")
+            xformable = UsdGeom.Xformable(prim)
+            xformable.ClearXformOpOrder()
+            xformable.SetResetXformStack(True)
+        if new_paths and synchronize:
+            self.stage.SynchronizeToFabric()
+        self._gaussian_splats_paths.update(new_paths)
+
     def _bind_geometries(self, provider: SceneDataProvider, paths: tuple[str, ...]) -> None:
         """Bind declared destinations by device and cadence; SDP owns all data movement."""
         # Foreign physics publishes world points. Author the sink once so Kit's USD refresh agrees.
@@ -197,6 +256,8 @@ class FabricBackend:
         self.transforms = self._selection = self._write_selection = None
         self._mapping = self._scales = self.hierarchy = self.stage = None
         self._geometry_bindings = None
+        self._gaussian_splats_paths.clear()
+        self._gaussian_splats_timestamp = -1
 
 
 @configclass

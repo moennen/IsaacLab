@@ -16,9 +16,12 @@ orphaned from its parent's ``__dict__`` after restoration.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import warp as wp
+
+if TYPE_CHECKING:
+    from .deformable_discovery import DeformableStageEntry
 
 # Under Sphinx ``autodoc_mock_imports``, ``wp.struct`` is a ``_MockObject``
 # that replaces the decorated class with another mock, hiding its docstring
@@ -132,6 +135,17 @@ class SceneDataBackend:
     This is not elapsed simulation time. Cached outputs record the timestamp they contain;
     reading one output never clears another output's pending update.
     """
+
+    def get_gaussian_splats_entries(self) -> list[DeformableStageEntry]:
+        """Return deformable entries with Gaussian bindings in native body order."""
+        return []
+
+    def get_gaussian_splats_points(self) -> dict[str, wp.array]:
+        """Borrow current simulation nodes by proxy prim path for Gaussian evaluation."""
+        return {}
+
+    def refresh_gaussian_splats_timestamp(self) -> None:
+        """Detect native pointer swaps before a Gaussian cache lookup, when needed."""
 
     @property
     def native_geometry_formats(self) -> tuple[Any, ...]:

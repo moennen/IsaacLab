@@ -10,9 +10,9 @@ from typing import Any
 
 import numpy as np
 import warp as wp
-from newton import JointType, ModelBuilder, ShapeFlags
+from newton import Gaussian, JointType, ModelBuilder, ShapeFlags
 
-from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 from isaaclab.cloner import ClonePlan
 from isaaclab.cloner import path as clone_path
@@ -25,6 +25,34 @@ from isaaclab_newton.sim.spawners.materials import (
     NewtonDeformableBodyMaterialCfg,
     NewtonSurfaceDeformableBodyMaterialCfg,
 )
+
+
+class _IndependentGaussian(Gaussian):
+    """Keep a deformable clone's mutable Gaussian buffers independent in Newton."""
+
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
+
+def isolate_deformable_gaussian_splats(builder: ModelBuilder, entries: Sequence[DeformableStageEntry]) -> None:
+    """Give each deformable visual its own mutable source before model finalization."""
+    paths = {embedding.path for entry in entries for embedding in entry.gaussian_splats_embeddings}
+    for index, label in enumerate(builder.shape_label):
+        if label not in paths:
+            continue
+        source = builder.shape_source[index]
+        if not isinstance(source, Gaussian):
+            raise TypeError(f"Deformable Gaussian {label!r} is not a Newton Gaussian shape.")
+        builder.shape_source[index] = _IndependentGaussian(
+            source.positions,
+            source.rotations,
+            source.scales,
+            source.opacities,
+            source.sh_coeffs,
+            source.sh_degree,
+            source.min_response,
+            source.sorting_mode,
+        )
 
 
 def add_deformable_from_usd(builder: ModelBuilder, stage: Usd.Stage, geometry: DeformableStageEntry) -> None:
@@ -69,14 +97,40 @@ def add_deformable_from_usd(builder: ModelBuilder, stage: Usd.Stage, geometry: D
     )
 
 
+def add_deformable_gaussian_splats(builder: ModelBuilder, stage: Usd.Stage, geometry: DeformableStageEntry) -> None:
+    """Import Gaussian visuals skipped with a deformable root by Newton's USD importer."""
+    xforms = UsdGeom.XformCache()
+    for embedding in geometry.gaussian_splats_embeddings:
+        if embedding.path in builder.shape_label:
+            continue
+        prim = stage.GetPrimAtPath(embedding.path)
+        matrix = xforms.GetLocalToWorldTransform(prim)
+        rotation = matrix.ExtractRotationQuat()
+        scale = Gf.Transform(matrix).GetScale()
+        builder.add_shape_gaussian(
+            -1,
+            gaussian=Gaussian.create_from_usd(prim),
+            xform=wp.transform(matrix.ExtractTranslation(), (*rotation.GetImaginary(), rotation.GetReal())),
+            scale=wp.vec3(*scale),
+            label=embedding.path,
+        )
+
+
 def add_visual_deformables_to_sources(
-    builders: dict[str, ModelBuilder], entries: Sequence[DeformableStageEntry]
+    builders: dict[str, ModelBuilder], stage: Usd.Stage, entries: Sequence[DeformableStageEntry]
 ) -> None:
     """Add each visual deformable to every imported source containing its USD subtree."""
     for entry in entries:
         for path in reversed(Sdf.Path(entry.root_path).GetPrefixes()):
             builder = builders.get(str(path))
             if builder is None:
+                continue
+            add_deformable_gaussian_splats(builder, stage, entry)
+            if (
+                entry.gaussian_splats_embeddings
+                and entry.vis_mesh_path == entry.sim_mesh_path
+                and entry.deformable_type in ("volume", "particle")
+            ):
                 continue
             pose = dict(pos=wp.vec3(*entry.init_pos), rot=wp.quat(*entry.init_rot), scale=1.0, vel=wp.vec3())
             surface = entry.deformable_type == "surface" or entry.vis_mesh_path != entry.sim_mesh_path

@@ -17,7 +17,9 @@ import pytest
 import warp as wp
 
 from isaaclab.scene_data import SceneDataFormat, SceneDataProvider
+from isaaclab.scene_data.deformable_gaussian_splats import GaussianSplatsState
 from isaaclab.sim import SimulationContext
+from isaaclab.test.utils.devices import DeviceScope, test_devices
 
 _REQUIRED_MODULES = ("isaaclab_ov", "ovrtx", "pxr")
 _MISSING_MODULES = [module for module in _REQUIRED_MODULES if importlib.util.find_spec(module) is None]
@@ -70,7 +72,7 @@ def test_geometry_bindings_follow_mixed_sdp_points_and_pointer_swaps(mode):
             ("/Cells/cell_3/Cable/curve", 2),
         )
     }
-    publication = SimpleNamespace(points=points, geometry_timestamp=0)
+    publication = SimpleNamespace(points=points, geometry_timestamp=0, get_gaussian_splats_entries=lambda: [])
     last_points = points
 
     def read_points(_format):
@@ -172,6 +174,89 @@ def test_geometry_bindings_follow_mixed_sdp_points_and_pointer_swaps(mode):
         write.return_value.wait.assert_called()
         assert write.call_args.args[0][0].ptr == snapshots[0][0].ptr
         binding.write.assert_not_called()
+
+
+@pytest.mark.parametrize("device", test_devices())
+def test_deformable_gaussian_splats_attributes_follow_scene_data_timestamp(device):
+    """OVRTX writes each selected Gaussian array once per physics publication."""
+    renderer, native = _make_renderer_without_backend()
+    renderer._use_ovstage = False
+    native.bind_array_attribute.side_effect = lambda *args, **kwargs: MagicMock()
+    renderer._device = device
+    renderer._warp_device = wp.get_device(device)
+    state = GaussianSplatsState(
+        positions=wp.array([[1, 2, 3]], dtype=wp.vec3f, device=device),
+        orientations=wp.array([[0, 0, 0, 1]], dtype=wp.quatf, device=device),
+        scales=wp.array([[1, 2, 3]], dtype=wp.vec3f, device=device),
+        sh_coefficients=wp.array([[0.1, 0.2, 0.3]], dtype=wp.vec3f, device=device),
+    )
+    publication = SimpleNamespace(geometry_timestamp=1)
+    renderer._sdp = SimpleNamespace(
+        get_deformable_gaussian_splats=lambda: {"/SplatsA": state, "/SplatsB": state}, backend=publication
+    )
+    renderer._update_deformable_gaussian_splats()
+    renderer._update_deformable_gaussian_splats()
+    assert [call.args[1] for call in native.bind_array_attribute.call_args_list] == [
+        "positions",
+        "orientations",
+        "scales",
+        "radiance:sphericalHarmonicsCoefficients",
+    ]
+    bindings = list(renderer._gaussian_splats_bindings.values())
+    writes = [binding.write_async.call_args for binding in bindings]
+    assert all(call.args[0] == ["/SplatsA", "/SplatsB"] for call in native.bind_array_attribute.call_args_list)
+    assert native.write_attribute.call_args_list[0].kwargs["prim_paths"] == ["/SplatsA", "/SplatsB"]
+    np.testing.assert_allclose(writes[0].args[0][0].numpy(), [[1, 2, 3]])
+    np.testing.assert_allclose(writes[1].args[0][0].numpy(), [[1, 0, 0, 0]])
+    np.testing.assert_allclose(writes[3].args[0][0].numpy(), [[0.1, 0.2, 0.3]])
+    assert all(call.kwargs["data_access"] is DataAccess.ASYNC for call in writes)
+    publication.geometry_timestamp += 1
+    renderer._update_deformable_gaussian_splats()
+    assert all(binding.write_async.call_count == 2 for binding in bindings)
+    assert all(not binding.write_async.return_value.wait.called for binding in bindings)
+    publication.geometry_timestamp += 1
+    renderer._update_deformable_gaussian_splats()
+    assert all(binding.write_async.call_count == 3 for binding in bindings)
+    assert all(binding.write_async.return_value.wait.called for binding in bindings)
+    renderer.close()
+
+
+@pytest.mark.parametrize("device", test_devices(DeviceScope.CUDA))
+def test_ovstage_gaussian_splats_writes_use_cuda_buffers(device):
+    """ovstage receives GPU splat buffers through DLTensor attributes."""
+    renderer, _ = _make_renderer_without_backend()
+    renderer._use_ovstage = True
+    renderer._device = device
+    renderer._warp_device = wp.get_device(device)
+    renderer.scene.ordinal = 7
+    renderer.scene.paths = SimpleNamespace(
+        create_path_list_from_strings=lambda paths: paths, destroy_path_list=lambda paths: None
+    )
+    renderer.scene.stage = MagicMock()
+    renderer.scene.stage.query_from_path_list.side_effect = contextlib.nullcontext
+    state = GaussianSplatsState(
+        wp.array([[1, 2, 3]], dtype=wp.vec3f, device=device),
+        wp.array([[0, 0, 0, 1]], dtype=wp.quatf, device=device),
+        wp.array([[1, 2, 3]], dtype=wp.vec3f, device=device),
+        wp.array([[0.1, 0.2, 0.3]], dtype=wp.vec3f, device=device),
+    )
+    renderer._sdp = SimpleNamespace(
+        get_deformable_gaussian_splats=lambda: {"/Splats": state}, backend=SimpleNamespace(geometry_timestamp=1)
+    )
+
+    renderer._update_deformable_gaussian_splats()
+
+    writes = renderer.scene.stage.write_attribute.call_args_list[2:]
+    assert [call.args[1] for call in writes] == [
+        "positions",
+        "orientations",
+        "scales",
+        "radiance:sphericalHarmonicsCoefficients",
+    ]
+    assert [call.kwargs["tensors"][0].data for call in writes] == [
+        array.ptr for array in renderer._gaussian_splats_arrays
+    ]
+    assert all(call.kwargs["cuda_stream"] == renderer._warp_device.stream.cuda_stream for call in writes)
 
 
 @pytest.mark.parametrize("mode, scaled", [("sync", False), ("async", True), ("ovstage", True)])

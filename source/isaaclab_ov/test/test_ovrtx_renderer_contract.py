@@ -469,7 +469,10 @@ def test_ovrtx_multiple_cameras_render_independent_views(monkeypatch, use_ovstag
 
     renderer = SimulationContext.instance().get_or_create_backend(OVRTXRendererCfg(async_rendering=asynchronous))
     publication = types.SimpleNamespace(
-        transform_paths=[], geometry_timestamp=0, get_geometry_batches=lambda _format: batches
+        transform_paths=[],
+        geometry_timestamp=0,
+        get_geometry_batches=lambda _format: batches,
+        get_gaussian_splats_entries=lambda: [],
     )
     renderer._sdp = SceneDataProvider(publication)
     plan = make_clone_plan(

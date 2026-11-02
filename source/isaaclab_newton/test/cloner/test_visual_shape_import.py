@@ -5,12 +5,29 @@
 
 """The Newton cloner imports visual-only geometry only when it is drawn."""
 
+from types import SimpleNamespace
+
 import newton
 import pytest
 from isaaclab_newton.cloner.newton_clone_utils import build_source_builders
+from isaaclab_newton.cloner.replicate import _particle_gaussian_splats_entries
 from newton import ShapeFlags
 
-from pxr import Usd, UsdGeom, UsdPhysics
+from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+
+
+def test_mpm_without_gaussian_splats_skips_deformable_discovery():
+    """An MPM asset with other point clouds does not need a Gaussian binding."""
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World/Asset")
+    for name in ("SimulationPoints", "OtherPoints"):
+        prim = UsdGeom.Points.Define(stage, f"/World/Asset/{name}").GetPrim()
+        api_schemas = Sdf.TokenListOp()
+        api_schemas.explicitItems = ["NewtonPointsDeformableSimAPI"]
+        prim.SetMetadata("apiSchemas", api_schemas)
+    imported = {"/World/Asset": {"path_particle_map": {"/World/Asset/SimulationPoints": (0, 4)}}}
+
+    assert _particle_gaussian_splats_entries(stage, imported, SimpleNamespace(env_template="/World/envs/env_{}")) == []
 
 
 @pytest.mark.parametrize("load_visual_shapes", [True, False])

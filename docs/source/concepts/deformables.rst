@@ -272,6 +272,56 @@ Like every other asset, a :class:`~isaaclab.assets.DeformableObject` integrates 
     The unsuffixed writers (``write_nodal_state_to_sim`` and friends) are deprecated in favor of the
     ``_to_sim_index`` and ``_to_sim_mask`` variants. The mask variants are CUDA-graph capturable.
 
+Gaussian splat visuals
+----------------------
+
+A ``ParticleField3DGaussianSplat`` beneath a volume or surface deformable body can follow its
+simulation mesh. Newton MPM assets can also place the Gaussian splat visual beneath the asset root,
+alongside ``SimulationPoints``. The splat's authored default ``positions`` are its bind
+centers. Simulation mesh bind points come from a ``PhysicsDeformablePoseAPI`` instance whose
+``purposes`` includes ``bindPose``; otherwise the mesh's authored default ``points`` are used.
+Existing ``OmniPhysicsDeformablePoseAPI`` bind poses remain readable. These rules follow the
+`draft USD deformables proposal <https://github.com/aousd/OpenUSD-proposals/blob/5d89c0ed46a26de92f4d3fefef3bfad6500c07ce/proposals/physics_deformables/wp_deformable_physics.md#geometry-embeddings>`_
+where its point-based schemas apply.
+
+The bind pose determines the Gaussian splat embedding only. The authored default simulation points
+remain the initial geometry for existing visual meshes and render-only imports. A bind pose
+must have the same point count as the simulation mesh.
+
+For repeatable visual motion across backends, author the following custom properties on the
+Gaussian splat prim. They extend the draft proposal, which does not prescribe mapping indices or
+weights for graphics geometry:
+
+.. list-table:: Gaussian splat embedding properties
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Property
+     - Meaning
+   * - ``isaaclab:embeddingOffsets`` (``int[]``)
+     - One more entry than splats; consecutive entries delimit each splat's embedding range.
+   * - ``isaaclab:embeddingIndices`` (``int[]``)
+     - Simulation point indices in the proxy's authored point order.
+   * - ``isaaclab:embeddingWeights`` (``float[]``)
+     - One finite weight per index; weights for each splat sum to one.
+   * - ``isaaclab:deformableChannels`` (``token[]``)
+     - ``["centers"]``, ``["centers", "covariance"]``, or
+       ``["centers", "covariance", "sphericalHarmonics"]``.
+
+Each range can list a weighted neighborhood of simulation points. Covariance updates require
+nondegenerate neighborhoods: three noncollinear nodes for a triangle proxy, or four noncoplanar
+nodes for a tet or MPM proxy. Without authored embedding arrays, Isaac Lab derives the embedding
+from the bind positions: barycentric interpolation for meshes, or the nearest
+point for MPM. For surface meshes, a splat's signed distance from its bind triangle is retained
+along the triangle's moving normal. Without ``isaaclab:deformableChannels``, only centers move. Covariance motion
+updates splat orientations and scales from local deformation. The third channel set also rotates
+directional spherical harmonics; degree-zero radiance stays fixed. Cable proxies are not yet
+supported for Gaussian splat visuals.
+
+Newton's Warp ray tracer currently shades Gaussian splats from their degree-zero coefficient.
+It receives the updated higher-order coefficients but does not yet display their directional
+effect. Isaac RTX and OVRTX consume the updated Gaussian attributes directly.
+
 Cables
 ------
 

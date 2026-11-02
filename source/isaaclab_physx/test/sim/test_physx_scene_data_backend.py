@@ -168,6 +168,27 @@ def test_geometry_publication_distinguishes_undeclared_and_empty_scenes(monkeypa
             _ = backend.native_geometry_formats
 
 
+def test_particle_gaussian_splats_does_not_publish_missing_physx_nodes():
+    """An MPM-only entry cannot be evaluated from PhysX deformable body views."""
+    from isaaclab_physx.physics import PhysxCfg, physx_manager
+
+    from isaaclab.scene_data.deformable_discovery import DeformableStageEntry
+
+    backend = physx_manager.PhysxSceneDataBackend(physx_manager.PhysxManager(PhysxCfg()))
+    entry = DeformableStageEntry(
+        "/Particles",
+        "/Particles/SimulationPoints",
+        "/Particles/SimulationPoints",
+        "particle",
+        4,
+        4,
+        gaussian_splats_embeddings=[SimpleNamespace(path="/Particles/Splats")],
+    )
+    backend._setup_deformable_geometry((entry,))
+    assert backend.get_gaussian_splats_entries() == []
+    assert backend.get_gaussian_splats_points() == {}
+
+
 @pytest.mark.parametrize("capacity", [3, 8])
 def test_deformable_geometry_uses_declared_counts_and_native_order(monkeypatch, capacity):
     """Declared unpadded counts survive native reordering and mesh paths."""

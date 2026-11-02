@@ -7,19 +7,32 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
+import warp as wp
+from scipy.spatial.transform import Rotation
 
 from pxr import Gf, Sdf, Usd, UsdGeom
 
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.cloner import make_clone_plan
+from isaaclab.scene_data import SceneDataFormat, SceneDataProvider
 from isaaclab.scene_data.deformable_discovery import (
+    DeformableStageEntry,
     deformable_entry,
+    deformable_geometry_batches,
     deformable_prototypes,
     expand_deformable_entries,
 )
+from isaaclab.scene_data.deformable_gaussian_splats import (
+    WarpGaussianSplatsEmbedding,
+    _sh_basis,
+    read_gaussian_splats_embedding,
+)
 from isaaclab.sim import SpawnerCfg
+from isaaclab.test.utils.devices import test_devices
 
 
 def _add_api_schemas(prim: Usd.Prim, schemas: list[str]) -> None:
@@ -58,6 +71,241 @@ def test_deformable_entry_volume_tet_mesh():
     matrix = tet.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
     expected = np.array([list(matrix.Transform(Gf.Vec3d(p))) for p in points], dtype=np.float32)
     np.testing.assert_allclose(entry.vertices, expected, atol=1e-6)
+    gaussian = stage.DefinePrim("/World/envs/env_0/SoftBody/splats", "ParticleField3DGaussianSplat")
+    gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.25, 0.25, 0.25)])
+    gaussian.CreateAttribute("isaaclab:embeddingOffsets", Sdf.ValueTypeNames.IntArray).Set([0, 4])
+    gaussian.CreateAttribute("isaaclab:embeddingIndices", Sdf.ValueTypeNames.IntArray).Set([0, 1, 2, 3])
+    gaussian.CreateAttribute("isaaclab:embeddingWeights", Sdf.ValueTypeNames.FloatArray).Set([0.25] * 4)
+    _add_api_schemas(tet.GetPrim(), ["OmniPhysicsVolumeDeformableSimAPI", "PhysicsDeformablePoseAPI:bind"])
+    tet.GetPrim().CreateAttribute("physics:deformablePose:bind:purposes", Sdf.ValueTypeNames.TokenArray).Set(
+        ["bindPose"]
+    )
+    tet.GetPrim().CreateAttribute("physics:deformablePose:bind:points", Sdf.ValueTypeNames.Point3fArray).Set(
+        [(p[0] * 0.5, p[1], p[2]) for p in points]
+    )
+    bound = deformable_entry(root)
+    assert [embedding.path for embedding in bound.gaussian_splats_embeddings] == [str(gaussian.GetPath())]
+    np.testing.assert_allclose(bound.vertices[1], expected[1], atol=1e-6)
+    np.testing.assert_allclose(bound.bind_vertices[1], list(matrix.Transform(Gf.Vec3d(0.5, 0, 0))), atol=1e-6)
+    tet.GetPrim().GetAttribute("physics:deformablePose:bind:points").Set([(0, 0, 0)])
+    with pytest.raises(ValueError, match="Bind pose point count"):
+        deformable_entry(root)
+
+
+@pytest.mark.parametrize("device", test_devices())
+def test_gaussian_splats_embedding_reads_authored_weights_and_falls_back_to_bind_pose(device):
+    """Asset weights select the intended element; an unbound splat embeds in the bind tet."""
+    stage = Usd.Stage.CreateInMemory()
+    gaussian = stage.DefinePrim("/Visual", "ParticleField3DGaussianSplat")
+    gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.25, 0.25, 0.25)])
+    points = np.array(
+        [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (5, 0, 0), (6, 0, 0), (5, 1, 0), (5, 0, 1)],
+        dtype=np.float32,
+    )
+    elements = np.array([0, 1, 2, 3, 4, 5, 6, 7], dtype=np.int32)
+
+    derived = read_gaussian_splats_embedding(gaussian, points, elements, element_width=4)
+    np.testing.assert_array_equal(derived.indices, elements[:4])
+    np.testing.assert_allclose(derived.weights, [0.25] * 4)
+    assert derived.channels == ("centers",)
+
+    gaussian.CreateAttribute("isaaclab:embeddingOffsets", Sdf.ValueTypeNames.IntArray).Set([0, 4])
+    gaussian.CreateAttribute("isaaclab:embeddingIndices", Sdf.ValueTypeNames.IntArray).Set([0, 1, 2, 3])
+    gaussian.CreateAttribute("isaaclab:embeddingWeights", Sdf.ValueTypeNames.FloatArray).Set([0.7, 0.1, 0.1, 0.1])
+    gaussian.CreateAttribute("isaaclab:deformableChannels", Sdf.ValueTypeNames.TokenArray).Set(
+        ["centers", "covariance"]
+    )
+    authored = read_gaussian_splats_embedding(gaussian, points, elements, element_width=4)
+    np.testing.assert_allclose(authored.weights, [0.7, 0.1, 0.1, 0.1])
+    assert authored.channels == ("centers", "covariance")
+    current = points.copy()
+    current[:, 0] *= 2.0
+    warp_embedding = WarpGaussianSplatsEmbedding.create(authored, points, (0, 0, 0), (0, 0, 0, 1), device)
+    state = warp_embedding.evaluate(wp.array(current, dtype=wp.vec3f, device=device))
+    np.testing.assert_allclose(state.positions.numpy()[0], [0.2, 0.1, 0.1])
+    np.testing.assert_allclose(np.sort(state.scales.numpy()[0]), [1, 1, 2], atol=1e-5)
+    device_rotation = Rotation.from_quat(state.orientations.numpy()[0]).as_matrix()
+    device_covariance = device_rotation @ np.diag(state.scales.numpy()[0] ** 2) @ device_rotation.T
+    np.testing.assert_allclose(device_covariance, np.diag([4, 1, 1]), atol=1e-5)
+    gaussian.GetAttribute("isaaclab:embeddingOffsets").Set([0, 3])
+    gaussian.GetAttribute("isaaclab:embeddingIndices").Set([0, 1, 2])
+    gaussian.GetAttribute("isaaclab:embeddingWeights").Set([1 / 3] * 3)
+    with pytest.raises(ValueError, match="degenerate proxy nodes"):
+        read_gaussian_splats_embedding(gaussian, points, elements, element_width=4)
+
+
+def test_particle_covariance_embedding_requires_a_full_rank_neighborhood():
+    """A nearest-particle fallback cannot define a Gaussian's local deformation."""
+    stage = Usd.Stage.CreateInMemory()
+    gaussian = stage.DefinePrim("/Visual", "ParticleField3DGaussianSplat")
+    gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.1, 0.1, 0.1)])
+    gaussian.CreateAttribute("isaaclab:deformableChannels", Sdf.ValueTypeNames.TokenArray).Set(
+        ["centers", "covariance"]
+    )
+    points = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="degenerate proxy nodes"):
+        read_gaussian_splats_embedding(gaussian, points, np.empty(0, dtype=np.int32), element_width=0)
+    gaussian.CreateAttribute("isaaclab:embeddingOffsets", Sdf.ValueTypeNames.IntArray).Set([0, 4])
+    gaussian.CreateAttribute("isaaclab:embeddingIndices", Sdf.ValueTypeNames.IntArray).Set([0, 1, 2, 3])
+    gaussian.CreateAttribute("isaaclab:embeddingWeights", Sdf.ValueTypeNames.FloatArray).Set([0.4, 0.2, 0.2, 0.2])
+    embedding = read_gaussian_splats_embedding(gaussian, points, np.empty(0, dtype=np.int32), element_width=0)
+    np.testing.assert_allclose(embedding.weights, [0.4, 0.2, 0.2, 0.2])
+
+
+@pytest.mark.parametrize("device", test_devices())
+def test_surface_gaussian_splats_embedding_preserves_normal_distance(device):
+    """A splat above cloth follows the rotated triangle without collapsing onto its plane."""
+    stage = Usd.Stage.CreateInMemory()
+    gaussian = stage.DefinePrim("/Visual", "ParticleField3DGaussianSplat")
+    gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.2, 0.2, 0.3)])
+    rest = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0)], dtype=np.float32)
+    embedding = read_gaussian_splats_embedding(gaussian, rest, np.array([0, 1, 2]), element_width=3)
+    rotated = rest @ Rotation.from_euler("x", 90, degrees=True).as_matrix().T
+
+    warp_embedding = WarpGaussianSplatsEmbedding.create(embedding, rest, (0, 0, 0), (0, 0, 0, 1), device)
+    state = warp_embedding.evaluate(wp.array(rotated.astype(np.float32), dtype=wp.vec3f, device=device))
+    np.testing.assert_allclose(state.positions.numpy()[0], [0.2, -0.3, 0.2], atol=1e-5)
+
+
+def test_centers_only_gaussian_splats_keeps_static_covariance_under_a_parent_transform():
+    """Static covariance and appearance survive parent and shape transforms."""
+    stage = Usd.Stage.CreateInMemory()
+    gaussian = stage.DefinePrim("/Visual", "ParticleField3DGaussianSplat")
+    gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.25, 0.25, 0.25)])
+    gaussian.CreateAttribute("scales", Sdf.ValueTypeNames.Float3Array).Set([(2, 1, 1)])
+    gaussian.CreateAttribute("radiance:sphericalHarmonicsDegree", Sdf.ValueTypeNames.Int).Set(1)
+    coefficients = np.zeros((4, 3), dtype=np.float32)
+    coefficients[3, 0] = 1.0
+    gaussian.CreateAttribute("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Float3Array).Set(
+        [Gf.Vec3f(*map(float, row)) for row in coefficients]
+    )
+    rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float32)
+    transform = np.eye(4, dtype=np.float32)
+    transform[:3, :3] = rotation.T
+    points = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], dtype=np.float32) @ rotation.T
+    embedding = read_gaussian_splats_embedding(
+        gaussian, points, np.arange(4), element_width=4, gaussian_splats_to_parent=transform
+    )
+
+    warp_embedding = WarpGaussianSplatsEmbedding.create(embedding, points, (0, 0, 0), (0, 0, 0, 1), "cpu")
+    state = warp_embedding.evaluate(wp.array(points, dtype=wp.vec3f, device="cpu"))
+    frame = Rotation.from_quat(state.orientations.numpy()[0]).as_matrix()
+    covariance = frame @ np.diag(state.scales.numpy()[0] ** 2) @ frame.T
+    np.testing.assert_allclose(covariance, np.diag([1, 4, 1]), atol=1e-5)
+    shape_pose = wp.array([[0, 0, 0, 0, 0, np.sqrt(0.5), np.sqrt(0.5)]], dtype=wp.transformf, device="cpu")
+    local = warp_embedding.to_local(state, shape_pose, wp.array([[1, 1, 1]], dtype=wp.vec3f, device="cpu"), 0)
+    world_direction = np.array([[1.0, 0.0, 0.0]])
+    local_direction = world_direction @ rotation
+    world_color = _sh_basis(world_direction, 1) @ state.sh_coefficients.numpy()
+    local_color = _sh_basis(local_direction, 1) @ local.sh_coefficients.numpy()
+    np.testing.assert_allclose(local_color, world_color, atol=2e-4)
+
+
+@pytest.mark.parametrize("device", test_devices())
+def test_deformable_gaussian_splats_publication_updates_after_native_nodes_change(device, monkeypatch):
+    """The provider evaluates native nodes on their device when physics advances."""
+    stage = Usd.Stage.CreateInMemory()
+    gaussian = stage.DefinePrim("/Visual", "ParticleField3DGaussianSplat")
+    gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.25, 0.25, 0.25)])
+    points = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], dtype=np.float32)
+    embedding = read_gaussian_splats_embedding(gaussian, points, np.array([0, 1, 2, 3]), element_width=4)
+    entry = DeformableStageEntry(
+        "/Body",
+        "/Sim",
+        "/VisualMesh",
+        "volume",
+        4,
+        4,
+        vertices=points,
+        vis_vertices=points,
+        gaussian_splats_embeddings=[embedding],
+    )
+    batches = deformable_geometry_batches([entry], [0], device=device)
+    assert "/Sim" not in {path for _, paths in batches for path in paths}
+    gaussian_splats_only = DeformableStageEntry(
+        "/Body",
+        "/Sim",
+        "/Sim",
+        "volume",
+        4,
+        4,
+        vertices=points,
+        vis_vertices=points,
+        gaussian_splats_embeddings=[embedding],
+    )
+    assert deformable_geometry_batches([gaussian_splats_only], [0], device=device) == []
+    publication = SceneDataFormat.Points()
+    publication.points = wp.array(points, dtype=wp.vec3f, device=device)
+    reads = []
+
+    def get_gaussian_splats_points():
+        reads.append(1)
+        return {"/Sim": publication.points}
+
+    backend = SimpleNamespace(
+        geometry_timestamp=0,
+        get_gaussian_splats_entries=lambda: [entry],
+        get_gaussian_splats_points=get_gaussian_splats_points,
+        refresh_gaussian_splats_timestamp=lambda: None,
+    )
+    provider = SceneDataProvider(backend)
+    provider.prepare_deformable_gaussian_splats(device)
+    with monkeypatch.context() as patch:
+        patch.setattr(wp.array, "numpy", lambda self: pytest.fail("Gaussian evaluation read back a native array"))
+        positions = provider.get_deformable_gaussian_splats()["/Visual"].positions
+    assert str(positions.device) == device
+    np.testing.assert_allclose(positions.numpy()[0], [0.25] * 3)
+    provider.get_deformable_gaussian_splats()
+    assert len(reads) == 1
+    moved = points + [1, 0, 0]
+    publication.points = wp.array(moved, dtype=wp.vec3f, device=device)
+    backend.geometry_timestamp += 1
+    with monkeypatch.context() as patch:
+        patch.setattr(wp.array, "numpy", lambda self: pytest.fail("Gaussian evaluation read back a native array"))
+        positions = provider.get_deformable_gaussian_splats()["/Visual"].positions
+    np.testing.assert_allclose(positions.numpy()[0], [1.25, 0.25, 0.25])
+    assert len(reads) == 2
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("device", test_devices())
+def test_directional_gaussian_splats_embedding_rotates_view_dependence(degree, device):
+    """A rotated tet turns a directional lobe without changing its constant coefficient."""
+    stage = Usd.Stage.CreateInMemory()
+    gaussian = stage.DefinePrim("/Visual", "ParticleField3DGaussianSplat")
+    gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.25, 0.25, 0.25), (0.1, 0.2, 0.3)])
+    gaussian.CreateAttribute("isaaclab:deformableChannels", Sdf.ValueTypeNames.TokenArray).Set(
+        ["centers", "covariance", "sphericalHarmonics"]
+    )
+    coefficients = np.zeros((2, (degree + 1) ** 2, 3), dtype=np.float32)
+    coefficients[:, 0, 0] = 0.25
+    coefficients[0, 3, 0] = 1.0
+    coefficients[1, 1, 1] = 0.8
+    gaussian.CreateAttribute("radiance:sphericalHarmonicsDegree", Sdf.ValueTypeNames.Int).Set(degree)
+    gaussian.CreateAttribute("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Float3Array).Set(
+        [Gf.Vec3f(*map(float, row)) for row in coefficients.reshape(-1, 3)]
+    )
+    points = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], dtype=np.float32)
+    embedding = read_gaussian_splats_embedding(gaussian, points, np.array([0, 1, 2, 3]), element_width=4)
+    rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float32)
+    stretch = np.diag([2.0, 1.0, 0.5]).astype(np.float32)
+    warp_embedding = WarpGaussianSplatsEmbedding.create(embedding, points, (0, 0, 0), (0, 0, 0, 1), device)
+    state = warp_embedding.evaluate(wp.array(points @ stretch @ rotation.T, dtype=wp.vec3f, device=device))
+    np.testing.assert_allclose(
+        state.positions.numpy(), np.array([[0.25, 0.25, 0.25], [0.1, 0.2, 0.3]]) @ stretch @ rotation.T, atol=1e-5
+    )
+    updated = state.sh_coefficients.numpy().reshape(coefficients.shape)
+    np.testing.assert_allclose(updated[:, 0], coefficients[:, 0], atol=1e-5)
+    for index, direction in enumerate(([1.0, 0.0, 0.0], [0.0, 1.0, 0.0])):
+        direction = np.asarray(direction)
+        original = _sh_basis(direction[None], degree) @ coefficients[index]
+        rotated = _sh_basis((rotation @ direction)[None], degree) @ updated[index]
+        np.testing.assert_allclose(rotated, original, atol=1e-5)
+    gaussian.GetAttribute("isaaclab:deformableChannels").Set(["centers"])
+    gaussian.GetAttribute("radiance:sphericalHarmonicsCoefficients").Set([Gf.Vec3f(0.0, 0.0, 0.0)])
+    with pytest.raises(ValueError, match="coefficients have the wrong size"):
+        read_gaussian_splats_embedding(gaussian, points, np.array([0, 1, 2, 3]), element_width=4)
 
 
 def test_deformable_entry_surface_mesh():
@@ -89,6 +337,27 @@ def test_deformable_entry_surface_mesh():
     assert entry.deformable_type == "surface"
     assert entry.vertex_count == 4
     assert entry.vis_vertex_count == 5
+
+
+def test_deformable_entry_particle_proxy_reads_gaussian_splats_neighborhood():
+    """MPM simulation points can drive a Gaussian visual beneath their asset root."""
+    stage = Usd.Stage.CreateInMemory()
+    root = UsdGeom.Xform.Define(stage, "/World/SoftParticles").GetPrim()
+    points = UsdGeom.Points.Define(stage, "/World/SoftParticles/SimulationPoints")
+    _add_api_schemas(points.GetPrim(), ["NewtonPointsDeformableSimAPI", "PhysicsDeformableBodyAPI"])
+    points.CreatePointsAttr([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
+    UsdGeom.Mesh.Define(stage, "/World/SoftParticles/VisualMesh").CreatePointsAttr([(0, 0, 0)])
+    gaussian = stage.DefinePrim("/World/SoftParticles/Splats", "ParticleField3DGaussianSplat")
+    gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.2, 0.2, 0.2)])
+    gaussian.CreateAttribute("isaaclab:embeddingOffsets", Sdf.ValueTypeNames.IntArray).Set([0, 4])
+    gaussian.CreateAttribute("isaaclab:embeddingIndices", Sdf.ValueTypeNames.IntArray).Set([0, 1, 2, 3])
+    gaussian.CreateAttribute("isaaclab:embeddingWeights", Sdf.ValueTypeNames.FloatArray).Set([0.4, 0.2, 0.2, 0.2])
+
+    entry = deformable_entry(root)
+    assert entry.deformable_type == "particle"
+    assert entry.sim_mesh_path == str(points.GetPath())
+    assert entry.vis_mesh_path == entry.sim_mesh_path
+    np.testing.assert_allclose(entry.gaussian_splats_embeddings[0].weights, [0.4, 0.2, 0.2, 0.2])
 
 
 def test_deformable_entry_skips_missing_mesh(caplog):

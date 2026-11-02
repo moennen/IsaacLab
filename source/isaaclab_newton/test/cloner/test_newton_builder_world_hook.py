@@ -171,6 +171,48 @@ def _author_deformable(stage, path, kind):
     UsdShade.MaterialBindingAPI.Apply(root).Bind(material, materialPurpose="physics")
 
 
+@pytest.mark.parametrize("kind", ["volume", "surface"])
+def test_deformable_gaussian_splats_shape_survives_ignored_usd_subtree(kind):
+    """A Newton deformable imports its Gaussian child as an independent render shape."""
+    sim_cfg = SimulationCfg(device="cpu", physics=NewtonCfg(solver_cfg=VBDSolverCfg(), load_visual_shapes=True))
+    with build_simulation_context(sim_cfg=sim_cfg) as sim:
+        stage = sim.stage
+        UsdGeom.SetStageUpAxis(stage, "Z")
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        root = "/World/env_0/Soft"
+        _author_deformable(stage, root, kind)
+        gaussian_splats_path = root + "/Splats"
+        gaussian = stage.DefinePrim(gaussian_splats_path, "ParticleField3DGaussianSplat")
+        gaussian.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.2, 0.2, 0.1)])
+        plan = make_clone_plan(
+            (AssetBaseCfg(prim_path="/World/env_[^/]+/Soft", spawn=SpawnerCfg(spawn_path=root)),),
+            ((0,),),
+            1,
+            positions=np.zeros((1, 3), dtype=np.float32),
+            env_template="/World/env_{}",
+        )
+        sim.set_clone_plan(plan)
+        replicate_module._replicate_newton(
+            stage,
+            np.arange(1),
+            sim,
+            plan=plan,
+            asset_prototype_ids=(0,),
+            positions=np.zeros((1, 3), dtype=np.float32),
+        )
+        sim.reset()
+
+        model = sim.backend_manager.backend.model
+        assert gaussian_splats_path in model.shape_label
+        assert isinstance(model.shape_source[model.shape_label.index(gaussian_splats_path)], newton.Gaussian)
+        assert any(
+            binding.path == gaussian_splats_path
+            for entry in sim.get_scene_data_provider().backend.get_gaussian_splats_entries()
+            for binding in entry.gaussian_splats_embeddings
+        )
+
+
 @pytest.mark.parametrize("heterogeneous", [False, True], ids=["batched", "heterogeneous"])
 def test_imported_deformables_follow_plan_and_publish_geometry(heterogeneous):
     """Import each prototype once and bind native/embedded visuals without inspecting generated clones."""
@@ -246,3 +288,41 @@ def test_imported_deformables_follow_plan_and_publish_geometry(heterogeneous):
             vertices = np.asarray(builder.particle_q)[tet]
             np.testing.assert_allclose((vertices[1:] - vertices[0]).T @ pose, np.eye(3), atol=1e-6)
         np.testing.assert_allclose(builder.particle_radius, 0.008)
+
+
+@pytest.mark.parametrize("kind", ["volume", "surface"])
+def test_render_only_deformable_splats_have_independent_sources_and_matching_proxies(kind):
+    """Foreign physics imports only published proxies and gives each splat clone its own storage."""
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.SetStageUpAxis(stage, "Z")
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    root = "/World/env_0/Soft"
+    _author_deformable(stage, root, kind)
+    if kind == "volume":
+        stage.RemovePrim(root + "/vis")
+    prim = stage.DefinePrim(root + "/Splats", "ParticleField3DGaussianSplat")
+    prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray).Set([(0.2, 0.2, 0.1)])
+    plan = make_clone_plan(
+        (AssetBaseCfg(prim_path="/World/env_[^/]+/Soft", spawn=SpawnerCfg(spawn_path=root)),),
+        ((0,),),
+        2,
+        positions=np.zeros((2, 3), dtype=np.float32),
+        env_template="/World/env_{}",
+    )
+    builder = newton.ModelBuilder()
+    sim = SimpleNamespace(
+        cfg=SimpleNamespace(physics=SimpleNamespace()),
+        device="cpu",
+        get_or_create_backend=lambda cfg: builder,
+    )
+    replicate_module._replicate_newton(stage, np.arange(2), sim, plan=plan, asset_prototype_ids=(0,))
+    assert len(builder.volume_label) == 0
+    assert len(builder.surface_label) == (2 if kind == "surface" else 0)
+    model = builder.finalize(device="cpu")
+    sources = [model.shape_source[model.shape_label.index(f"/World/env_{i}/Soft/Splats")] for i in range(2)]
+    first, second = (source._warp_data.transforms for source in sources)
+    assert first.ptr != second.ptr
+    moved = first.numpy()
+    moved[0, 0] = 10
+    first.assign(moved)
+    np.testing.assert_allclose(second.numpy()[0, :3], [0.2, 0.2, 0.1])

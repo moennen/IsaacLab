@@ -17,12 +17,15 @@ from newton import Axis, ModelBuilder
 
 from pxr import Sdf, Usd, UsdGeom
 
+from isaaclab import sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.cloner import ClonePlan, PrototypeWorldTopology, ReplicateContext
 from isaaclab.cloner import path as cloner_path
 from isaaclab.cloner.cloner_cfg import DEFAULT_ENV_TEMPLATE
 from isaaclab.scene_data import SceneDataFormat
 from isaaclab.scene_data.deformable_discovery import (
+    DeformableStageEntry,
+    deformable_entry,
     deformable_geometry_batches,
     deformable_prototypes,
     expand_deformable_entries,
@@ -32,8 +35,10 @@ from isaaclab.sim import SimulationContext, SpawnerCfg
 
 from isaaclab_newton.cloner.newton_clone_utils import (
     add_deformable_from_usd,
+    add_deformable_gaussian_splats,
     add_visual_deformables_to_sources,
     build_source_builders,
+    isolate_deformable_gaussian_splats,
     replicate_builder_mapping,
 )
 from isaaclab_newton.physics import NewtonBuilderCfg, NewtonCfg, NewtonCloneRecord
@@ -96,6 +101,46 @@ def newton_builder_world_hook(
     finally:
         if hook in hooks:
             hooks.remove(hook)
+
+
+def _particle_gaussian_splats_entries(
+    stage: Usd.Stage, imported: dict[str, dict], plan: ClonePlan
+) -> list[DeformableStageEntry]:
+    """Discover Gaussian visuals under MPM roots recorded by Newton's USD importer."""
+    entries = []
+    for result in imported.values():
+        for path in result["path_particle_map"]:
+            if not path.endswith(_SIMULATION_POINTS_SUFFIX):
+                continue
+            root = stage.GetPrimAtPath(path.removesuffix(_SIMULATION_POINTS_SUFFIX))
+            if not root or not sim_utils.get_all_matching_child_prims(
+                prim_path=root.GetPath(),
+                predicate=lambda prim: prim.GetTypeName() == "ParticleField3DGaussianSplat",
+                stage=stage,
+            ):
+                continue
+            entry = deformable_entry(root, env_template=plan.env_template)
+            if entry is not None and entry.gaussian_splats_embeddings:
+                entries.append(entry)
+    return entries
+
+
+def _import_deformable_entries(
+    source_builders: dict[str, ModelBuilder],
+    stage: Usd.Stage,
+    entries: Sequence[DeformableStageEntry],
+    load_visual_shapes: bool,
+) -> None:
+    """Import each deformable and its Gaussian visuals into every owning source."""
+    for entry in entries:
+        ancestors = reversed(Sdf.Path(entry.root_path).GetPrefixes())
+        owners = [source_builders[str(path)] for path in ancestors if str(path) in source_builders]
+        if not owners:
+            raise RuntimeError(f"No imported source owns deformable {entry.root_path!r}.")
+        for source in owners:
+            add_deformable_from_usd(source, stage, entry)
+            if load_visual_shapes:
+                add_deformable_gaussian_splats(source, stage, entry)
 
 
 def _replicate_newton(
@@ -188,6 +233,7 @@ def _replicate_newton(
     options = dict(ignore_paths=ignore_paths, load_visual_shapes=load_visual_shapes)
     options.update(skip_mesh_approximation=not simulation, import_results_out=import_results)
     source_builders = build_source_builders(stage, source_paths, builder_factory, schema_resolvers, **options)
+    particle_entries = _particle_gaussian_splats_entries(stage, import_results, plan) if simulation else []
     # Imports contain authored USD poses, which need not include the planned world placement.
     source_inverse = {}
     xforms = UsdGeom.XformCache()
@@ -213,16 +259,10 @@ def _replicate_newton(
                 continue
             cables[path] = [shapes[f"{path}_edge_capsule_{segment}"] for segment in range(len(bodies))]
     if simulation:
-        for entry in entries:
-            ancestors = reversed(Sdf.Path(entry.root_path).GetPrefixes())
-            owners = [source_builders[str(path)] for path in ancestors if str(path) in source_builders]
-            if not owners:
-                raise RuntimeError(f"No imported source owns deformable {entry.root_path!r}.")
-            for source in owners:
-                add_deformable_from_usd(source, stage, entry)
+        _import_deformable_entries(source_builders, stage, entries, load_visual_shapes)
         global_sites, source_sites, root_sites = sim.backend_manager.inject_sites(builder, source_builders)
     else:
-        add_visual_deformables_to_sources(source_builders, entries)
+        add_visual_deformables_to_sources(source_builders, stage, entries)
         # Clear imported filters before merging into a fresh, compact final filter store.
         for imported in source_builders.values():
             imported.shape_collision_filter_pairs = []
@@ -258,12 +298,18 @@ def _replicate_newton(
     )
     site_index_map = {label: (idx, None) for label, idx in global_sites.items()}
     site_index_map.update((label, (None, per_world)) for label, per_world in local_site_map.items())
+    geometry = expand_deformable_entries(entries, plan, env_ids, positions, imported_sources=source_builders)
+    particle_geometry = expand_deformable_entries(
+        particle_entries, plan, env_ids, positions, imported_sources=source_builders
+    )
+    isolate_deformable_gaussian_splats(builder, (*geometry, *particle_geometry))
     if simulation:
-        geometry = expand_deformable_entries(entries, plan, env_ids, positions, imported_sources=source_builders)
         ranges = dict(zip(builder.surface_label, builder._surface_particle_start, strict=True))
         ranges.update(zip(builder.volume_label, builder._volume_particle_start, strict=True))
         offsets = [ranges[entry.root_path] for entry in geometry]
         batches = deformable_geometry_batches(geometry, offsets, device=sim.device)
+        particle_offsets = [particle_ranges[entry.sim_mesh_path][0] for entry in particle_geometry]
+        batches.extend(deformable_geometry_batches(particle_geometry, particle_offsets, device=sim.device))
         if visual_ranges:
             batches.append((SceneDataFormat.Points(), visual_ranges))
         record = NewtonCloneRecord(
@@ -272,6 +318,11 @@ def _replicate_newton(
             particle_ranges=particle_ranges,
             cable_bindings=cable_bindings,
             geometry_batches=batches,
+            gaussian_splats_entries=[
+                entry
+                for entry in (*geometry, *particle_geometry)
+                if load_visual_shapes and entry.gaussian_splats_embeddings
+            ],
         )
         sim.backend_manager.record_clone(record, site_index_map)
     return builder, stage_info, site_index_map

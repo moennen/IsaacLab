@@ -35,6 +35,7 @@ from .newton_manager_cfg import NewtonCfg
 if TYPE_CHECKING:
     from isaaclab.actuators.newton import NewtonActuatorAdapter
     from isaaclab.renderers.base_renderer import VisualMaterialBatch
+    from isaaclab.scene_data.deformable_discovery import DeformableStageEntry
 
     from .newton_backend_cfg import NewtonBackendCfg
 
@@ -98,6 +99,8 @@ class NewtonCloneRecord:
     """Body indices per replicated cable prim path."""
     geometry_batches: list
     """Shape batches the scene data backend publishes as geometry."""
+    gaussian_splats_entries: list[DeformableStageEntry]
+    """Deformables with Gaussian bindings in clone-plan order."""
 
 
 class NewtonBackend:

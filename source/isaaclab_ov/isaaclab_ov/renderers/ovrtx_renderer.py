@@ -90,6 +90,7 @@ from isaaclab_ov.renderers.ovrtx_renderer_kernels import (
     create_camera_transforms_kernel,
     create_marker_transforms_kernel,
     extract_all_tiles_kernel,
+    gaussian_orientations_wxyz,
     generate_random_colors_from_ids_kernel,
     normalize_mesh_normals,
 )
@@ -396,6 +397,11 @@ class OVRTXRenderer(BaseRenderer):
         self._geometry_offsets: dict[str, int] = {}
         self._geometry_writes = _AsyncWriteBuffers[wp.array]()
         self._geometry_timestamp = -1
+        self._gaussian_splats_timestamp = -1
+        self._gaussian_splats_arrays: list[wp.array] = []
+        self._gaussian_splats_bindings: dict[tuple[str, tuple[str, ...]], AttributeBinding] = {}
+        self._gaussian_splats_writes: deque[list[tuple[Operation[bool], list[wp.array]]]] = deque()
+        self._gaussian_splats_paths: set[str] = set()
         self._initialized_scene = False
         self._output_id_color_buffers: dict[str, wp.array] = {}
         self._visual_material_writer_ref: weakref.ReferenceType[OVRTXVisualMaterialWriter] | None = None
@@ -491,6 +497,7 @@ class OVRTXRenderer(BaseRenderer):
                     query, _GPU_CAMERA_TRANSFORMS_ATTRIBUTE, ordinal=self.scene.ordinal,
                     tensors=cpu_cameras, is_array=False,
                 ).wait()  # fmt: skip
+        self._sdp.prepare_deformable_gaussian_splats(self._device)
         if self._use_ovstage:
             self.scene.commit()
             if not self.backend.attached:
@@ -499,6 +506,13 @@ class OVRTXRenderer(BaseRenderer):
                 self.scene.resources.callback(self.backend.detach)
             self.scene.resources.callback(self._sim.render_context.reset_stage_prepare_flag)
             self.scene.resources.callback(self.close)
+        self._reset_gaussian_splats_paths(
+            [
+                embedding.path
+                for entry in self._sdp.backend.get_gaussian_splats_entries()
+                for embedding in entry.gaussian_splats_embeddings
+            ]
+        )
         self._initialized_scene = True
         self._needs_transform_initialization = not self._use_ovstage and self.backend.cfg.read_gpu_transforms
 
@@ -1088,6 +1102,7 @@ class OVRTXRenderer(BaseRenderer):
                 marker.translations, marker.orientations, marker.scales, marker.marker_indices,
                 visible=marker.is_visible(),
             )  # fmt: skip
+        self._update_deformable_gaussian_splats()
         binding = self._geometry_points_binding
         if binding is None:
             return
@@ -1119,6 +1134,121 @@ class OVRTXRenderer(BaseRenderer):
         else:
             binding.write(points, data_access=DataAccess.ASYNC, cuda_stream=stream.cuda_stream or 1)
         self._geometry_timestamp = timestamp
+
+    def _reset_gaussian_splats_paths(self, paths: list[str]) -> None:
+        """Initialize world-space Gaussian transforms when the renderer stage is prepared."""
+        new_paths = [path for path in paths if path not in self._gaussian_splats_paths]
+        if new_paths:
+            identity = np.tile(np.eye(4, dtype=np.float64), (len(new_paths), 1, 1))
+            reset = np.ones(len(new_paths), dtype=np.bool_)
+            if self._use_ovstage:
+                with self.scene.query(new_paths) as query:
+                    self.scene.stage.write_attribute(
+                        query,
+                        "omni:resetXformStack",
+                        ordinal=self.scene.ordinal,
+                        tensors=reset,
+                        is_array=False,
+                    ).wait()
+                    self.scene.stage.write_attribute(
+                        query,
+                        "omni:xform",
+                        ordinal=self.scene.ordinal,
+                        tensors=xform_tensor_from_numpy(identity),
+                        is_array=False,
+                        semantic=ovstage.AttributeSemantic.MATRIX,
+                    ).wait()
+            else:
+                self.backend.renderer.write_attribute(
+                    prim_paths=new_paths,
+                    attribute_name="omni:resetXformStack",
+                    tensor=reset,
+                    prim_mode=PrimMode.MUST_EXIST,
+                )
+                self.backend.renderer.write_attribute(
+                    prim_paths=new_paths,
+                    attribute_name="omni:xform",
+                    tensor=identity,
+                    semantic=Semantic.XFORM_MAT4x4,
+                    prim_mode=PrimMode.MUST_EXIST,
+                )
+            self._gaussian_splats_paths.update(new_paths)
+
+    def _update_deformable_gaussian_splats(self) -> None:
+        """Write world-space Gaussian arrays from the shared deformable publication."""
+        states = self._sdp.get_deformable_gaussian_splats()
+        timestamp = self._sdp.backend.geometry_timestamp
+        if self._gaussian_splats_timestamp == timestamp or not states:
+            return
+        if not self._use_ovstage and len(self._gaussian_splats_writes) == 2:
+            for operation, _ in self._gaussian_splats_writes[0]:
+                operation.wait()
+            self._gaussian_splats_writes.popleft()
+        arrays = []
+        stream = (self._warp_device.stream.cuda_stream or 1) if self._warp_device.is_cuda else 1
+        self._reset_gaussian_splats_paths(list(states))
+        grouped = {}
+        for path, state in states.items():
+            attributes = {"positions": state.positions, "orientations": state.orientations, "scales": state.scales}
+            if state.sh_coefficients is not None:
+                attributes["radiance:sphericalHarmonicsCoefficients"] = state.sh_coefficients
+            for name, values in attributes.items():
+                array = values
+                if array.device != self._warp_device:
+                    array = wp.empty(len(values), dtype=values.dtype, device=self._warp_device)
+                    wp.copy(array, values)
+                if name == "orientations":
+                    reordered = wp.empty(len(array), dtype=wp.quatf, device=self._warp_device)
+                    wp.launch(
+                        gaussian_orientations_wxyz, dim=len(array), inputs=[array, reordered], device=self._warp_device
+                    )
+                    array = reordered
+                arrays.append(array)
+                paths, values = grouped.setdefault(name, ([], []))
+                paths.append(path)
+                values.append(array)
+        writes = []
+        if not self._use_ovstage:
+            self._gaussian_splats_writes.append(writes)
+        for name, (paths, values) in grouped.items():
+            if self._use_ovstage:
+                lanes = 4 if name == "orientations" else 3
+                tensors = [
+                    ovstage.make_dltensor(
+                        array,
+                        dtype=ovstage.DLDataType(code=ovstage.DLDataTypeCode.kDLFloat, bits=32, lanes=lanes),
+                    )
+                    for array in values
+                ]
+                with self.scene.query(paths) as query:
+                    self.scene.stage.write_attribute(
+                        query,
+                        name,
+                        ordinal=self.scene.ordinal,
+                        tensors=tensors,
+                        is_array=True,
+                        semantic=ovstage.AttributeSemantic.POINT
+                        if name == "positions"
+                        else ovstage.AttributeSemantic.NONE,
+                        cuda_stream=stream,
+                    ).wait()
+            else:
+                key = (name, tuple(paths))
+                binding = self._gaussian_splats_bindings.get(key)
+                if binding is None:
+                    binding = self.backend.renderer.bind_array_attribute(
+                        paths,
+                        name,
+                        dtype=np.float32,
+                        shape=(4,) if name == "orientations" else (3,),
+                        prim_mode=PrimMode.MUST_EXIST,
+                    )
+                    self._gaussian_splats_bindings[key] = binding
+                    self._bindings.callback(binding.unbind)
+                operation = binding.write_async(values, data_access=DataAccess.ASYNC, cuda_stream=stream)
+                writes.append((operation, values))
+        self._gaussian_splats_arrays = arrays
+        self._gaussian_splats_timestamp = timestamp
 
     def update_camera(
         self,
@@ -1283,6 +1413,7 @@ class OVRTXRenderer(BaseRenderer):
         try:
             with contextlib.ExitStack() as resources:
                 resources.callback(self._bindings.close)
+                resources.callback(self._close_gaussian_splats_writes)
                 resources.callback(self._transform_writes.close)
                 resources.callback(self._geometry_writes.close)
                 resources.callback(self.geometry_resources.close)
@@ -1297,6 +1428,10 @@ class OVRTXRenderer(BaseRenderer):
             self._geometry_offsets.clear()
             self._geometry_paths = []
             self._geometry_timestamp = -1
+            self._gaussian_splats_timestamp = -1
+            self._gaussian_splats_arrays.clear()
+            self._gaussian_splats_bindings.clear()
+            self._gaussian_splats_paths.clear()
             self._transforms_timestamp = -1
             self._output_id_color_buffers.clear()
             self._initialized_scene = False
@@ -1304,6 +1439,14 @@ class OVRTXRenderer(BaseRenderer):
             self.meshes.clear()
             self.markers.clear()
             self.geometry_callbacks.clear()
+
+    def _close_gaussian_splats_writes(self) -> None:
+        """Complete native Gaussian writes before releasing their input arrays or bindings."""
+        with contextlib.ExitStack() as writes:
+            writes.callback(self._gaussian_splats_writes.clear)
+            for frame in self._gaussian_splats_writes:
+                for operation, _ in frame:
+                    writes.callback(operation.wait)
 
 
 class OVRTXMesh:

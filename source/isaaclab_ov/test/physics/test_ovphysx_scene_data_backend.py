@@ -516,6 +516,10 @@ def test_scene_data_binding_is_deferred_until_requested(manager, monkeypatch, mo
     backend = OvPhysxSceneDataBackend(manager)
     backend._defer_setup(native, "cpu", ())
     assert calls == []
+    from isaaclab.scene_data import SceneDataProvider
+
+    SceneDataProvider(backend).prepare_deformable_gaussian_splats("cpu")
+    assert backend.get_gaussian_splats_points() == {}
     assert backend.transform_count == 2
     assert backend.transform_paths == expected_paths
     assert len(calls) == 2
@@ -606,6 +610,28 @@ def test_geometry_publication_distinguishes_undeclared_and_empty_scenes(manager,
         backend.get_geometry_batches()
     with pytest.raises(RuntimeError, match="ClonePlan"):
         _ = backend.native_geometry_formats
+
+
+def test_particle_gaussian_splats_does_not_publish_missing_ovphysx_nodes(manager):
+    """An MPM-only entry cannot be evaluated from OVPhysX deformable body views."""
+    from isaaclab_ov.physics.ovphysx_manager import OvPhysxSceneDataBackend
+
+    from isaaclab.scene_data.deformable_discovery import DeformableStageEntry
+
+    backend = OvPhysxSceneDataBackend(manager)
+    native = SimpleNamespace(physx=None, rigid_body_view=SimpleNamespace(count=0))
+    entry = DeformableStageEntry(
+        "/Particles",
+        "/Particles/SimulationPoints",
+        "/Particles/SimulationPoints",
+        "particle",
+        4,
+        4,
+        gaussian_splats_embeddings=[SimpleNamespace(path="/Particles/Splats")],
+    )
+    backend.setup(native, "cpu", (entry,))
+    assert backend.get_gaussian_splats_entries() == []
+    assert backend.get_gaussian_splats_points() == {}
 
 
 @pytest.mark.parametrize("node_padding", [0, 1])

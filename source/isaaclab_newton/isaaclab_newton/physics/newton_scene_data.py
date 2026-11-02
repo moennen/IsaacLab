@@ -16,6 +16,8 @@ from newton import Model, State
 from isaaclab.scene_data import SceneDataBackend, SceneDataFormat
 
 if TYPE_CHECKING:
+    from isaaclab.scene_data.deformable_discovery import DeformableStageEntry
+
     from .newton_manager import NewtonManager
 
 
@@ -37,15 +39,23 @@ class NewtonSceneDataBackend(SceneDataBackend):
         self.transforms_timestamp = 0
         self.geometry_timestamp = 0
         self._geometry_batches = []
+        self._gaussian_splats_entries = []
 
-    def initialize_geometry(self, geometry_batches: list, cable_bindings: dict[str, list[int]]) -> None:
+    def initialize_geometry(
+        self,
+        geometry_batches: list,
+        cable_bindings: dict[str, list[int]],
+        gaussian_splats_entries: list[DeformableStageEntry],
+    ) -> None:
         """Bind imported geometry paths to native particle ranges and capsule endpoints.
 
         Args:
             geometry_batches: Deformable and particle geometry recorded by replication.
             cable_bindings: Native capsule shape indices of each open cable.
+            gaussian_splats_entries: Deformable entries with Gaussian visuals.
         """
         self._geometry_batches = list(geometry_batches)
+        self._gaussian_splats_entries = list(gaussian_splats_entries)
         endpoints, ranges = [], {}
         offset = 0
         for path, shapes in cable_bindings.items():
@@ -67,6 +77,30 @@ class NewtonSceneDataBackend(SceneDataBackend):
             source.shape_scale = model.shape_scale
             source.endpoints = wp.array(np.concatenate(endpoints), dtype=wp.vec4i, device=model.device)
             self._geometry_batches.append((source, ranges))
+
+    def get_gaussian_splats_entries(self) -> list[DeformableStageEntry]:
+        """Return Gaussian-bearing deformables in clone-plan order."""
+        return self._gaussian_splats_entries
+
+    def get_gaussian_splats_points(self) -> dict[str, wp.array]:
+        """Borrow the current native particle ranges for Gaussian bindings."""
+        if not self._gaussian_splats_entries:
+            return {}
+        backend = self._manager.backend
+        nodes = backend.state_0.particle_q
+        result = {}
+        for entry in self._gaussian_splats_entries:
+            if entry.deformable_type == "particle":
+                start, count = backend.particle_ranges[entry.sim_mesh_path]
+            else:
+                start, count, _ = backend.deformable_ranges[entry.root_path]
+            result[entry.sim_mesh_path] = nodes[start : start + count]
+        return result
+
+    def refresh_gaussian_splats_timestamp(self) -> None:
+        """Discover a Newton state-buffer swap before Gaussian cache lookup."""
+        if self._gaussian_splats_entries:
+            self.get_geometry_batches()
 
     @property
     def native_geometry_formats(self) -> tuple[type, ...]:

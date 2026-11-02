@@ -17,6 +17,7 @@ from .. import sim as sim_utils
 from ..cloner.cloner_cfg import DEFAULT_ENV_TEMPLATE
 from ..sensors import camera, contact_sensor
 from ..utils.buffers import TimestampedBuffer
+from .deformable_gaussian_splats import GaussianSplatsState, WarpGaussianSplatsEmbedding
 from .geometry_points import convert_geometry_fabric_kernel, convert_geometry_points_kernel
 from .scene_data_backend import SceneDataBackend, SceneDataFormat
 
@@ -67,6 +68,52 @@ class SceneDataProvider:
         """Borrowed cameras by prim expression, including cameras spawned without an InteractiveScene."""
         self._cache: dict[Any, TimestampedBuffer] = {}
         self._transform_mappings: dict[tuple, wp.array | None] = {}
+        self._gaussian_splats_device_embeddings: dict[tuple[str, str], WarpGaussianSplatsEmbedding] = {}
+
+    def prepare_deformable_gaussian_splats(self, device: str) -> None:
+        """Upload asset embeddings once to the simulation device."""
+        device = str(device)
+        for entry in self.backend.get_gaussian_splats_entries():
+            for embedding in entry.gaussian_splats_embeddings:
+                key = (embedding.path, device)
+                if key not in self._gaussian_splats_device_embeddings:
+                    self._gaussian_splats_device_embeddings[key] = WarpGaussianSplatsEmbedding.create(
+                        embedding, entry.bind_points, entry.init_pos, entry.init_rot, device
+                    )
+
+    def get_deformable_gaussian_splats(self) -> dict[str, GaussianSplatsState]:
+        """Evaluate asset-authored Gaussian splat embeddings against the current simulation nodes.
+
+        Results are world-space snapshots keyed by exact Gaussian prim path. A physics
+        timestamp change invalidates the cached snapshots, including same-step state writes.
+        """
+        entries = self.backend.get_gaussian_splats_entries()
+        if not entries:
+            return {}
+        self.backend.refresh_gaussian_splats_timestamp()
+        timestamp = self.backend.geometry_timestamp
+        cached = self._cache.get("deformable_gaussian_splats")
+        if cached is not None and cached.timestamp == timestamp:
+            return cached.data
+        points = self.backend.get_gaussian_splats_points()
+        states = {}
+        for entry in entries:
+            native = points[entry.sim_mesh_path]
+            for embedding in entry.gaussian_splats_embeddings:
+                if embedding.path in states:
+                    raise ValueError(f"Gaussian splat prim {embedding.path!r} has multiple deformable embeddings.")
+                key = (embedding.path, str(native.device))
+                device_embedding = self._gaussian_splats_device_embeddings.get(key)
+                if device_embedding is None:
+                    self.prepare_deformable_gaussian_splats(str(native.device))
+                    device_embedding = self._gaussian_splats_device_embeddings[key]
+                states[embedding.path] = device_embedding.evaluate(native)
+        self._cache["deformable_gaussian_splats"] = TimestampedBuffer(states, timestamp)
+        return states
+
+    def get_gaussian_splats_device_embedding(self, path: str, device: str) -> WarpGaussianSplatsEmbedding:
+        """Return a prepared device embedding after Gaussian splat publication has initialized it."""
+        return self._gaussian_splats_device_embeddings[(path, device)]
 
     def get_transforms(
         self,

@@ -21,6 +21,7 @@ from packaging import version
 from isaaclab.renderers import RenderBufferKind, RenderBufferSpec
 from isaaclab.scene_data import SceneDataFormat
 from isaaclab.sim import SimulationContext
+from isaaclab.test.utils.devices import test_devices
 from isaaclab.utils.renderers import ISAAC_RTX_SHOW_ALL_PARTITIONS_BY_DEFAULT_SETTING
 
 
@@ -84,6 +85,57 @@ def test_native_fabric_geometry_needs_no_separate_publication(monkeypatch):
     )
     FabricBackend.__new__(FabricBackend).update_geometries(provider, 0)
     provider.get_geometry_points.assert_not_called()
+
+
+@pytest.mark.parametrize("device", test_devices())
+def test_fabric_writes_deformable_gaussian_splats_arrays_to_stage(monkeypatch, device):
+    """RTX's stage receives positions, covariance, and directional appearance."""
+    _install_omni_stubs(monkeypatch)
+    from isaaclab_physx.renderers.fabric import FabricBackend
+
+    from pxr import Sdf, Usd
+
+    from isaaclab.scene_data.deformable_gaussian_splats import GaussianSplatsState
+
+    stage = Usd.Stage.CreateInMemory()
+    prim = stage.DefinePrim("/Splats", "ParticleField3DGaussianSplat")
+    for name, value_type in (
+        ("positions", Sdf.ValueTypeNames.Point3fArray),
+        ("orientations", Sdf.ValueTypeNames.QuatfArray),
+        ("scales", Sdf.ValueTypeNames.Float3Array),
+        ("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Float3Array),
+    ):
+        prim.CreateAttribute(name, value_type)
+    fabric = FabricBackend.__new__(FabricBackend)
+    fabric.usd_stage = stage
+    fabric.stage = SimpleNamespace(SynchronizeToFabric=MagicMock(), GetPrimAtPath=MagicMock())
+    fabric.device = device
+    fabric._gaussian_splats_paths = set()
+    fabric._gaussian_splats_timestamp = -1
+    state = GaussianSplatsState(
+        positions=wp.array([[1, 2, 3]], dtype=wp.vec3f, device=device),
+        orientations=wp.array([[0, 0, 0, 1]], dtype=wp.quatf, device=device),
+        scales=wp.array([[1, 2, 3]], dtype=wp.vec3f, device=device),
+        sh_coefficients=wp.array([[0.1, 0.2, 0.3]], dtype=wp.vec3f, device=device),
+    )
+    provider = SimpleNamespace(
+        get_deformable_gaussian_splats=lambda: {"/Splats": state},
+        backend=SimpleNamespace(geometry_timestamp=1),
+    )
+    fabric.update_gaussian_splats(provider)
+    if device.startswith("cuda"):
+        from isaaclab_physx.renderers import fabric as fabric_module
+
+        source = fabric_module.usdrt.Vt.Vec3fArray.call_args_list[0].args[0]
+        assert str(source.device) == device
+        assert fabric.stage.GetPrimAtPath.call_count == 1
+        assert fabric.stage.SynchronizeToFabric.call_count == 1
+        return
+    assert tuple(prim.GetAttribute("positions").Get()[0]) == (1, 2, 3)
+    assert tuple(prim.GetAttribute("scales").Get()[0]) == (1, 2, 3)
+    assert prim.GetAttribute("orientations").Get()[0].GetReal() == 1
+    np.testing.assert_allclose(prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").Get()[0], [0.1, 0.2, 0.3])
+    assert fabric.stage.SynchronizeToFabric.call_count == 1
 
 
 def test_create_render_data_uses_unique_sdf_safe_render_product_name(monkeypatch):
