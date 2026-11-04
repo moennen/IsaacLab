@@ -80,7 +80,8 @@ throughout: an arm command that leads the arm's lag keeps it from waiting, and t
 | `--num_berries {1,2,3}` | 1 (scripted_demo: 3) | Raspberries in the punnet |
 | `--layout_seed N`, `--fixed_layout` | 0 | Random punnet layout (reset replays it), or the scripted demo's fixed one |
 | `--tissue_resolution {full,half}` | `full` | Half the tissue particles, for speed; the Gaussians are unchanged (MPM only) |
-| `--tissue_solver {explicit,implicit,vbd}` | `explicit` | Tissue solver (see below) |
+| `--tissue_solver {explicit,implicit,vbd,simplicits}` | `explicit` | Tissue solver (see below) |
+| `--berry_asset PATH` | published raspberry USDZ | Override the berry asset, including a package prepared for Simplicits |
 | `--arm_speed X` | 2 (scripted demo: medium 6, short 12) | Arm speed multiplier; the gripper keeps its gentle closing pace |
 | `--demo_length {full,medium,short}` | `full` | Scripted demo: handle the three berries, or only the first two, faster |
 | `--camera {punnet_and_bowl,berry_closeup,room,scripted_camera}` | `punnet_and_bowl` | Fixed views, a close-up following the handled berry, or a shot-by-shot film (scripted demo) |
@@ -92,6 +93,59 @@ throughout: an arm command that leads the arm's lag keeps it from waiting, and t
 
 Frame rates while grasping, at 1280 × 720 on an RTX 6000 Ada: about 17 frames/s with one berry, 9 with three
 (`--num_berries 3`). Rendering the berries' Gaussians dominates, so `--tissue_resolution half` hardly changes them.
+
+### Optional Kaolin Simplicits
+
+`--tissue_solver simplicits` selects Kaolin's reduced deformation solver with captured MLS surface contact.
+Kaolin is an optional development dependency, loaded only when this solver is selected. For now use a built
+checkout on `vismay/fracture_mls_captured` (validated base revision `0446c631e632073bd8fd199abe32761fab6e823d`).
+The `simplicits` extra installs its public runtime dependencies; private source URLs are excluded from published
+metadata and the workspace lockfile. USD is provided by Isaac Lab's `usd-exchange` installation.
+
+```bash
+uv sync --extra simplicits --extra ovrtx
+export PYTHONPATH=/mnt/oss/kaolin-lambert${PYTHONPATH:+:$PYTHONPATH}
+```
+
+The checkout must have Kaolin's native extension built for the workspace's Torch/CUDA versions. To install a
+checkout explicitly instead of using `PYTHONPATH`, use
+`uv pip install --no-deps --no-build-isolation -e /mnt/oss/kaolin-lambert` after installing its build prerequisites
+(`pybind11`, `setuptools`, `packaging`, `ninja`). Keep subsequent commands on `uv run --no-sync`.
+
+Prepare a new package from the original raspberry asset once, then select it explicitly:
+
+```bash
+uv run --no-sync python source/isaaclab_tasks/isaaclab_tasks/contrib/franka_pick_berries/scripts/prepare_simplicits_asset.py \
+  --output output/simplicits/raspberry_simplicits.usdz
+uv run --no-sync python source/isaaclab_tasks/isaaclab_tasks/contrib/franka_pick_berries/scripts/pick_berries.py \
+  --tissue_solver simplicits --berry_asset output/simplicits/raspberry_simplicits.usdz --mode teleop_keyboard
+```
+
+The generated USDZ preserves the original Gaussians, MPM particles, tet mesh, materials and packaged resources. It adds
+Kaolin's standard `KaolinSkinnedPhysicsAPI` to `/Berry/Gaussians`, with quadrature points, material parameters, skinning
+weights, spatial weight gradients and Gaussian skinning weights. `/Berry/TaskData/SimplicitsCollision` contains a second
+baked representation for MLS surface samples, plus outward normals and rest-area weights. Defaults are eight handles,
+512 quadrature points and 256 contact samples. The default RKPM basis uses 32 nodes and eigenanalysis; `--basis mlp`
+selects a learned basis with 2,000 training steps by default. The preparation script exposes these counts and a seed,
+refuses to overwrite an existing package, and validates the result through the asset reader. Simulation never trains
+a network at startup. Existing published raspberry packages need this preparation before selecting Simplicits.
+
+The solver shares the scene and camera interfaces with the other solvers. Gaussian centers, covariance and SH rotations
+use the baked handle weights. It follows kinematic Franka pad motion with **one-way coupling**: contact forces are not
+fed back into the rigid arm. Tissue is elastic, with no automatic bruising or fracture; the branch's fracture tools are
+not serialized by this baked representation. The full tissue resolution is required because quadrature is baked into
+the asset. Kaolin owns its captured MLS graphs and takes four tissue substeps per tick, with interpolated pad motion.
+When the checkout supports fixed capacity and asynchronous checks, the outer Newton graph includes tissue and robot steps.
+The unmodified development branch uses its native captured MLS step with automatic capacity growth and an eager outer step. Set
+`cfg.simplicits_solver.captured=False` for eager execution; contact and iteration settings live on the same config.
+The extended local Kaolin integration uses fixed MLS neighbor capacity (`cfg.simplicits_solver.contact_capacity=32`)
+and GPU assertions for capacity overflow and nonfinite solves, avoiding per-substep scalar readbacks.
+An assertion requires restarting the process; increase capacity for contact overflow. This requires the accompanying
+local Kaolin changes adding `mls_fixed_capacity` and `async_solve_check` to `SimplicitsScene`.
+For faster interaction, pass `--simplicits_substeps 1` (default: 4). This reduces temporal resolution
+from 480 Hz to 120 Hz; it retains the same material, contact model and nonlinear iteration limit.
+The receiving bowl remains porcelain. Use gentle closure for this elastic solver; the scripted first-berry crush
+expects a damage-capable tissue model.
 
 ### Render backends
 

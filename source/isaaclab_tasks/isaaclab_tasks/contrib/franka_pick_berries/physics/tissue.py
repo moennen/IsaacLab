@@ -3,8 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Berry tissue as Newton MPM particles, or as the nodes of a tetrahedral mesh for VBD: loading, placement in the
-punnet, scene configuration and a runtime handle.
+"""Berry tissue as MPM particles, Simplicits quadrature points, or tetrahedral mesh nodes for VBD.
+
+Handles loading, placement in the punnet, scene configuration and runtime state.
 
 The tissue solvers (:mod:`.grasp_explicit_mpm`, :mod:`.grasp_implicit_mpm`, :mod:`.grasp_vbd`) model the tissue's
 deformation and damage; this module only describes and places the particles or nodes.
@@ -91,6 +92,26 @@ def load_tissue(cfg: BerryPickEnvCfg, name: str, offset: tuple[float, float, flo
     """Load one berry's asset, select its tissue particles, or its tetrahedral mesh for VBD, and give it its
     material."""
     stage, gaussians, particles, profile = load_berry_asset(cfg.berry_asset)
+    if cfg.tissue_solver == "simplicits":
+        from scipy.spatial import cKDTree
+
+        from ..assets.simplicits import load_simplicits
+
+        if cfg.tissue_resolution != "full":
+            raise ValueError("Simplicits uses baked quadrature points: use full tissue resolution")
+        data = load_simplicits(stage)
+        nearest = cKDTree(particles["xyz"]).query(data["pts"])[1]
+        volume = float(data["appx_vol"]) / len(data["pts"])
+        particles = {
+            "xyz": data["pts"].copy(),
+            "regions": particles["regions"][nearest].copy(),
+            "interface": particles["interface"][nearest].copy(),
+            "spacing": np.float32(np.cbrt(volume)),
+            "particle_volume": volume,
+            "simplicits": data,
+            "simplicits_transform": np.eye(4, dtype=np.float32),
+        }
+        return TissueSpec(name, stage, gaussians, particles, profile, particle_material(profile), offset)
     if cfg.tissue_solver == "vbd":
         if cfg.tissue_resolution != "full":
             raise ValueError("The VBD tissue solver uses the asset's tetrahedral mesh: use full tissue resolution")
@@ -208,6 +229,11 @@ def transform_tissue(spec: TissueSpec, rotation: np.ndarray, shift: np.ndarray, 
     """
     particles = dict(spec.particles, xyz=(spec.particles["xyz"] @ rotation.T + shift).astype(np.float32))
     gaussians = dict(spec.gaussians, xyz=(spec.gaussians["xyz"] @ rotation.T + shift).astype(np.float32))
+    if "simplicits" in particles:
+        placement = np.eye(4, dtype=np.float32)
+        placement[:3, :3] = rotation
+        placement[:3, 3] = shift
+        particles["simplicits_transform"] = placement
     turn = Rotation.from_matrix(rotation)
     gaussians["rotations"] = (turn * Rotation.from_quat(spec.gaussians["rotations"])).as_quat().astype(np.float32)
     gaussians["sh"] = rotate_berry_sh(spec.gaussians["sh"], rotation).astype(np.float32)
@@ -292,6 +318,8 @@ class BerryTissue:
     """
 
     def __init__(self, spec: TissueSpec, asset: BaseDeformableObject):
+        self.simplicits_solver = None
+        self.simplicits_object = None
         self.name = spec.name
         self.stage = spec.stage
         self.gaussians = spec.gaussians

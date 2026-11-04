@@ -18,8 +18,7 @@ import warp as wp
 
 from pxr import Sdf, Usd, UsdGeom, UsdShade, Vt
 
-from .mpm_binding import MPMBinding
-from .vbd_binding import VBDBinding
+from .visuals import gaussian_binding
 
 SHADING = "primvars:squishyShQuaternion"
 """Per-Gaussian SH rotation and bruise tint read by the berry's MDL shader."""
@@ -71,8 +70,13 @@ def author_berry_visual(stage: Usd.Stage, tissue, root_path: str, builtin_materi
     Sdf.CopySpec(layer, "/Berry/Gaussians", stage.GetRootLayer(), field_path)
     prim = stage.GetPrimAtPath(field_path)
     for attr in prim.GetAttributes():
-        if attr.GetName().startswith("berry:"):
+        if attr.GetName().startswith(("berry:", "kaolin_skinned_physics:", "kaolin_physics_material:")):
             prim.RemoveProperty(attr.GetName())
+    schemas = prim.GetMetadata("apiSchemas")
+    if schemas:
+        for schema in schemas.GetAppliedItems():
+            if schema.startswith(("KaolinSkinnedPhysicsAPI:", "KaolinPhysicsMaterialAPI:")):
+                prim.RemoveAppliedSchema(schema)
     # The berry may have been turned and moved into the punnet: author its placed Gaussians. Time samples mark the
     # attributes the renderer should expect to change.
     original = source.GetPrimAtPath("/Berry/Gaussians")
@@ -123,11 +127,7 @@ class GaussianRenderDelegate:
         self._dynamic = [(name, lanes) for name, lanes in _DYNAMIC if not (builtin_material and name == SHADING)]
         gaussians = tissue.gaussians
         device = tissue.device
-        particles = tissue.particles
-        if "tets" in particles:
-            self.binding = VBDBinding(gaussians, particles["xyz"], particles["tets"], device)
-        else:
-            self.binding = MPMBinding(gaussians, particles["xyz"], particles["regions"], device)
+        self.binding = gaussian_binding(tissue)
         # The renderer keeps the Gaussians' bounds from their authored extent. The deformed Gaussians are therefore
         # published in a local frame that keeps them inside their rest bounds, with a transform that moves them back
         # into place.

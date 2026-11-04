@@ -42,12 +42,20 @@ parser.add_argument(
 )
 parser.add_argument(
     "--tissue_solver",
-    choices=["explicit", "implicit", "vbd"],
+    choices=["explicit", "implicit", "vbd", "simplicits"],
     default="explicit",
     help=(
         "Explicit MLS-MPM with frictional finger pads, Newton's implicit MPM with frictional grasping, or Newton's"
-        " VBD on a tetrahedral mesh (elastic, without damage)"
+        " VBD on a tetrahedral mesh, or optional Kaolin Simplicits with captured MLS contact"
     ),
+)
+parser.add_argument("--berry_asset", type=str, help="Override the raspberry USDZ, including a baked Simplicits asset")
+parser.add_argument(
+    "--simplicits_substeps",
+    type=int,
+    default=4,
+    choices=range(1, 9),
+    help="Simplicits steps per physics tick; 1 trades temporal resolution for speed",
 )
 parser.add_argument(
     "--arm_speed",
@@ -126,6 +134,9 @@ if scripted_demo:
     cfg.randomize_layout = False
 cfg.tissue_resolution = args.tissue_resolution
 cfg.tissue_solver = args.tissue_solver
+cfg.simplicits_solver.substeps = args.simplicits_substeps
+if args.berry_asset is not None:
+    cfg.berry_asset = args.berry_asset
 cfg.sim.device = args.device
 
 with launch_simulation(cfg, args), ExitStack() as resources:

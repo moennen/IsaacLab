@@ -46,6 +46,7 @@ from newton.solvers import SolverBase, SolverImplicitMPM
 from isaaclab.utils import configclass
 
 from ..scene.tableware import PunnetSpec, punnet_wall_contact, tableware_solids
+from .finger_pads import PAD_HALF_EXTENTS, PAD_OFFSETS
 from .materials import POISSON_RATIO, YOUNG_MODULUS
 
 # Error counters of :attr:`SolverGraspExplicitMPM.errors`.
@@ -1249,8 +1250,6 @@ class SolverGraspExplicitMPM(SolverBase, CouplingInterface):
 # --------------------------------------------------------------------------------------------------------------------
 
 # Franka finger pads: the flat inner fingertip faces, in each finger's frame [m].
-_PAD_HALF_EXTENTS = (0.009, 0.0054, 0.0089)
-_PAD_OFFSETS = {"left": (0.0, 0.0054, 0.045), "right": (0.0, -0.0054, 0.045)}
 
 
 @dataclass
@@ -1329,7 +1328,7 @@ def explicit_solver_config(specs, fingers: dict[str, str], punnet: PunnetSpec) -
         vessel_corner_radius=corner,
         vessel_wall_thickness=wall,
         vessel_wall_flare=flare,
-        pads=tuple(PadConfig(fingers[side], _PAD_OFFSETS[side], _PAD_HALF_EXTENTS) for side in ("left", "right")),
+        pads=tuple(PadConfig(fingers[side], PAD_OFFSETS[side], PAD_HALF_EXTENTS) for side in ("left", "right")),
         hardening=materials[0].hardening,
     )
 

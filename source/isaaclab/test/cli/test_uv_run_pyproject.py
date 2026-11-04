@@ -82,6 +82,7 @@ def test_uv_run_exposes_centralized_feature_extras(source_checkout_root: Path):
         "importers",
         "rlinf",
         "tetrahedralization",
+        "simplicits",
         "all",
     }
     assert expected_extras <= set(optional_dependencies)
@@ -112,6 +113,7 @@ def test_all_extra_aggregates_curated_ov_rl_and_visualizer_extras(source_checkou
     reachable = aggregated | {"ovphysx", "ovrtx"}
 
     assert set(optional) - reachable - {"all"} == {
+        "simplicits",
         "rlinf",
         "torchrl",
         "skrl-jax",

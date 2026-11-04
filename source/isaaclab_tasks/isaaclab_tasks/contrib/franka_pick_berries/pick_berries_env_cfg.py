@@ -28,6 +28,7 @@ from isaaclab_assets.robots.franka import FRANKA_PANDA_LEGACY_HIGH_PD_CFG
 from .assets.asset_paths import raspberry_asset_path
 from .mdp.actions import GripperApertureActionCfg, WorkspaceIKAction
 from .physics.coupling import coupled_physics_cfg
+from .physics.grasp_simplicits import GraspSimplicitsSolverCfg
 from .scene.tableware import (
     PUNNET_CENTER,
     PUNNET_FLOOR,
@@ -124,7 +125,10 @@ class BerryPickEnvCfg(ManagerBasedRLEnvCfg):
     tissue_solver: str = "explicit"
     """Tissue solver: ``explicit`` (explicit MLS-MPM with frictional finger pads, :mod:`.physics.grasp_explicit_mpm`),
     ``implicit`` (Newton's implicit MPM with frictional grasping, :mod:`.physics.grasp_implicit_mpm`) or ``vbd``
-    (Newton's VBD on the berry's tetrahedral mesh, :mod:`.physics.grasp_vbd`)."""
+    (Newton's VBD on the berry's tetrahedral mesh, :mod:`.physics.grasp_vbd`), or ``simplicits``
+    (optional Kaolin reduced deformation with captured MLS contact, :mod:`.physics.grasp_simplicits`)."""
+    simplicits_solver: GraspSimplicitsSolverCfg = GraspSimplicitsSolverCfg()
+    """Optional Kaolin solver settings; baked handles and quadrature are selected by the asset."""
     num_berries: int = 1
     """Number of raspberries in the punnet, 1 to 3."""
     randomize_layout: bool = True

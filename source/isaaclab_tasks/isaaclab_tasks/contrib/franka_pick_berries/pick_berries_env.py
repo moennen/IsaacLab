@@ -9,6 +9,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 
 from .gaussian_splats.visuals import publish_gaussians
 from .physics.coupling import (
+    TISSUE_ENTRY,
     check_tissue_solver,
     configure_tissue_solver,
     coupled_physics_cfg,
@@ -54,6 +55,12 @@ class BerryPickEnv(ManagerBasedRLEnv):
             use_cuda_graph = cfg.sim.physics.use_cuda_graph
             cfg.sim.physics = coupled_physics_cfg(solver=cfg.tissue_solver)
             cfg.sim.physics.use_cuda_graph = use_cuda_graph
+        if cfg.tissue_solver == "simplicits":
+            tissue_entry = next(entry for entry in cfg.sim.physics.solver_cfg.entries if entry.name == TISSUE_ENTRY)
+            tissue_entry.solver_cfg = cfg.simplicits_solver.copy()
+            tissue_entry.solver_cfg.timestep = (
+                cfg.sim.dt / cfg.sim.physics.num_substeps / tissue_entry.substeps / tissue_entry.solver_cfg.substeps
+            )
         configure_tissue_solver(cfg.sim.physics, specs, punnet)
         cfg.scene.visuals = visual_scene_cfg(specs)
         super().__init__(cfg, **kwargs)

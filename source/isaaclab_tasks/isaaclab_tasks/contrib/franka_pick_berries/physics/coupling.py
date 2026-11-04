@@ -7,6 +7,7 @@
 (:mod:`.grasp_explicit_mpm`, the default), implicit MPM (:mod:`.grasp_implicit_mpm`) or VBD (:mod:`.grasp_vbd`)."""
 
 import newton
+import numpy as np
 from isaaclab_newton.physics import (
     MJWarpSolverCfg,
     NewtonBackend,
@@ -26,6 +27,7 @@ from ..scene.tableware import PunnetSpec
 from . import grasp_explicit_mpm, grasp_implicit_mpm
 from .grasp_explicit_mpm import GraspExplicitMPMSolverCfg, SolverGraspExplicitMPM, explicit_solver_config
 from .grasp_implicit_mpm import GraspImplicitMPMSolverCfg
+from .grasp_simplicits import GraspSimplicitsSolverCfg, SolverSimplicits
 from .grasp_vbd import GraspVBDSolverCfg
 
 ARM_ENTRY = "arm"
@@ -104,6 +106,24 @@ def coupled_physics_cfg(solver: str = "explicit") -> NewtonCfg:
         )
         # The explicit solver handles the tableware analytically; the arm collides with its static colliders.
         arm_substeps, coupled_substeps, arm_static_shapes = 4, 1, True
+    elif solver == "simplicits":
+        tissue = CouplerEntryCfg(
+            name=TISSUE_ENTRY,
+            solver_cfg=GraspSimplicitsSolverCfg(),
+            all_particles=True,
+            shape_label_patterns=_STATIC_COLLIDERS,
+            substeps=1,
+            in_place=True,
+        )
+        proxies = CouplerProxyMappingCfg(
+            source=ARM_ENTRY,
+            destination=TISSUE_ENTRY,
+            bodies=[_FINGERS],
+            mode="staggered",
+            proxy_relaxation=0.0,
+            collision_pipeline=None,
+        )
+        arm_substeps, coupled_substeps, arm_static_shapes = 4, 1, False
     elif solver == "vbd":
         # Eight VBD substeps per coupled substep (1920 Hz) resolve the finger contacts of the light, soft mesh.
         tissue = CouplerEntryCfg(
@@ -163,6 +183,20 @@ def configure_tissue_solver(physics: NewtonCfg, specs, punnet: PunnetSpec) -> No
             elif isinstance(entry.solver_cfg, GraspImplicitMPMSolverCfg):
                 entry.solver_cfg.voxel_size = max(spec.voxel_size for spec in specs)
                 entry.solver_cfg.max_active_cell_count = CELLS_PER_BERRY * len(specs)
+            elif isinstance(entry.solver_cfg, GraspSimplicitsSolverCfg):
+                entry.solver_cfg.representations = [
+                    {
+                        key: value
+                        for key, value in spec.particles["simplicits"].items()
+                        if key not in {"renderable_weights", "renderable_pts"}
+                    }
+                    for spec in specs
+                ]
+                entry.solver_cfg.placements = []
+                for spec in specs:
+                    placement = spec.particles["simplicits_transform"].copy()
+                    placement[:3, 3] += np.asarray(spec.offset)
+                    entry.solver_cfg.placements.append(placement)
             return
     raise ValueError(f"No {TISSUE_ENTRY!r} entry in the physics configuration")
 
@@ -196,6 +230,11 @@ def register_tissues(tissues) -> None:
     intact.
     """
     solver = tissue_solver()[0]
+    if isinstance(solver, SolverSimplicits):
+        for index, tissue in enumerate(tissues):
+            tissue.simplicits_solver = solver
+            tissue.simplicits_object = solver.object_ids[index]
+        return
     if isinstance(solver, SolverVBD):
         return
     module = grasp_explicit_mpm if isinstance(solver, SolverGraspExplicitMPM) else grasp_implicit_mpm
@@ -215,10 +254,13 @@ def check_tissue_solver() -> None:
 
 def reset_tissue_solver() -> None:
     """Reset the tissue solver's deformation and damage after the scene restored the particles."""
-    if isinstance(tissue_solver()[0], (SolverGraspExplicitMPM, SolverVBD)):
+    if isinstance(tissue_solver()[0], (SolverGraspExplicitMPM, SolverVBD, SolverSimplicits)):
         # The coupled reset passes the restored particles to the entry, which restores its own solver state.
         backend = _backend()
         backend.solver.reset(backend.state_0, flags=newton.StateFlags.PARTICLE)
+        if isinstance(tissue_solver()[0], SolverSimplicits):
+            # Kaolin reset replaces its state buffers and captured contact graphs.
+            backend.invalidate_graph()
     else:
         # There is one environment, so an unmasked reset selects exactly that world.
         reset_mpm_solver_state(_backend(), flags=newton.StateFlags.PARTICLE)
