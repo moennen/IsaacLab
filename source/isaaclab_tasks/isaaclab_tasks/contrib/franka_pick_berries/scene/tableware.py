@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""The lab table, the open punnet, the glass or porcelain receiving bowl and the reject dish; dimensions in metres."""
+"""The lab table, the open punnet, the porcelain receiving bowl and the reject dish; dimensions in metres."""
 
 from __future__ import annotations
 
@@ -65,8 +65,6 @@ PUNNET = PunnetSpec("clear_pet_container.usdz", (0.0431, 0.0556, 0.0086), 0.0035
 TABLE_VISIBLE_TOP = 0.00142
 TABLE_POSITION = (0.55, 0.0, 0.003 - TABLE_VISIBLE_TOP - 0.0001)
 TABLE_ROTATION = (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5))
-BOWL_MATERIALS = ("glass", "porcelain")
-"""Materials of the receiving bowl."""
 PORCELAIN_COLOR = (0.93, 0.92, 0.89)
 """Color [linear RGB] of the porcelain bowl's glaze."""
 
@@ -175,27 +173,6 @@ def _rounded_outline(hx: float, hy: float, radius: float) -> np.ndarray:
     return np.asarray(points)
 
 
-def _no_shadow(geometry: UsdGeom.Gprim) -> None:
-    """Keep ``geometry`` from casting shadows, which RTX would make opaque for glass."""
-    UsdGeom.PrimvarsAPI(geometry).CreatePrimvar("doNotCastShadows", Sdf.ValueTypeNames.Bool).Set(True)
-
-
-def _glass_material(
-    stage: Usd.Stage, name: str, color: tuple[float, float, float], ior: float, frosting: float, thin_walled: bool
-) -> UsdShade.Material:
-    """Clear glass or plastic; a thin-walled sheet reflects without bending what is behind it."""
-    material = UsdShade.Material.Define(stage, f"/World/Tableware/{name}")
-    shader = UsdShade.Shader.Define(stage, f"{material.GetPath()}/Shader")
-    shader.SetSourceAsset(Sdf.AssetPath("OmniGlass.mdl"), "mdl")
-    shader.SetSourceAssetSubIdentifier("OmniGlass", "mdl")
-    shader.CreateInput("glass_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
-    shader.CreateInput("glass_ior", Sdf.ValueTypeNames.Float).Set(ior)
-    shader.CreateInput("frosting_roughness", Sdf.ValueTypeNames.Float).Set(frosting)
-    shader.CreateInput("thin_walled", Sdf.ValueTypeNames.Bool).Set(thin_walled)
-    material.CreateSurfaceOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
-    return material
-
-
 def _lathe(
     stage: Usd.Stage,
     path: str,
@@ -282,18 +259,16 @@ def _porcelain_material(stage: Usd.Stage, path: str) -> UsdShade.Material:
     return material
 
 
-def add_tableware_visuals(stage: Usd.Stage, bowl_material: str = "porcelain") -> None:
+def add_tableware_visuals(stage: Usd.Stage, root_path: str = "/World/Tableware") -> None:
     """Reference the punnet's visual asset and author the bowl's and reject dish's open render meshes.
 
     Args:
         stage: Stage to author the meshes in.
-        bowl_material: Material of the receiving bowl, one of :data:`BOWL_MATERIALS`.
+        root_path: Parent prim path for the tableware visuals.
     """
-    if bowl_material not in BOWL_MATERIALS:
-        raise ValueError(f"Unknown bowl material {bowl_material!r}; expected one of {BOWL_MATERIALS}")
-    UsdGeom.Xform.Define(stage, "/World/Tableware")
+    UsdGeom.Xform.Define(stage, root_path)
     # The package is centered on the tabletop, with its floor's support height in its geometry.
-    package = UsdGeom.Xform.Define(stage, "/World/Tableware/Punnet")
+    package = UsdGeom.Xform.Define(stage, f"{root_path}/Punnet")
     package.GetPrim().GetReferences().AddReference(retrieve_file_path(punnet_asset_path(PUNNET.asset)))
     package.AddTranslateOp().Set(Gf.Vec3d(*PUNNET_CENTER, 0.0))
     for name, spec in (("Reject", REJECT_DISH), ("Bowl", BOWL)):
@@ -313,21 +288,16 @@ def add_tableware_visuals(stage: Usd.Stage, bowl_material: str = "porcelain") ->
             (0, base),
         ]
         if name == "Bowl":
-            # A shallow recessed underside avoids coincident glass/table faces.
+            # A shallow recessed underside avoids coincident bowl/table faces.
             # Only the outer foot ring touches the tabletop.
             profile[:1] = [(0, 0.0007), (outer - 0.004, 0.0007), (outer - 0.002, 0)]
         # Round the bowl's foot ring into its recess, and its 1 mm lip top into the lip bevels.
         smooth_corners = (2, 6, 7) if name == "Bowl" else ()
-        mesh = _lathe(stage, f"/World/Tableware/{name}", profile, (x, y), smooth_corners)
-        if name == "Bowl" and bowl_material == "porcelain":
-            material = _porcelain_material(stage, "/World/Tableware/BowlMaterial")
-        elif name == "Bowl":
-            # RTX shadow rays do not refract: solid glass would cast an opaque
-            # shadow and leave the tabletop seen through its floor black.
-            _no_shadow(mesh)
-            material = _glass_material(stage, "BowlMaterial", (0.98, 1.0, 0.995), 1.47, 0.03, False)
+        mesh = _lathe(stage, f"{root_path}/{name}", profile, (x, y), smooth_corners)
+        if name == "Bowl":
+            material = _porcelain_material(stage, f"{root_path}/BowlMaterial")
         else:
-            material = UsdShade.Material.Define(stage, f"/World/Tableware/{name}Material")
+            material = UsdShade.Material.Define(stage, f"{root_path}/{name}Material")
             shader = UsdShade.Shader.Define(stage, f"{material.GetPath()}/Shader")
             shader.CreateIdAttr("UsdPreviewSurface")
             shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.50, 0.53, 0.56))

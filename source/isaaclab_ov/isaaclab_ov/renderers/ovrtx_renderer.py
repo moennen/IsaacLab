@@ -74,6 +74,7 @@ from isaaclab.sim import PreviewSurfaceCfg, SimulationContext, use_stage
 from isaaclab.utils.warp import ProxyArray
 
 from isaaclab_ov.cloner import ovrtx_replicate
+from isaaclab_ov.renderers.gaussian_fields import OVRTXGaussianFields
 from isaaclab_ov.renderers.ovrtx_annotator_utils import (
     IdentifierMap,
     build_instance_id_to_labels_and_semantics,
@@ -389,6 +390,7 @@ class OVRTXRenderer(BaseRenderer):
         self.geometry_callbacks: dict[Any, Callable[[OVRTXRenderer], None]] = {}
         self.geometry_resources = contextlib.ExitStack()
         self._sdp = self._sim.get_scene_data_provider()
+        self._gaussian_fields = OVRTXGaussianFields(self)
         self._transforms_timestamp = -1
         self._transform_writes = _AsyncWriteBuffers(SceneDataFormat.TransposedMatrix44d() for _ in range(2))
         self._object_scales: wp.array | None = None
@@ -1074,6 +1076,7 @@ class OVRTXRenderer(BaseRenderer):
 
     def update_geometries(self) -> None:
         """Write changed SDP geometry to OVRTX."""
+        self._gaussian_fields.update()
         for callback in self.geometry_callbacks.values():
             callback(self)
         for marker in tuple(self.markers):
@@ -1286,6 +1289,7 @@ class OVRTXRenderer(BaseRenderer):
                 resources.callback(self._transform_writes.close)
                 resources.callback(self._geometry_writes.close)
                 resources.callback(self.geometry_resources.close)
+                resources.callback(self._gaussian_fields.close)
                 for geometry in (*self.meshes.values(), *self.markers.values()):
                     resources.callback(geometry.close)
                 for render_data in tuple(self._camera_render_data):

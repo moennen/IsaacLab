@@ -534,3 +534,43 @@ Where to go next
 
 - :doc:`/source/concepts/scene_data_providers`: how scene data flows from physics backends to renderers
 - :doc:`/source/concepts/visualization` — lightweight visualizer backends for interactive feedback
+
+
+Mutable Gaussian fields
+-----------------------
+
+A task can publish deformation of an existing USD ``ParticleField3DGaussianSplat`` through
+:meth:`~isaaclab.scene_data.SceneDataProvider.register_gaussian_field`. The standard Newton Warp
+and OVRTX renderers consume the same :class:`~isaaclab.scene_data.GaussianField` buffers. A task
+needs no renderer subclass or native scene writes:
+
+.. code-block:: python
+
+   from isaaclab.scene_data import GaussianField
+
+   provider = sim.get_scene_data_provider()
+   provider.register_gaussian_field(
+       "/World/Object/Gaussians",
+       GaussianField(positions, orientations, scales, update=deform_gaussians),
+   )
+
+Publish local-space ``wp.vec3f`` positions and standard deviations, plus ``wp.quatf`` orientations
+in xyzw order. The producer owns these fixed-size arrays and allocates them before stepping physics
+or capturing CUDA graphs. The optional update callback fills them once per simulation state, shared
+by all consumers. For writes between physics steps, call ``provider.mark_gaussian_field_dirty(path)``.
+Registration requires a matching authored Gaussian count. Keep buffers and topology fixed; finish
+pending renders and unregister the old publication before replacing them. Unregistering restores
+authored attributes on the renderer's next scene update.
+
+Optional opacities update the authored opacity array. Spherical harmonics remain as authored.
+Additional float scalar or vector attributes can be supplied for OVRTX shader primvars; Newton Warp
+uses its native Gaussian appearance and does not evaluate those shader attributes. OVRTX requires a
+nonempty authored extent and compensates for changing bounds with a field transform. Its current
+bounds compensation reads back six floats per changed field. Newton Warp updates native Gaussian
+and scene BVHs on the GPU, giving independently deforming shapes separate render buffers even when
+they share one imported Gaussian asset.
+
+``NewtonWarpRendererCfg`` exposes ``gaussians_mode``, ``gaussians_min_transmittance`` and
+``gaussians_max_num_hits`` for quality and cost control. ``enable_particles`` and
+``enable_deformable_triangles`` control whether simulation geometry is also drawn alongside the
+Gaussian appearance. Rigid visual meshes remain controlled by their authored visibility.

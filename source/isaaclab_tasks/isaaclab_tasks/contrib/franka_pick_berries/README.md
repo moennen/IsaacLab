@@ -84,7 +84,6 @@ throughout: an arm command that leads the arm's lag keeps it from waiting, and t
 | `--arm_speed X` | 2 (scripted demo: medium 6, short 12) | Arm speed multiplier; the gripper keeps its gentle closing pace |
 | `--demo_length {full,medium,short}` | `full` | Scripted demo: handle the three berries, or only the first two, faster |
 | `--camera {punnet_and_bowl,berry_closeup,room,scripted_camera}` | `punnet_and_bowl` | Fixed views, a close-up following the handled berry, or a shot-by-shot film (scripted demo) |
-| `--bowl_material {glass,porcelain}` | `porcelain` | Material of the receiving bowl |
 | `--repeat` | | Scripted demo: start again when it ends |
 | `--save_frames DIR` | | Scripted demo: render offscreen, save one PNG per 1/30 s, then exit |
 | `--stochastic_gaussian_rendering` | | The berries' own material, which turns their colour and tints bruises, with sampling noise (default: the renderer's built-in material, without it) |
@@ -96,13 +95,20 @@ Frame rates while grasping, at 1280 × 720 on an RTX 6000 Ada: about 17 frames/s
 
 ### Render backends
 
-The berries, container, dishes, and aligned room scan share one USD visual scene authored by `scene/visuals.py`.
-The OVRTX viewer consumes that scene directly. Newton Warp uses Newton's standard USD importer for the same mesh
-and Gaussian fields; its adapter updates the deforming berry buffers and acceleration bounds before camera capture.
-Both renderer paths share the camera poses and a 45-degree vertical field of view.
+The berries, container, dishes, and room are declared once as a regular visual asset in `cfg.scene.visuals`.
+The receiving bowl always uses glazed white porcelain.
+Isaac Lab's scene importer consumes that USD asset for the configured rendering backend. The environment does not
+inspect camera backend types or install native builder hooks.
 
-Renderer capabilities affect appearance: Warp uses DC Gaussian color and opaque tableware materials, while OVRTX
-supports the packaged MDL shading and transparent plastic. The scene assets and their placement are shared.
+Use the standard `NewtonWarpRendererCfg` or `OVRTXRendererCfg` in `CameraCfg.renderer_cfg`.
+The task publishes tissue-driven Gaussian buffers through `SceneDataProvider.register_gaussian_field()`.
+The selected renderer consumes those buffers and updates its native scene; no task-specific renderer is needed.
+For Gaussian-only tissue visuals in Warp, set `enable_particles=False` and `enable_deformable_triangles=False`.
+Gaussian quality settings are also regular fields on `NewtonWarpRendererCfg`.
+The legacy OVRTX viewer copies the same authored USD asset, preserving its materials. Both paths share camera poses
+and a 45-degree vertical field of view.
+
+Warp uses DC Gaussian color and opaque tableware materials; OVRTX supports the packaged MDL shading and transparency.
 
 ### Code layout
 

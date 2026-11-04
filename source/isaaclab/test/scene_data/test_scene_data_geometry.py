@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import warp as wp
 
+from isaaclab.scene_data import GaussianField
 from isaaclab.scene_data.scene_data_backend import SceneDataFormat
 from isaaclab.scene_data.scene_data_provider import SceneDataProvider
 
@@ -173,3 +174,40 @@ def test_cable_endpoint_conversion_composes_shape_poses_and_averages_joints():
     backend = SimpleNamespace(geometry_timestamp=0, get_geometry_batches=lambda _: [(source, {"/Cable/curve": (0, 3)})])
     points = SceneDataProvider(backend).get_geometry_points()["/Cable/curve"]
     np.testing.assert_allclose(points.numpy(), [[1, 2, 3], [2.5, 3.25, 3], [2, 0.5, 3]], atol=1e-6)
+
+
+def test_gaussian_producers_refresh_once_across_consumers_and_reregister():
+    """Two renderers share one deformation refresh; replacing a field refreshes even at the same state."""
+    backend = SimpleNamespace(transforms_timestamp=0, geometry_timestamp=0)
+    provider = SceneDataProvider(backend)
+    updates = []
+    positions = wp.zeros(2, dtype=wp.vec3f, device="cpu")
+    field = GaussianField(
+        positions,
+        wp.zeros(2, dtype=wp.quatf, device="cpu"),
+        wp.full(2, wp.vec3f(0.1), device="cpu"),
+        update=lambda: updates.append((backend.transforms_timestamp, backend.geometry_timestamp)),
+    )
+    provider.register_gaussian_field("/Field", field)
+    with pytest.raises(ValueError, match="already published"):
+        provider.register_gaussian_field("/Field", field)
+    provider.get_gaussian_fields()
+    provider.get_gaussian_fields()
+    assert updates == [(0, 0)]
+    backend.geometry_timestamp += 1
+    provider.get_gaussian_fields()
+    provider.get_gaussian_fields()
+    backend.transforms_timestamp += 1
+    provider.get_gaussian_fields()
+    assert updates == [(0, 0), (0, 1), (1, 1)]
+    previous = provider.gaussian_timestamp
+    provider.unregister_gaussian_field("/Field")
+    assert not provider.get_gaussian_fields()
+    provider.register_gaussian_field("/Field", field)
+    assert provider.gaussian_timestamp != previous
+    provider.get_gaussian_fields()
+    assert updates == [(0, 0), (0, 1), (1, 1), (1, 1)]
+    provider.mark_gaussian_field_dirty("/Field")
+    provider.get_gaussian_fields()
+    provider.get_gaussian_fields()
+    assert updates == [(0, 0), (0, 1), (1, 1), (1, 1), (1, 1)]

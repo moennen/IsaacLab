@@ -39,6 +39,8 @@ disturbance. CUDA graph capture needs a fixed capacity, and the cost of each ste
 _FINGERS = r"/World/envs/env_.*/Robot/panda_(left|right)finger"
 _FINGER = {side: rf"/World/envs/env_.*/Robot/panda_{side}finger" for side in ("left", "right")}
 _TABLE = r"/World/envs/env_.*/Table"
+# Own physical colliders explicitly; the shared scene also contains static visual-only geometry.
+_STATIC_COLLIDERS = [r"/World/(TablewareCollisions|GroundPlane)(/.*)?"]
 
 
 def _arm_entry(substeps: int, static_shapes: bool) -> CouplerEntryCfg:
@@ -48,7 +50,7 @@ def _arm_entry(substeps: int, static_shapes: bool) -> CouplerEntryCfg:
         name=ARM_ENTRY,
         solver_cfg=MJWarpSolverCfg(use_mujoco_contacts=False, integrator="implicitfast", njmax=512, nconmax=256),
         bodies=[r"/World/envs/env_.*/Robot", _TABLE],
-        include_static_shapes=static_shapes,
+        shape_label_patterns=_STATIC_COLLIDERS if static_shapes else [],
         substeps=substeps,
     )
 
@@ -71,7 +73,7 @@ def coupled_physics_cfg(solver: str = "explicit") -> NewtonCfg:
             name=TISSUE_ENTRY,
             solver_cfg=GraspImplicitMPMSolverCfg(),
             all_particles=True,
-            include_static_shapes=True,
+            shape_label_patterns=_STATIC_COLLIDERS,
             substeps=1,
             in_place=True,
         )
@@ -108,7 +110,7 @@ def coupled_physics_cfg(solver: str = "explicit") -> NewtonCfg:
             name=TISSUE_ENTRY,
             solver_cfg=GraspVBDSolverCfg(),
             all_particles=True,
-            include_static_shapes=True,
+            shape_label_patterns=_STATIC_COLLIDERS,
             substeps=8,
         )
         # The fingers and the table collide with the mesh's nodes as proxies; the static tableware, through the

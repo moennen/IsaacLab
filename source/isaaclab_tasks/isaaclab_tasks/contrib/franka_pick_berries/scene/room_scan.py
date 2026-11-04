@@ -25,7 +25,7 @@ def room_to_task_transform() -> Gf.Matrix4d:
     return robot_in_room.GetInverse()
 
 
-def add_room_scan(stage: Usd.Stage, radiance_shader: UsdShade.Shader) -> str:
+def add_room_scan(stage: Usd.Stage, radiance_shader: UsdShade.Shader, root_path: str = "/World/Room") -> str:
     """Reference the static room and bind the packaged SH shader (no physics import).
 
     Avoid the scan's unqualified ParticleFieldEmissive.mdl dependency.
@@ -42,8 +42,8 @@ def add_room_scan(stage: Usd.Stage, radiance_shader: UsdShade.Shader) -> str:
     # RTX. Explicitly use the parent: XformCache ignores unknown ParticleField
     # types in kitless USD.
     # Keep the large arrays referenced, not duplicated in a temporary stage.
-    UsdGeom.Xform.Define(stage, "/World/Room")
-    field = stage.DefinePrim("/World/Room/Gaussians", "ParticleField3DGaussianSplat")
+    UsdGeom.Xform.Define(stage, root_path)
+    field = stage.DefinePrim(f"{root_path}/Gaussians", "ParticleField3DGaussianSplat")
     field.GetReferences().AddReference(path, original.GetPath())
     transform = UsdGeom.Xformable(field)
     transform.ClearXformOpOrder()
@@ -53,8 +53,8 @@ def add_room_scan(stage: Usd.Stage, radiance_shader: UsdShade.Shader) -> str:
     for name in ("projectionModeHint", "sortingModeHint"):
         if field.HasAttribute(name):
             field.GetAttribute(name).Block()
-    material = UsdShade.Material.Define(stage, "/World/RoomMaterial")
-    shader = UsdShade.Shader.Define(stage, "/World/RoomMaterial/Shader")
+    material = UsdShade.Material.Define(stage, f"{root_path}Material")
+    shader = UsdShade.Shader.Define(stage, f"{root_path}Material/Shader")
     shader.SetSourceAsset(radiance_shader.GetSourceAsset("mdl"), "mdl")
     shader.SetSourceAssetSubIdentifier(radiance_shader.GetSourceAssetSubIdentifier("mdl"), "mdl")
     shader.CreateInput("emission_intensity", Sdf.ValueTypeNames.Float).Set(1.0)

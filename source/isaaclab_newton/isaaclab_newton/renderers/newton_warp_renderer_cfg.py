@@ -46,6 +46,21 @@ class NewtonWarpRendererCfg(RendererCfg):
     enable_backface_culling: bool = False
     """Cull back-facing triangles."""
 
+    enable_particles: bool = True
+    """Render simulation particles as spheres."""
+
+    enable_deformable_triangles: bool = True
+    """Render simulation triangle surfaces independently of rigid visual meshes."""
+
+    gaussians_mode: Literal["fast", "quality"] = "fast"
+    """Native Gaussian compositing mode."""
+
+    gaussians_min_transmittance: float = 0.49
+    """Stop Gaussian compositing below this remaining transmittance."""
+
+    gaussians_max_num_hits: int = 20
+    """Maximum Gaussian intersections retained per ray in quality mode."""
+
     max_distance: float = 1000.0
     """Maximum ray distance [m].
 

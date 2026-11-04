@@ -5,10 +5,9 @@
 
 """Single workcell environment: a Franka and deformable berry tissue on Newton's coupled MPM or VBD."""
 
-from contextlib import nullcontext
-
 from isaaclab.envs import ManagerBasedRLEnv
 
+from .gaussian_splats.visuals import publish_gaussians
 from .physics.coupling import (
     check_tissue_solver,
     configure_tissue_solver,
@@ -25,6 +24,7 @@ from .physics.tissue import (
     transform_tissue,
 )
 from .scene.tableware import PUNNET
+from .scene.visuals import visual_scene_cfg
 
 
 class BerryPickEnv(ManagerBasedRLEnv):
@@ -55,36 +55,13 @@ class BerryPickEnv(ManagerBasedRLEnv):
             cfg.sim.physics = coupled_physics_cfg(solver=cfg.tissue_solver)
             cfg.sim.physics.use_cuda_graph = use_cuda_graph
         configure_tissue_solver(cfg.sim.physics, specs, punnet)
-        warp_cameras = [
-            value
-            for value in vars(cfg.scene).values()
-            if getattr(getattr(value, "renderer_cfg", None), "renderer_type", None) == "newton_warp"
-        ]
-        scope = nullcontext()
-        if warp_cameras:
-            from isaaclab_newton.cloner import newton_builder_world_hook
-
-            from .gaussian_splats.warp_visuals import import_scene_visuals
-
-            def add_warp_visuals(builder, *_):
-                import_scene_visuals(builder, specs)
-
-            scope = newton_builder_world_hook(add_warp_visuals)
-        with scope:
-            super().__init__(cfg, **kwargs)
+        cfg.scene.visuals = visual_scene_cfg(specs)
+        super().__init__(cfg, **kwargs)
         self.berries = {spec.name: BerryTissue(spec, self.scene[spec.scene_name]) for spec in specs}
         register_tissues(self.berries.values())
         # The berry being handled, which the close-up follows; the scripted demo moves on through the others.
         self.handled_berry = next(iter(self.berries.values()))
-        if warp_cameras:
-            from .gaussian_splats.warp_visuals import WarpGaussianVisuals, configure_camera
-
-            self.warp_visuals = WarpGaussianVisuals(self)
-            for camera_name in vars(cfg.scene):
-                camera_cfg = getattr(cfg.scene, camera_name)
-                if camera_cfg in warp_cameras:
-                    camera = self.scene[camera_name]
-                    configure_camera(camera, self.warp_visuals)
+        publish_gaussians(self.berries, self.sim.get_scene_data_provider())
 
     def step(self, action):
         result = super().step(action)

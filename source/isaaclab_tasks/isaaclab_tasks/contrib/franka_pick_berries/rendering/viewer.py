@@ -5,20 +5,22 @@
 
 """Interactive RTX viewer of the workcell: Newton's robot and props, the deforming berries and the scanned room."""
 
+import copy
 import math
 import time
 
+import newton
 import numpy as np
 import ovstage
 import warp as wp
 from newton.viewer import ViewerRTX
 
-from pxr import Gf, Sdf, UsdGeom, UsdLux
+from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdShade
 
 from isaaclab.sim import get_current_stage
 
 from ..gaussian_splats.render_delegate import GaussianRenderDelegate
-from ..scene.visuals import author_scene_visuals
+from ..scene.visuals import VISUAL_ROOT_PATH
 from ..scene.workcell_materials import restore_workcell_materials
 from .camera import VERTICAL_FOV_DEG, camera_view
 
@@ -40,7 +42,6 @@ class BerryViewer(ViewerRTX):
         samples_per_pixel: Real-time path-tracing samples per pixel; None keeps the renderer's default.
         camera: Initial camera view, one of :data:`CAMERA_VIEWS`.
         f_stop: Camera f-number for depth of field in a scripted camera's close shots; None keeps everything sharp.
-        bowl_material: Material of the receiving bowl, ``glass`` or ``porcelain``.
         stochastic_gaussian_rendering: Shade the berries with their own material, which turns their colour with the
             tissue and tints bruises, but is stochastically composited, with visible sampling noise between frames.
             Otherwise the Gaussians use the renderer's built-in ParticleFieldEmissive material, composited
@@ -54,7 +55,6 @@ class BerryViewer(ViewerRTX):
         samples_per_pixel=None,
         camera="punnet_and_bowl",
         f_stop=None,
-        bowl_material="porcelain",
         stochastic_gaussian_rendering=False,
         **kwargs,
     ):
@@ -64,7 +64,6 @@ class BerryViewer(ViewerRTX):
         self.handled_berry = env.handled_berry
         self.samples_per_pixel = samples_per_pixel
         self.f_stop = f_stop
-        self.bowl_material = bowl_material
         self.stochastic_gaussian_rendering = stochastic_gaussian_rendering
         # Keyboard teleoperation's commanded aperture [m].
         self.keyboard_aperture = 0.08
@@ -83,12 +82,22 @@ class BerryViewer(ViewerRTX):
         self.status_text = None
         self.last_center = self.handled_berry.positions().mean(0)
         self.render_delegates = [
-            GaussianRenderDelegate(berry, f"/World/Berries/{name}", builtin_material=not stochastic_gaussian_rendering)
+            GaussianRenderDelegate(
+                berry, f"{VISUAL_ROOT_PATH}/Berries/{name}", builtin_material=not stochastic_gaussian_rendering
+            )
             for name, berry in env.berries.items()
         ]
         super().__init__(**kwargs, environment="studio", fps=30, async_rendering=False)
         self.camera.fov = VERTICAL_FOV_DEG
-        self.set_model(self._newton.model)
+        # The shared USD asset is copied below with its original materials. Hide its native
+        # representation in this legacy viewer's model layer to avoid drawing it twice.
+        model = copy.copy(self._newton.model)
+        flags = model.shape_flags.numpy()
+        for index, label in enumerate(model.shape_label):
+            if label.startswith(VISUAL_ROOT_PATH + "/"):
+                flags[index] &= ~int(newton.ShapeFlags.VISIBLE)
+        model.shape_flags = wp.array(flags, dtype=model.shape_flags.dtype, device=model.device)
+        self.set_model(model)
         # The berries appear as their Gaussians only, not as the VBD solver's tetrahedral mesh.
         self.show_triangles = False
         # A scripted camera starts on the overview and is then moved with place_camera().
@@ -225,9 +234,14 @@ class BerryViewer(ViewerRTX):
                 for index, shape in enumerate(batch.model_shapes)
             ),
         )
-        author_scene_visuals(
-            self.stage, self.env.berries.values(), self.bowl_material, not self.stochastic_gaussian_rendering
-        )
+        Sdf.CopySpec(get_current_stage().Flatten(), VISUAL_ROOT_PATH, self.stage.GetRootLayer(), VISUAL_ROOT_PATH)
+        if self.stochastic_gaussian_rendering:
+            for delegate in self.render_delegates:
+                original = UsdShade.Shader.Get(delegate.tissue.stage, "/Berry/Materials/Radiance/Shader")
+                shader = UsdShade.Shader.Get(self.stage, delegate.shader_path)
+                asset = original.GetSourceAsset("mdl")
+                shader.SetSourceAsset(Sdf.AssetPath(asset.resolvedPath or asset.path), "mdl")
+                shader.SetSourceAssetSubIdentifier(original.GetSourceAssetSubIdentifier("mdl"), "mdl")
         # Newton loads the stage with OVStage 0.2's ``open_usd(..., time_code=)``, which OVStage 0.3 names ``time``.
         open_usd = ovstage.population.open_usd
 
@@ -278,9 +292,6 @@ class BerryViewer(ViewerRTX):
             product.CreateAttribute("omni:rtx:rtpt:spp", Sdf.ValueTypeNames.Int).Set(self.samples_per_pixel)
         if not self.stochastic_gaussian_rendering:
             product.CreateAttribute("omni:rtx:rtpt:gaussian:nonStochastic:enabled", Sdf.ValueTypeNames.Bool).Set(True)
-        # Rays through the glass bowl can cross both walls and its solid base.
-        product.CreateAttribute("omni:rtx:rtpt:maxBounces", Sdf.ValueTypeNames.Int).Set(8)
-        product.CreateAttribute("omni:rtx:rtpt:maxSpecularAndTransmissionBounces", Sdf.ValueTypeNames.Int).Set(8)
 
     def _update_ovrtx_camera(self):
         super()._update_ovrtx_camera()

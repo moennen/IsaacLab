@@ -3,7 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-__all__ = ["REQUIRES_STAGE_AND_MODEL", "SceneDataBackend", "SceneDataFormat", "SceneDataProvider"]
+__all__ = ["REQUIRES_STAGE_AND_MODEL", "SceneDataBackend", "SceneDataFormat", "SceneDataProvider", "GaussianField"]
 
+from .gaussian_field import GaussianField
 from .scene_data_backend import SceneDataBackend, SceneDataFormat
 from .scene_data_provider import REQUIRES_STAGE_AND_MODEL, SceneDataProvider

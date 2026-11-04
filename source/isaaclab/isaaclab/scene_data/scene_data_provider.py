@@ -17,6 +17,7 @@ from .. import sim as sim_utils
 from ..cloner.cloner_cfg import DEFAULT_ENV_TEMPLATE
 from ..sensors import camera, contact_sensor
 from ..utils.buffers import TimestampedBuffer
+from .gaussian_field import GaussianField
 from .geometry_points import convert_geometry_fabric_kernel, convert_geometry_points_kernel
 from .scene_data_backend import SceneDataBackend, SceneDataFormat
 
@@ -67,6 +68,73 @@ class SceneDataProvider:
         """Borrowed cameras by prim expression, including cameras spawned without an InteractiveScene."""
         self._cache: dict[Any, TimestampedBuffer] = {}
         self._transform_mappings: dict[tuple, wp.array | None] = {}
+        self._gaussian_fields: dict[str, GaussianField] = {}
+        self._gaussian_updates: dict[str, tuple[int, int]] = {}
+        self._gaussian_revision = 0
+
+    @property
+    def gaussian_timestamp(self) -> tuple[int, int, int]:
+        """Revision of registered fields and the simulation state driving their refresh."""
+        return (self._gaussian_revision, self.backend.transforms_timestamp, self.backend.geometry_timestamp)
+
+    def register_gaussian_field(self, path: str, field: GaussianField) -> None:
+        """Publish fixed-topology buffers for an existing USD Gaussian prim.
+
+        All arrays must be one-dimensional, equally sized and on the same device.
+        Call before stepping physics so the producer's allocations precede graph capture.
+        Duplicate paths are rejected; unregister a previous publication before replacing it.
+        """
+        if path in self._gaussian_fields:
+            raise ValueError(f"A Gaussian field is already published at {path}.")
+        if not path.startswith("/") or not len(field.positions):
+            raise ValueError("A Gaussian publication requires an absolute prim path and at least one Gaussian.")
+        arrays = {"positions": field.positions, "orientations": field.orientations, "scales": field.scales}
+        if field.opacities is not None:
+            arrays["opacities"] = field.opacities
+        if {"positions", "orientations", "scales", "opacities"} & field.attributes.keys():
+            raise ValueError("Additional attributes cannot override Gaussian field arrays.")
+        arrays.update(field.attributes)
+        expected = {"positions": wp.vec3f, "orientations": wp.quatf, "scales": wp.vec3f, "opacities": wp.float32}
+        for name, array in arrays.items():
+            if array.ndim != 1 or len(array) != len(field.positions) or array.device != field.positions.device:
+                raise ValueError(f"Gaussian attribute {name} must share the field's count and device.")
+            if array.dtype != expected.get(name, array.dtype) or array.dtype not in (
+                wp.float32,
+                wp.vec2f,
+                wp.vec3f,
+                wp.vec4f,
+                wp.quatf,
+            ):
+                raise ValueError(f"Gaussian attribute {name} has an unsupported dtype: {array.dtype}.")
+        self._gaussian_fields[path] = field
+        self._gaussian_revision += 1
+
+    def unregister_gaussian_field(self, path: str) -> None:
+        """Withdraw a field after pending renders finish; consumers restore authored data on their next update."""
+        del self._gaussian_fields[path]
+        self._gaussian_updates.pop(path, None)
+        self._gaussian_revision += 1
+
+    def mark_gaussian_field_dirty(self, path: str) -> None:
+        """Invalidate a field after producer writes between simulation steps."""
+        if path not in self._gaussian_fields:
+            raise KeyError(path)
+        self._gaussian_updates.pop(path, None)
+        self._gaussian_revision += 1
+
+    def get_gaussian_fields(self) -> dict[str, GaussianField]:
+        """Refresh producers once per state and borrow their local-space Gaussian arrays.
+
+        Consumers must not mutate the returned mapping or arrays. Renderer-native writes,
+        bounds updates and acceleration structures remain owned by each renderer.
+        """
+        timestamp = (self.backend.transforms_timestamp, self.backend.geometry_timestamp)
+        for path, field in self._gaussian_fields.items():
+            if self._gaussian_updates.get(path) != timestamp:
+                if field.update is not None:
+                    field.update()
+                self._gaussian_updates[path] = timestamp
+        return self._gaussian_fields
 
     def get_transforms(
         self,

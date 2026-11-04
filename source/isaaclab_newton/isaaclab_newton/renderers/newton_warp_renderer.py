@@ -24,6 +24,7 @@ from isaaclab.utils.version import has_kit
 from isaaclab.utils.warp.warp_math import replace_background_depth_wp
 
 from ..physics import NewtonBackendCfg, newton_backend
+from .gaussian_fields import NewtonGaussianFields
 from .newton_warp_renderer_cfg import NewtonWarpRendererCfg
 from .segmentation import NewtonSegmentationMapper, NewtonSegmentationMapping
 
@@ -454,9 +455,22 @@ class NewtonWarpRenderer(BaseRenderer):
         self._scene_data_provider = self._sim.get_scene_data_provider()
         self._transform_mapping = self._scene_data_provider.create_mapping(list(self.backend.model.body_label))
 
+        self._gaussian_fields = NewtonGaussianFields(self.backend, self._scene_data_provider)
+        model = self._gaussian_fields.model
+        if not self.cfg.enable_deformable_triangles and model.tri_count:
+            # Keep the native physics model untouched; the sensor only borrows this topology view.
+            model.tri_count = 0
+            model.tri_indices = wp.empty(0, dtype=wp.vec3i, device=model.device)
         self.newton_sensor = newton.sensors.SensorTiledCamera(
-            self.backend.model,
+            model,
             default_render_config=newton.sensors.SensorTiledCamera.RenderConfig(
+                enable_particles=self.cfg.enable_particles,
+                gaussians_mode={
+                    "fast": newton.sensors.SensorTiledCamera.GaussianRenderMode.FAST,
+                    "quality": newton.sensors.SensorTiledCamera.GaussianRenderMode.QUALITY,
+                }[self.cfg.gaussians_mode],
+                gaussians_min_transmittance=self.cfg.gaussians_min_transmittance,
+                gaussians_max_num_hits=self.cfg.gaussians_max_num_hits,
                 enable_textures=self.cfg.enable_textures,
                 enable_shadows=self.cfg.enable_shadows,
                 enable_ambient_lighting=self.cfg.enable_ambient_lighting,
@@ -542,9 +556,8 @@ class NewtonWarpRenderer(BaseRenderer):
         pass
 
     def update_geometries(self) -> None:
-        """No-op for Newton Warp - geometry is read directly from Newton state during render.
-        See :meth:`~isaaclab.renderers.base_renderer.BaseRenderer.update_geometries`."""
-        pass
+        """Refresh mutable Gaussian fields; mesh points are pulled immediately before rendering."""
+        self._gaussian_fields.update()
 
     def update_camera(
         self,
@@ -687,4 +700,5 @@ class NewtonWarpRenderer(BaseRenderer):
 
     def close(self) -> None:
         """Release borrowed native handles and SDP bindings after camera cleanup."""
+        self._gaussian_fields = None
         self.newton_sensor = self.backend = self._scene_data_provider = self._transform_mapping = None
